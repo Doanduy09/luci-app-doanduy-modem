@@ -19,8 +19,10 @@
 * Thiết bị đầu cuối lệnh AT (AT Terminal) tương tác trực tiếp với modem.
 
 ### 🛡️ Kịch Bản 3: Tự Động Nhận Biết Nhà Mạng Thu Hồi IP & Warm Reset Khôi Phục Tức Thì
-* **Tự nhận biết khi mất IP WAN:** Khi nhà mạng thu hồi IP ngẫu nhiên sau 1-2 ngày, Watchdog nhận biết ngay trong 15-20 giây.
-* **Warm Baseband Reset (`AT+CFUN=1,1` / `AT!RESET`):** Tự động ra lệnh khởi động lại chip baseband của modem, xả sạch 100% RAM rác và phân mảnh Ring Buffer DMA PCIe MHI, cấp lại IP WAN mới tức thì.
+* **Tự nhận biết khi mất IP WAN:** Khi mạng di động thay đổi trạng thái hoặc thu hồi IP, Watchdog nhận biết ngay trong 15-20 giây.
+* **Warm Baseband Reset (`AT+CFUN=1,1` / `AT!RESET`):** Tự động ra lệnh khởi động lại chip baseband của modem, giải phóng bộ nhớ đệm PCIe MHI và cấp lại IP WAN mới tức thì.
+* **Tự Động Làm Tươi Kết Nối (Connection Refresh):** Tự động tối ưu hóa trạng thái kết nối định kỳ, giải phóng bộ đệm mạng và duy trì độ trễ thấp nhất.
+
 ### 🤖 Kịch Bản 4: Quản Lý Không Giới Hạn Camera IP & Đa Bot Telegram
 * Quản lý động danh sách Camera IP RTSP không giới hạn số lượng.
 * Quản lý đa Bot Telegram: Từng Bot chuyên trách cho từng Camera, Bot báo trộm, Bot báo cháy khói, Kênh/Nhóm gia đình.
@@ -28,6 +30,7 @@
 
 ### 🔐 Kịch Bản 5: Két Sắt Bảo Mật Tuyệt Đối (Zero-Leak Vault)
 * Lưu trữ an toàn Gemini AI Key, Tailscale Auth Key, Telegram Token với quyền `chmod 600`.
+* **Bảo Mật Hệ Thống Cấp Doanh Nghiệp:** Tự động bảo vệ các tham số thiết bị và mã định danh phần cứng (Cryptographic Hash Verification), ngăn ngừa truy cập trái phép từ bên ngoài.
 
 ---
 
@@ -47,6 +50,7 @@ make menuconfig
 ```
 
 ### Cách 2: Cài trực tiếp file `.ipk` trên Router đang chạy
+Tải file `luci-app-doanduy-modem_1.0.0-1_all.ipk` từ mục [Releases](https://github.com/Doanduy09/luci-app-doanduy-modem/releases) rồi cài đặt:
 ```bash
 opkg update
 opkg install luci-app-doanduy-modem*.ipk

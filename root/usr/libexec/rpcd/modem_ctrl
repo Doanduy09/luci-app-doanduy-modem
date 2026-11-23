@@ -20,8 +20,11 @@ case "$1" in
 				[ -z "$imei_val" ] && imei_val=$(cat /tmp/master_imei 2>/dev/null)
 				[ -z "$imei_val" ] && imei_val="030537611972346"
 
-				iccid_val=$(cat /etc/config/active_iccid 2>/dev/null)
-				[ -z "$iccid_val" ] && iccid_val="89840480009484443869"
+				iccid_val=$(cat /etc/config/active_iccid /tmp/sms_current_iccid /tmp/current_sim_iccid 2>/dev/null | grep -oE '[0-9]{10,22}' | head -1)
+				[ -z "$iccid_val" ] && iccid_val="Chưa phát hiện"
+				if [ "$iccid_val" != "Chưa phát hiện" ] && [ ${#iccid_val} -ge 10 ]; then
+					iccid_val=$(echo "$iccid_val" | awk '{print substr($0,1,6) "******" substr($0,length($0)-3)}')
+				fi
 
 				cat << JSONEOF
 {
@@ -56,7 +59,7 @@ case "$1" in
         {
           "class": "SIM Information",
           "full_name": "Thẻ SIM & Mã ICCID",
-          "value": "SIM Viettel • $iccid_val (SIM VIP Hoạt Động)"
+          "value": "SIM Viettel • $iccid_val (Đang Hoạt Động)"
         },
         {
           "class": "SIM Information",

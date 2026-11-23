@@ -62,24 +62,26 @@ if [ -z "$cur_iccid" ] && [ -c "$port" ] && command -v atinout >/dev/null 2>&1; 
     [ -n "$cur_iccid" ] && echo "$cur_iccid" > /tmp/sms_current_iccid
 fi
 
-# 3. Kiem tra Whitelist: CHI DUY NHAT 3 SIM VIP MAC DINH MOI DUOC PHEP GIA HAN GOI CUOC
-STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074"
-ALLOWED_ICCIDS=$(cat /etc/config/allowed_iccids.dat 2>/dev/null | tr '\r\n' ' ')
-[ -z "$ALLOWED_ICCIDS" ] && ALLOWED_ICCIDS="$STRICT_DEFAULT_ICCIDS"
+# 3. Kiem tra Whitelist: Kiem thuc bang ma bam mat ma hoc SHA-256 (Zero Leak)
+DEFAULT_ICCID_HASHES="a7a16520a4144e79d6b262ce4265a5d585154221b52803d8e8e6b62213e49865 c317b0ec0ee235c2bae6baf0efde7b03a05e35ad84cf794fc71a809802d47df9 e972c309ace289c3037d4479d79b983d02151f3868f003073085abf4bf508575"
 
 is_sim_allowed=0
 if [ -n "$cur_iccid" ]; then
-    for a in $ALLOWED_ICCIDS; do
-        clean_a=$(echo "$a" | tr -d '\r\n[:space:]')
-        [ -z "$clean_a" ] && continue
-        if [ "$cur_iccid" = "$clean_a" ]; then
+    cur_hash=$(printf "%s" "$cur_iccid" | sha256sum | awk '{print $1}')
+    for h in $DEFAULT_ICCID_HASHES; do
+        if [ "$cur_hash" = "$h" ]; then
             is_sim_allowed=1
             break
         fi
     done
+    if [ "$is_sim_allowed" -eq 0 ] && [ -f /etc/config/allowed_iccids.dat ]; then
+        if grep -qF "$cur_iccid" /etc/config/allowed_iccids.dat 2>/dev/null || grep -qF "$cur_hash" /etc/config/allowed_iccids.dat 2>/dev/null; then
+            is_sim_allowed=1
+        fi
+    fi
 fi
 
-masked_cur_iccid="898404******"
+masked_cur_iccid="Chưa phát hiện"
 if [ -n "$cur_iccid" ] && [ ${#cur_iccid} -ge 10 ]; then
     masked_cur_iccid=$(echo "$cur_iccid" | awk '{print substr($0,1,6) "******" substr($0,length($0)-3)}')
 fi

@@ -1,0 +1,104 @@
+name: Build and Release IPK Package
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Package IPK & Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Build Standard OpenWrt IPK Package
+        run: |
+          mkdir -p build_staging/data build_staging/control
+          
+          # Copy root files
+          cp -r root/* build_staging/data/
+          
+          # Copy htdocs into /www
+          mkdir -p build_staging/data/www
+          cp -r htdocs/* build_staging/data/www/
+          
+          # Enforce proper execution permissions
+          find build_staging/data -type d -exec chmod 755 {} +
+          find build_staging/data -type f -exec chmod 644 {} +
+          chmod 755 build_staging/data/usr/bin/* 2>/dev/null || true
+          chmod 755 build_staging/data/usr/libexec/rpcd/* 2>/dev/null || true
+          chmod 755 build_staging/data/www/cgi-bin/* 2>/dev/null || true
+          
+          # Control file
+          cat << 'EOF' > build_staging/control/control
+          Package: luci-app-doanduy-modem
+          Version: 1.0.0-1
+          Depends: luci-base, rpcd, ubus, jsonfilter, kmod-mhi-bus, kmod-mhi-net, atinout
+          Section: luci
+          Architecture: all
+          Maintainer: DOANDUY <doanduy09@gmail.com>
+          Description: Quan Tri Modem 5G PCIe Sierra EM9190, SMS Engine, Auto-Renew & AI Sentinel
+          EOF
+          
+          # Conffiles
+          cat << 'EOF' > build_staging/control/conffiles
+          /etc/config/sentinel_bots.json
+          /etc/config/sentinel_cameras.conf
+          /etc/config/allowed_iccids.dat
+          EOF
+          
+          # Post-installation script
+          cat << 'EOF' > build_staging/control/postinst
+          #!/bin/sh
+          [ -n "$IPKG_INSTROOT" ] || {
+              chmod +x /usr/bin/daily_vip_renew.sh /usr/bin/read_pcie_sms.lua /usr/bin/smart_modem_watchdog.sh /usr/bin/wwan_smart_dialer.sh /usr/libexec/rpcd/luci.sms-status /usr/libexec/rpcd/modem_ctrl /www/cgi-bin/sim_manager 2>/dev/null
+              rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
+              /etc/init.d/rpcd restart 2>/dev/null
+              /etc/init.d/uhttpd restart 2>/dev/null
+              exit 0
+          }
+          EOF
+          chmod 755 build_staging/control/postinst
+          find build_staging/control -type f ! -name "postinst" -exec chmod 644 {} +
+          
+          # Debian binary format
+          echo "2.0" > build_staging/debian-binary
+          
+          # Pack archives
+          tar -czf build_staging/data.tar.gz -C build_staging/data .
+          tar -czf build_staging/control.tar.gz -C build_staging/control .
+          
+          # Pack final IPK
+          tar -czf luci-app-doanduy-modem_1.0.0-1_all.ipk -C build_staging debian-binary control.tar.gz data.tar.gz
+          
+          ls -la luci-app-doanduy-modem_1.0.0-1_all.ipk
+
+      - name: Upload IPK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-doanduy-modem_1.0.0-1_all
+          path: luci-app-doanduy-modem_1.0.0-1_all.ipk
+          if-no-files-found: error
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="v1.0.0"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists, uploading asset..."
+            gh release upload "$TAG_NAME" luci-app-doanduy-modem_1.0.0-1_all.ipk --clobber
+          else
+            echo "Creating new release $TAG_NAME..."
+            gh release create "$TAG_NAME" luci-app-doanduy-modem_1.0.0-1_all.ipk \
+              --title "LuCI App DoanDuy Modem v1.0.0" \
+              --notes "Official release package for luci-app-doanduy-modem (Architecture: all). Supports Sierra EM9190 / SDX55 5G PCIe Modems on OpenWrt / ImmortalWrt."
+          fi
