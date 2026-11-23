@@ -24,11 +24,11 @@ jobs:
           mkdir -p build_staging/data build_staging/control
           
           # Copy root files
-          cp -r root/* build_staging/data/
+          cp -r luci-app-doanduy-modem/root/* build_staging/data/
           
           # Copy htdocs into /www
           mkdir -p build_staging/data/www
-          cp -r htdocs/* build_staging/data/www/
+          cp -r luci-app-doanduy-modem/htdocs/* build_staging/data/www/
           
           # Enforce proper execution permissions
           find build_staging/data -type d -exec chmod 755 {} +
