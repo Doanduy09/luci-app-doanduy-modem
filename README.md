@@ -6,7 +6,7 @@
 
 ## 🌟 Tính Năng & Kịch Bản Phân Rã (Modular Scenarios)
 
-### 📬 Kịch Bản 1: Quản Lý SIM VIP & Hộp Thư SMS PCIe Thông Minh
+### 📬 Kịch Bản 1: Quản Lý SIM & Hộp Thư SMS PCIe Thông Minh
 * Hỗ trợ đọc và gửi SMS qua cổng AT `/dev/wwan0at0` hoặc QMI WMS `/dev/wwan0qmi0`.
 * Giải mã chuẩn xác **tiếng Việt Unicode UCS2 / UTF-8** không lỗi font.
 * Hiển thị danh thiếp tin nhắn trực quan, nút **📋 Sao Chép (Copy 1-click)** mã OTP / cước data và xóa tin nhắn an toàn.
@@ -30,7 +30,7 @@
 
 ### 🔐 Kịch Bản 5: Két Sắt Bảo Mật Tuyệt Đối (Zero-Leak Vault)
 * Lưu trữ an toàn Gemini AI Key, Tailscale Auth Key, Telegram Token với quyền `chmod 600`.
-* Bảo vệ ICCID SIM VIP: SIM không nằm trong danh sách mặc định sẽ tự động bị ẩn (Stealth mode) và khóa toàn bộ quyền gửi SMS để bảo vệ tài khoản.
+* Bảo vệ ICCID SIM: SIM không nằm trong danh sách mặc định sẽ tự động kích hoạt Stealth Mode (ẩn hoàn toàn 100% thông tin quản trị và lịch tự động để bảo vệ thiết bị).
 
 ---
 
