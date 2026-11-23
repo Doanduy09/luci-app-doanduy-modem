@@ -21,8 +21,6 @@
 ### 🛡️ Kịch Bản 3: Tự Động Nhận Biết Nhà Mạng Thu Hồi IP & Warm Reset Khôi Phục Tức Thì
 * **Tự nhận biết khi mất IP WAN:** Khi nhà mạng thu hồi IP ngẫu nhiên sau 1-2 ngày, Watchdog nhận biết ngay trong 15-20 giây.
 * **Warm Baseband Reset (`AT+CFUN=1,1` / `AT!RESET`):** Tự động ra lệnh khởi động lại chip baseband của modem, xả sạch 100% RAM rác và phân mảnh Ring Buffer DMA PCIe MHI, cấp lại IP WAN mới tức thì.
-* **Lịch gia hạn khung giờ vàng (01:25:30):** Tự động gửi SMS gia hạn gói cước (5G150N), xác nhận Y và làm mới IP sạch sẽ mỗi ngày.
-
 ### 🤖 Kịch Bản 4: Quản Lý Không Giới Hạn Camera IP & Đa Bot Telegram
 * Quản lý động danh sách Camera IP RTSP không giới hạn số lượng.
 * Quản lý đa Bot Telegram: Từng Bot chuyên trách cho từng Camera, Bot báo trộm, Bot báo cháy khói, Kênh/Nhóm gia đình.
@@ -30,7 +28,6 @@
 
 ### 🔐 Kịch Bản 5: Két Sắt Bảo Mật Tuyệt Đối (Zero-Leak Vault)
 * Lưu trữ an toàn Gemini AI Key, Tailscale Auth Key, Telegram Token với quyền `chmod 600`.
-* Bảo vệ ICCID SIM: SIM không nằm trong danh sách mặc định sẽ tự động kích hoạt Stealth Mode (ẩn hoàn toàn 100% thông tin quản trị và lịch tự động để bảo vệ thiết bị).
 
 ---
 
