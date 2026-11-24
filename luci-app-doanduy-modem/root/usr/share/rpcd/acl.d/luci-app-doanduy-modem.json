@@ -5,6 +5,7 @@
 			"ubus": {
 				"luci.sms-status": [ "*" ],
 				"modem_ctrl": [ "*" ],
+				"doanduy.sim": [ "*" ],
 				"doanduy.rf": [ "*" ],
 				"doanduy.adshield": [ "*" ],
 				"doanduy.remote": [ "*" ],
@@ -19,6 +20,7 @@
 			"ubus": {
 				"luci.sms-status": [ "*" ],
 				"modem_ctrl": [ "*" ],
+				"doanduy.sim": [ "*" ],
 				"doanduy.rf": [ "*" ],
 				"doanduy.adshield": [ "*" ],
 				"doanduy.remote": [ "*" ],

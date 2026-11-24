@@ -7,14 +7,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-doanduy-modem
-PKG_VERSION:=1.0.1
+PKG_VERSION:=2.0.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_MAINTAINER:=DOANDUY <doanduy09@gmail.com>
 
 LUCI_TITLE:=Quản Trị Modem 5G PCIe & USB, SMS Engine, Auto-Renew & AI Sentinel
-LUCI_DEPENDS:=+luci-base +rpcd +ubus +jsonfilter +atinout
+LUCI_DEPENDS:=+luci-base +rpcd +ubus +jsonfilter +atinout +curl +ca-bundle
 LUCI_PKGARCH:=all
 
 define Package/$(PKG_NAME)/conffiles
@@ -29,6 +29,12 @@ define Package/$(PKG_NAME)/conffiles
 /etc/config/adshield_status
 /etc/config/adshield_family
 /etc/config/adshield_custom.conf
+/etc/config/sms_custom_time.dat
+/etc/config/sms_renew_package.dat
+/etc/config/sms_renew_dest.dat
+/etc/config/tailscale_authkey
+/etc/config/tailscale_hostname
+/etc/config/gemini_api.key
 endef
 
 include $(TOPDIR)/feeds/luci/luci.mk

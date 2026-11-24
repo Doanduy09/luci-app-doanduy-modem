@@ -1,0 +1,325 @@
+#!/bin/sh
+# DOANDUY 5G Authenticated SIM Whitelist & Auto-Renew RPCD Backend (Zero-Leak SHA-256)
+. /usr/share/libubox/jshn.sh
+
+ALLOWED_FILE="/etc/config/allowed_iccids.dat"
+TIME_FILE="/etc/config/sms_custom_time.dat"
+PKG_FILE="/etc/config/sms_renew_package.dat"
+DEST_FILE="/etc/config/sms_renew_dest.dat"
+LAST_SENT_FILE="/etc/config/sim_last_sent.dat"
+
+DEFAULT_HASHES="a7a16520a4144e79d6b262ce4265a5d585154221b52803d8e8e6b62213e49865 c317b0ec0ee235c2bae6baf0efde7b03a05e35ad84cf794fc71a809802d47df9 e972c309ace289c3037d4479d79b983d02151f3868f003073085abf4bf508575"
+
+calc_sha256() {
+	[ -n "$1" ] || return 0
+	printf '%s' "$1" | sha256sum 2>/dev/null | awk '{print $1}'
+}
+
+is_iccid_allowed() {
+	local iccid="$1" h line
+	[ ${#iccid} -ge 10 ] || return 1
+	h=$(calc_sha256 "$iccid")
+	for d_h in $DEFAULT_HASHES; do
+		[ "$h" = "$d_h" ] && return 0
+	done
+	if [ -f "$ALLOWED_FILE" ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			line=$(printf '%s' "$line" | tr -d ' \r\t')
+			[ -n "$line" ] || continue
+			[ "$line" = "$iccid" ] && return 0
+			[ -n "$h" ] && [ "$line" = "$h" ] && return 0
+		done < "$ALLOWED_FILE"
+	fi
+	return 1
+}
+
+mask_iccid() {
+	local iccid="$1" pfx sfx
+	if [ ${#iccid} -lt 10 ]; then
+		printf 'Chua phat hien'
+		return 0
+	fi
+	pfx=$(printf '%s' "$iccid" | cut -c1-6)
+	sfx=$(printf '%s' "$iccid" | awk '{n=length($0); if(n>=4) print substr($0, n-3, 4)}')
+	printf '%s******%s' "$pfx" "$sfx"
+}
+
+write_if_changed() {
+	local path="$1" content="$2" cur=""
+	[ -f "$path" ] && cur=$(cat "$path" 2>/dev/null)
+	[ "$cur" = "$content" ] && return 0
+	printf '%s\n' "$content" > "$path"
+}
+
+probe_live_iccid() {
+	local iccid="" wp port resp=""
+	EXPLICIT_ABSENT=0
+	if [ -s /tmp/quectel_cm/quectel-cm.log ]; then
+		iccid=$(grep -oE 'SimIccId:[[:space:]]*[0-9]{18,22}' /tmp/quectel_cm/quectel-cm.log 2>/dev/null | tail -n 1 | grep -oE '[0-9]{18,22}')
+		if [ ${#iccid} -ge 18 ]; then
+			printf '%s' "$iccid"
+			return 0
+		fi
+		grep -q "SimNotInserted" /tmp/quectel_cm/quectel-cm.log 2>/dev/null && EXPLICIT_ABSENT=1
+	fi
+
+	for wp in /dev/wwan0at0 /dev/mhi_DUN; do
+		if [ -c "$wp" ] && [ -x /usr/bin/read_pcie_sms.lua ]; then
+			for cmd in "AT+ICCID" "AT+QCCID"; do
+				resp=$(/usr/bin/read_pcie_sms.lua -p "$wp" --at "$cmd" 2>/dev/null)
+				iccid=$(printf '%s\n' "$resp" | grep -oE '[0-9]{18,22}' | head -n 1)
+				[ ${#iccid} -ge 18 ] && { printf '%s' "$iccid"; return 0; }
+				echo "$resp" | grep -qiE 'not inserted|SIM failure' && EXPLICIT_ABSENT=1
+			done
+			break
+		fi
+	done
+
+	port=$(cat /tmp/master_sms_port 2>/dev/null)
+	echo "$port" | grep -q '/dev/tty' || port=""
+	if [ -z "$port" ]; then
+		for wp in /dev/ttyUSB2 /dev/ttyUSB3 /dev/ttyUSB0; do
+			[ -c "$wp" ] && { port="$wp"; break; }
+		done
+	fi
+	if [ -n "$port" ] && [ -c "$port" ]; then
+		if command -v sms_tool >/dev/null 2>&1; then
+			resp=$(modem_lock_run sms_tool -d "$port" -D at 'AT+QCCID' 2>/dev/null)
+			iccid=$(printf '%s\n' "$resp" | grep -oE '[0-9]{18,22}' | head -n 1)
+			[ ${#iccid} -ge 18 ] && { printf '%s' "$iccid"; return 0; }
+			resp=$(modem_lock_run sms_tool -d "$port" -D at 'AT+ICCID' 2>/dev/null)
+			iccid=$(printf '%s\n' "$resp" | grep -oE '[0-9]{18,22}' | head -n 1)
+			[ ${#iccid} -ge 18 ] && { printf '%s' "$iccid"; return 0; }
+		fi
+		if command -v atinout >/dev/null 2>&1; then
+			resp=$(printf 'AT+ICCID\r\n' | modem_lock_run timeout 3 atinout - "$port" - 2>/dev/null)
+			iccid=$(printf '%s\n' "$resp" | grep -oE '[0-9]{18,22}' | head -n 1)
+			[ ${#iccid} -ge 18 ] && { printf '%s' "$iccid"; return 0; }
+		fi
+	fi
+	return 1
+}
+
+get_active_iccid() {
+	local force_probe="${1:-0}" iccid="" p
+	EXPLICIT_ABSENT=0
+	if [ "$force_probe" != "1" ]; then
+		for p in /tmp/sms_current_iccid /tmp/current_sim_iccid; do
+			[ -f "$p" ] || continue
+			iccid=$(grep -oE '[0-9]{18,22}' "$p" 2>/dev/null | head -n 1)
+			[ ${#iccid} -ge 18 ] && break
+		done
+	fi
+	if [ ${#iccid} -lt 18 ]; then
+		iccid=$(probe_live_iccid || true)
+	fi
+	if [ ${#iccid} -lt 18 ] && [ "$EXPLICIT_ABSENT" != "1" ] && [ -f /etc/config/last_known_iccid ]; then
+		iccid=$(grep -oE '[0-9]{18,22}' /etc/config/last_known_iccid 2>/dev/null | head -n 1)
+	fi
+	if [ ${#iccid} -ge 18 ]; then
+		write_if_changed /tmp/sms_current_iccid "$iccid"
+		write_if_changed /tmp/current_sim_iccid "$iccid"
+		write_if_changed /etc/config/last_known_iccid "$iccid"
+		printf '%s' "$iccid"
+	else
+		rm -f /tmp/sms_current_iccid /tmp/current_sim_iccid 2>/dev/null
+		printf ''
+	fi
+}
+
+get_configured_time() {
+	local t=""
+	[ -f "$TIME_FILE" ] && t=$(cat "$TIME_FILE" 2>/dev/null | tr -d ' \r\n\t')
+	if echo "$t" | grep -qE '^[0-9]{2}:[0-9]{2}:[0-9]{2}$'; then
+		printf '%s' "$t"
+	else
+		printf '01:25:30'
+	fi
+}
+
+get_configured_pkg() {
+	local p=""
+	[ -f "$PKG_FILE" ] && p=$(cat "$PKG_FILE" 2>/dev/null | tr -d '\r\n')
+	p=$(printf '%s' "$p" | sed 's/^[ \t]*//;s/[ \t]*$//')
+	printf '%s' "${p:-5G150N}"
+}
+
+get_configured_dest() {
+	local d=""
+	[ -f "$DEST_FILE" ] && d=$(cat "$DEST_FILE" 2>/dev/null | tr -cd '0-9+')
+	printf '%s' "${d:-191}"
+}
+
+calc_next_epoch() {
+	local sched="$1" now_ts vn_h vn_m vn_s t_h t_m t_s total_sec sec_today_vn midnight target_t
+	now_ts=$(date +%s 2>/dev/null || echo 0)
+	vn_h=$(TZ='<+07>-7' date '+%H' | sed 's/^0*\([0-9]\)/\1/')
+	vn_m=$(TZ='<+07>-7' date '+%M' | sed 's/^0*\([0-9]\)/\1/')
+	vn_s=$(TZ='<+07>-7' date '+%S' | sed 's/^0*\([0-9]\)/\1/')
+	sec_today_vn=$(( vn_h * 3600 + vn_m * 60 + vn_s ))
+	midnight=$(( now_ts - sec_today_vn ))
+
+	t_h=$(printf '%s' "$sched" | cut -d: -f1 | sed 's/^0*\([0-9]\)/\1/')
+	t_m=$(printf '%s' "$sched" | cut -d: -f2 | sed 's/^0*\([0-9]\)/\1/')
+	t_s=$(printf '%s' "$sched" | cut -d: -f3 | sed 's/^0*\([0-9]\)/\1/')
+	t_h=${t_h:-1}; t_m=${t_m:-25}; t_s=${t_s:-30}
+	[ "$t_h" -le 23 ] 2>/dev/null || t_h=1
+	[ "$t_m" -le 59 ] 2>/dev/null || t_m=25
+	[ "$t_s" -le 59 ] 2>/dev/null || t_s=30
+
+	total_sec=$(( t_h * 3600 + t_m * 60 + t_s ))
+	if [ "$total_sec" -lt 1200 ] || [ "$total_sec" -gt 20400 ]; then
+		t_h=1; t_m=25; t_s=30
+	fi
+	target_t=$(( midnight + t_h * 3600 + t_m * 60 + t_s ))
+	[ "$target_t" -le "$now_ts" ] && target_t=$(( target_t + 86400 ))
+	VALID_TIME=$(printf '%02d:%02d:%02d' "$t_h" "$t_m" "$t_s")
+	TARGET_EPOCH="$target_t"
+}
+
+sync_lock_state() {
+	local allowed="$1" target_t="$2"
+	if [ "$allowed" = "1" ]; then
+		printf 'VALID\n' > /tmp/master_sim_status
+		printf '%s\n' "$target_t" > /tmp/sms_next_send_epoch
+		printf '%s\n' "$(( target_t - 120 ))" > /tmp/sms_next_wake_epoch
+	else
+		printf 'LOCKED\n' > /tmp/master_sim_status
+		printf '0\n' > /tmp/sms_next_send_epoch
+		printf '0\n' > /tmp/sms_next_wake_epoch
+		rm -f /tmp/sms_custom_send_epoch /etc/sms_custom_send_epoch /tmp/auto_data/force_renew_sms 2>/dev/null
+	fi
+}
+
+case "$1" in
+	list)
+		echo '{"getState":{},"detectIccid":{},"saveTime":{"time":"string"},"savePackage":{"package":"string","dest":"string"},"testSendNow":{}}'
+		;;
+	call)
+		read -r input
+		case "$2" in
+			detectIccid)
+				active=$(get_active_iccid 1)
+				allowed=0
+				is_iccid_allowed "$active" && allowed=1
+				ret_iccid=""
+				[ "$allowed" -eq 1 ] && ret_iccid="$active"
+				json_init
+				json_add_string "status" "success"
+				json_add_string "active_iccid" "$ret_iccid"
+				json_add_string "masked_iccid" "$(mask_iccid "$active")"
+				json_add_boolean "is_whitelisted" "$allowed"
+				json_dump
+				;;
+			saveTime)
+				active=$(get_active_iccid 0)
+				if ! is_iccid_allowed "$active"; then
+					echo '{"status":"error","message":"SIM ngoài danh mục đã bị KHÓA CHẶT 100%! Không thể lên lịch SMS."}'
+					exit 0
+				fi
+				new_time=$(printf '%s' "$input" | jsonfilter -e '$.time' 2>/dev/null | tr -d ' \r\n\t')
+				if ! echo "$new_time" | grep -qE '^[0-9]{2}:[0-9]{2}:[0-9]{2}$'; then
+					echo '{"status":"error","message":"Định dạng giờ không hợp lệ (HH:MM:SS)!"}'
+					exit 0
+				fi
+				calc_next_epoch "$new_time"
+				mkdir -p /etc/config
+				printf '%s\n' "$VALID_TIME" > "$TIME_FILE"
+				printf '%s\n' "$TARGET_EPOCH" > /tmp/sms_custom_send_epoch
+				printf '%s\n' "$TARGET_EPOCH" > /etc/sms_custom_send_epoch
+				sync_lock_state 1 "$TARGET_EPOCH"
+				json_init
+				json_add_string "status" "success"
+				json_add_string "message" "Đã lưu giờ gửi SMS tự động: ${VALID_TIME} (Khung giờ 00h20 - 05h40)"
+				json_add_string "schedule_time" "$VALID_TIME"
+				json_add_int "next_send_epoch" "$TARGET_EPOCH"
+				json_dump
+				;;
+			savePackage)
+				active=$(get_active_iccid 0)
+				if ! is_iccid_allowed "$active"; then
+					echo '{"status":"error","message":"SIM ngoài danh mục đã bị KHÓA CHẶT 100%!"}'
+					exit 0
+				fi
+				pkg=$(printf '%s' "$input" | jsonfilter -e '$.package' 2>/dev/null | tr -cd 'a-zA-Z0-9 _-')
+				dest=$(printf '%s' "$input" | jsonfilter -e '$.dest' 2>/dev/null | tr -cd '0-9+')
+				[ -n "$pkg" ] && [ -n "$dest" ] || { echo '{"status":"error","message":"Cú pháp hoặc số nhận không hợp lệ!"}'; exit 0; }
+				mkdir -p /etc/config
+				printf '%s\n' "$pkg" > "$PKG_FILE"
+				printf '%s\n' "$dest" > "$DEST_FILE"
+				json_init
+				json_add_string "status" "success"
+				json_add_string "message" "Đã lưu cú pháp gia hạn: ${pkg} gửi ${dest}"
+				json_add_string "package" "$pkg"
+				json_add_string "dest" "$dest"
+				json_dump
+				;;
+			testSendNow)
+				active=$(get_active_iccid 0)
+				if ! is_iccid_allowed "$active"; then
+					echo '{"status":"error","message":"SIM ngoài danh mục đã bị KHÓA CHẶT 100%! Không cho phép gửi bất kỳ SMS nào."}'
+					exit 0
+				fi
+				today_vn=$(TZ='<+07>-7' date '+%Y-%m-%d')
+				rm -f /tmp/daily_auto_renew.lock /tmp/daily_vip_renew.lock /tmp/sms_sending.lock "/tmp/sms_scheduled_sent_${today_vn}" 2>/dev/null
+				nohup /usr/bin/daily_vip_renew.sh --force >/tmp/sms_manual_test.log 2>&1 &
+				pkg=$(get_configured_pkg)
+				dest=$(get_configured_dest)
+				json_init
+				json_add_string "status" "success"
+				json_add_string "message" "Đã phát lệnh gửi SMS thích ứng (${pkg} -> ${dest}) cho SIM ($(mask_iccid "$active"))!"
+				json_dump
+				;;
+			getState|*)
+				active=$(get_active_iccid 0)
+				allowed=0
+				is_iccid_allowed "$active" && allowed=1
+				sched_time=$(get_configured_time)
+				pkg=$(get_configured_pkg)
+				dest=$(get_configured_dest)
+				today=$(TZ='<+07>-7' date '+%Y-%m-%d')
+				cb_ready=1
+				if [ -f "/tmp/sms_scheduled_sent_${today}" ]; then
+					cb_ready=0
+				elif [ -f "$LAST_SENT_FILE" ] && grep -q "$today" "$LAST_SENT_FILE" 2>/dev/null; then
+					cb_ready=0
+					touch "/tmp/sms_scheduled_sent_${today}"
+				fi
+				if [ "$allowed" -eq 1 ]; then
+					calc_next_epoch "$sched_time"
+					sync_lock_state 1 "$TARGET_EPOCH"
+					display_sched="$VALID_TIME"
+					ret_iccid="$active"
+				else
+					TARGET_EPOCH=0
+					sync_lock_state 0 0
+					display_sched="KHONG_LEN_LICH"
+					ret_iccid=""
+				fi
+				last_resp=""
+				[ -f /tmp/sms_last_response.txt ] && last_resp=$(cat /tmp/sms_last_response.txt 2>/dev/null | tr '\r\n' '  ' | sed 's/^[ \t]*//;s/[ \t]*$//')
+				low_bal=0; grep -q "1" /tmp/sms_insufficient_funds 2>/dev/null && low_bal=1
+				ren_ok=0; grep -q "1" /tmp/sms_renew_success 2>/dev/null && ren_ok=1
+				log_tail=$(tail -n 5 /tmp/daily_auto_renew.log 2>/dev/null || tail -n 5 /tmp/daily_vip_renew.log 2>/dev/null || echo "")
+
+				json_init
+				json_add_string "status" "success"
+				json_add_string "active_iccid" "$ret_iccid"
+				json_add_string "masked_iccid" "$(mask_iccid "$active")"
+				json_add_boolean "is_whitelisted" "$allowed"
+				json_add_string "schedule_time" "$display_sched"
+				json_add_int "next_send_epoch" "$TARGET_EPOCH"
+				json_add_string "sms_package" "$pkg"
+				json_add_string "sms_recipient" "$dest"
+				json_add_string "sms_confirm" "Y (Chi gui khi tong dai yeu cau)"
+				json_add_boolean "circuit_breaker_ready" "$cb_ready"
+				json_add_string "today" "$today"
+				json_add_string "last_sms_response" "$last_resp"
+				json_add_string "last_renew_log" "$log_tail"
+				json_add_boolean "is_low_balance" "$low_bal"
+				json_add_boolean "is_renew_success" "$ren_ok"
+				json_dump
+				;;
+		esac
+		;;
+esac

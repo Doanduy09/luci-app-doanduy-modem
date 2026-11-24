@@ -19,17 +19,19 @@ var callSetBandLock = rpc.declare({ object: 'luci.sms-status', method: 'setBandL
 var callGetCellInfo = rpc.declare({ object: 'luci.sms-status', method: 'getCellInfo', expect: { } });
 var callSetCellLock = rpc.declare({ object: 'luci.sms-status', method: 'setCellLock', params: ['action'], expect: { } });
 var callSetCustomSchedule = rpc.declare({ object: 'luci.sms-status', method: 'setCustomSchedule', params: ['datetime'] });
+var callSimGetState = rpc.declare({ object: 'doanduy.sim', method: 'getState', expect: { } });
+var callSimSaveTime = rpc.declare({ object: 'doanduy.sim', method: 'saveTime', params: ['time'], expect: { } });
+var callSimSavePackage = rpc.declare({ object: 'doanduy.sim', method: 'savePackage', params: ['package', 'dest'], expect: { } });
+var callSimTestSendNow = rpc.declare({ object: 'doanduy.sim', method: 'testSendNow', expect: { } });
 
 var callChangeIMEI = rpc.declare({ object: 'doanduy.rf', method: 'changeIMEI', params: ['imei', 'brand'] });
 var callRestoreIMEI = rpc.declare({ object: 'doanduy.rf', method: 'restoreIMEI', expect: { } });
 var callRfStatus = rpc.declare({ object: 'doanduy.rf', method: 'getStatus', expect: { } });
-var callSetVipImei = rpc.declare({ object: 'luci.sms-status', method: 'setVipImei', params: ['imei'], expect: { } });
 var callSetTelegramToken = rpc.declare({ object: 'doanduy.vault', method: 'save', params: ['tg_bot_token', 'tg_admin_id', 'tg_owner_name'] });
 var callGetSentinelConfig = rpc.declare({ object: 'doanduy.vault', method: 'get', expect: { } });
 var callSetSentinelConfig = rpc.declare({ object: 'doanduy.vault', method: 'save', params: ['tg_bot_token', 'tg_admin_id', 'tg_owner_name', 'emergency_phone', 'gemini_api_key', 'tailscale_auth_key', 'cloud_remote', 'telegram_bots', 'gemini_keys', 'tailscale_keys', 'cameras'] });
 var callLoadVaultKeys = rpc.declare({ object: 'doanduy.vault', method: 'get', expect: { } });
 var callTestTelegram = rpc.declare({ object: 'doanduy.vault', method: 'testTelegram', params: ['token', 'chat_id', 'name'], expect: { } });
-var callTriggerAITest = rpc.declare({ object: 'luci.device-control', method: 'triggerAITest', params: ['mode', 'cam'] });
 
 var callRemoteStatus = rpc.declare({ object: 'doanduy.remote', method: 'status', expect: { } });
 var callTailscaleUp = rpc.declare({ object: 'doanduy.remote', method: 'tailscaleUp', params: ['authkey', 'enable_funnel'], expect: { } });
@@ -39,8 +41,8 @@ var callStartTunnel = rpc.declare({ object: 'doanduy.remote', method: 'startTunn
 var callStopTunnel = rpc.declare({ object: 'doanduy.remote', method: 'stopTunnel', expect: { } });
 
 var callSetTTL = rpc.declare({ object: 'doanduy.rf', method: 'setTTL', params: ['ttl'] });
-var callSetCard = rpc.declare({ object: 'luci.weather-status', method: 'setCardMode', params: ['mode', 'iface_name'] });
-var callRenameInterface = rpc.declare({ object: 'luci.sms-status', method: 'renameInterface', params: ['new_name'] });
+var callSetCard = rpc.declare({ object: 'luci.sms-status', method: 'setCardMode', params: ['mode', 'iface_name'], expect: { } });
+var callRenameInterface = rpc.declare({ object: 'luci.sms-status', method: 'renameInterface', params: ['new_name'], expect: { } });
 
 function parseAndRenderSMS(rawText) {
     if (!rawText || typeof rawText !== 'string' || (!rawText.match(/MSG:\s*[0-9]+/i) && !rawText.match(/Tin nhắn\s*#[0-9]+/i))) {
@@ -250,7 +252,7 @@ return view.extend({
             callSMSInfo().catch(function() { return {}; }),
             callGetPorts().catch(function() { return {}; }),
             callGetCellInfo().catch(function() { return {}; }),
-            fetch('/cgi-bin/sim_manager?action=get_state&t=' + Date.now()).then(function(r) { return r.json(); }).catch(function() { return {}; }),
+            callSimGetState().catch(function() { return {}; }),
             callGetSentinelConfig().catch(function() { return {}; }),
             callRemoteStatus().catch(function() { return {}; }),
             callRfStatus().catch(function() { return {}; })
@@ -276,7 +278,6 @@ return view.extend({
         var tabButtons = [
             { id: 'tab-btn-sms', key: 'sms', icon: '📬', title: 'Quản Lý SIM & Tin Nhắn SMS' },
             { id: 'tab-btn-modem', key: 'modem', icon: '📶', title: 'Modem 5G, Băng Tần & Lệnh AT' },
-            { id: 'tab-btn-mesh', key: 'mesh', icon: '⚡', title: '1-Click Auto Mesh' },
             { id: 'tab-btn-sentinel', key: 'sentinel', icon: '🤖', title: 'Telegram, AI & Từ Xa' }
         ];
 
@@ -293,9 +294,6 @@ return view.extend({
                         btnEl.style.color = '#ffffff';
                         btnEl.style.borderColor = '#2563eb';
                         paneEl.style.display = 'block';
-                        if (b.key === 'mesh' && typeof refreshMeshDashboard === 'function') {
-                            refreshMeshDashboard();
-                        }
                     } else {
                         btnEl.style.background = '#ffffff';
                         btnEl.style.color = '#334155';
@@ -390,8 +388,7 @@ return view.extend({
                         return;
                     }
                     saveSchedBtn.textContent = '⏳ Đang lưu...';
-                    fetch('/cgi-bin/sim_manager?action=save_time&time=' + encodeURIComponent(val) + '&t=' + Date.now())
-                        .then(function(r) { return r.json(); })
+                    callSimSaveTime(val)
                         .then(function(res) {
                             saveSchedBtn.textContent = '💾 Lưu Giờ Gửi';
                             if (res && res.status === 'success') {
@@ -401,7 +398,7 @@ return view.extend({
                                     updateLiveCountdown();
                                 }
                             } else {
-                                ui.addNotification(null, E('p', '❌ ' + (res.message || 'Lỗi')), 'error');
+                                ui.addNotification(null, E('p', '❌ ' + ((res && res.message) || 'Lỗi')), 'error');
                             }
                         }).catch(function(err) {
                             saveSchedBtn.textContent = '💾 Lưu Giờ Gửi';
@@ -434,14 +431,13 @@ return view.extend({
                     var dest = schedDestInput.value.trim();
                     if (!pkg || !dest) return alert('Vui lòng nhập cú pháp và số nhận!');
                     savePkgBtn.textContent = '⏳ Đang lưu...';
-                    fetch('/cgi-bin/sim_manager?action=save_package&package=' + encodeURIComponent(pkg) + '&dest=' + encodeURIComponent(dest) + '&t=' + Date.now())
-                        .then(function(r) { return r.json(); })
+                    callSimSavePackage(pkg, dest)
                         .then(function(res) {
                             savePkgBtn.textContent = '💾 Lưu Cú Pháp';
                             if (res && res.status === 'success') {
                                 ui.addNotification(null, E('p', '✅ ' + res.message), 'info');
                             } else {
-                                ui.addNotification(null, E('p', '❌ ' + (res.message || 'Lỗi')), 'error');
+                                ui.addNotification(null, E('p', '❌ ' + ((res && res.message) || 'Lỗi')), 'error');
                             }
                         }).catch(function(err) {
                             savePkgBtn.textContent = '💾 Lưu Cú Pháp';
@@ -464,23 +460,21 @@ return view.extend({
                     if (!confirm('⚡ Xác nhận gửi thử gia hạn gói [' + curPkg + '] tới [' + curDest + '] ngay bây giờ?')) return;
                     ev.target.disabled = true;
                     ev.target.textContent = '⏳ Đang kích hoạt...';
-                    fetch('/cgi-bin/sim_manager?action=test_send_now&t=' + Date.now())
-                        .then(function(r) { return r.json(); })
+                    callSimTestSendNow()
                         .then(function(d) {
                             ev.target.disabled = false;
                             ev.target.textContent = '⚡ Gia Hạn Thử Ngay';
                             if (d && d.status === 'success') {
                                 ui.addNotification(null, E('p', '✅ ' + d.message), 'info');
                                 setTimeout(function() {
-                                    fetch('/cgi-bin/sim_manager?action=get_state&t=' + Date.now())
-                                        .then(function(res) { return res.json(); })
+                                    callSimGetState()
                                         .then(function(data) {
                                             var lb = document.getElementById('sms-renew-log-box');
-                                            if (lb && data.last_renew_log) lb.textContent = data.last_renew_log;
-                                        });
+                                            if (lb && data && data.last_renew_log) lb.textContent = data.last_renew_log;
+                                        }).catch(function() {});
                                 }, 3500);
                             } else {
-                                ui.addNotification(null, E('p', '❌ ' + (d.message || 'Lỗi gửi SMS')), 'error');
+                                ui.addNotification(null, E('p', '❌ ' + ((d && d.message) || 'Lỗi gửi SMS')), 'error');
                             }
                         }).catch(function(err) {
                             ev.target.disabled = false;
@@ -530,7 +524,7 @@ return view.extend({
         var vipImeiInput = E('input', {
             type: 'text',
             class: 'cbi-input-text',
-            value: (smsRes && smsRes.vip_imei) ? smsRes.vip_imei : '030537611972346',
+            value: (rfStatus && rfStatus.imei) ? rfStatus.imei : '',
             placeholder: 'Nhập 15 số IMEI',
             style: 'width: 190px; height: 34px; font-weight: 800; font-family: monospace; border-radius: 6px; font-size: 13px;'
         });
@@ -540,14 +534,14 @@ return view.extend({
             style: 'font-size: 12px; font-weight: 750; padding: 5px 14px; border-radius: 6px;',
             click: function() {
                 var im = vipImeiInput.value.trim();
-                if (!im.match(/^[0-9]{14,16}$/)) {
-                    alert('Số IMEI phải chứa từ 14 đến 16 chữ số!');
+                if (!im.match(/^[0-9]{15}$/)) {
+                    alert('Số IMEI phải gồm đúng 15 chữ số!');
                     return;
                 }
                 saveVipImeiBtn.textContent = '⏳ Đang lưu...';
-                callSetVipImei(im).then(function(res) {
+                callChangeIMEI(im, 'auto').then(function(res) {
                     saveVipImeiBtn.textContent = '💾 Lưu Số IMEI';
-                    ui.addNotification(null, E('p', '✅ ' + (res.message || 'Đã cập nhật số IMEI thiết bị!')), 'info');
+                    ui.addNotification(null, E('p', (res && res.success ? '✅ ' : '❌ ') + ((res && res.message) || 'Đã cập nhật số IMEI thiết bị!')), (res && res.success) ? 'info' : 'error');
                 }).catch(function(err) {
                     saveVipImeiBtn.textContent = '💾 Lưu Số IMEI';
                     alert('Lỗi: ' + err);
@@ -739,9 +733,9 @@ return view.extend({
             click: function() {
                 var p = ifaceSelect.value.split('|');
                 saveIfaceBtn.textContent = '⏳ Đang áp dụng...';
-                callSetCard(p[0], p[1]).then(function() {
+                callSetCard(p[0], p[1]).then(function(res) {
                     saveIfaceBtn.textContent = '🚀 Áp Dụng Interface';
-                    ui.addNotification(null, E('p', '✅ Đã đổi giao thức interface sang ' + p[0] + ' (' + p[1] + ')!'), 'info');
+                    ui.addNotification(null, E('p', (res && res.success === false ? '❌ ' : '✅ ') + ((res && res.message) || ('Đã đổi giao thức interface sang ' + p[0] + ' (' + p[1] + ')!'))), (res && res.success === false) ? 'error' : 'info');
                 }).catch(function(err) {
                     saveIfaceBtn.textContent = '🚀 Áp Dụng Interface';
                     ui.addNotification(null, E('p', '❌ Lỗi: ' + err), 'error');
@@ -1019,425 +1013,7 @@ return view.extend({
         ]);
         tabPanes['modem'] = modemTabContent;
 
-        // ---------------- TAB 4: 1-CLICK AUTO MESH (THIẾT KẾ GIỐNG NHƯ FILE ALL) ----------------
-        var meshStatusCard = E('div', {
-            style: 'background: #ffffff; border: 1.5px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-bottom: 16px;'
-        }, [ E('div', { style: 'text-align: center; padding: 20px; font-weight: 700; color: #2563eb;' }, '⏳ Đang kết nối và tải sơ đồ Mesh...') ]);
-
-        var btnTriggerMeshPair = E('button', {
-            class: 'btn cbi-button cbi-button-action',
-            style: 'background: #7c3aed; color: #ffffff; font-size: 13.5px; font-weight: 800; padding: 10px 18px; border-radius: 8px; cursor: pointer; border: none;',
-            click: function(ev) {
-                ev.target.disabled = true;
-                ev.target.textContent = '⏳ Đang tự động ghép nối Mesh...';
-                fetch('/cgi-bin/airdrop?action=mesh_pair')
-                    .then(function(r) { return r.json(); })
-                    .then(function(data) {
-                        ev.target.disabled = false;
-                        ev.target.textContent = '⚡ BẬT GHÉP NỐI MESH TỰ ĐỘNG (1-CLICK)';
-                        ui.addNotification(null, E('p', data.message || '⚡ Đã kích hoạt chế độ Ghép Nối Mesh Tự Động!'), 'info');
-                        if (data.new_ip && data.new_ip !== window.location.hostname) {
-                            setTimeout(function() { window.location.href = 'http://' + data.new_ip + '/cgi-bin/luci'; }, 3500);
-                        } else {
-                            setTimeout(function() { refreshMeshDashboard(); }, 2000);
-                        }
-                    }).catch(function(err) {
-                        ev.target.disabled = false;
-                        ev.target.textContent = '⚡ BẬT GHÉP NỐI MESH TỰ ĐỘNG (1-CLICK)';
-                        ui.addNotification(null, E('p', '❌ Lỗi kích hoạt Mesh: ' + err), 'error');
-                    });
-            }
-        }, '⚡ BẬT GHÉP NỐI MESH TỰ ĐỘNG (1-CLICK)');
-
-        var btnSetMaster = E('button', {
-            class: 'btn cbi-button',
-            style: 'background: #0284c7; color: #ffffff; font-size: 13px; font-weight: 800; padding: 10px 16px; border-radius: 8px; cursor: pointer; border: none;',
-            click: function(ev) {
-                if (!confirm('Xác nhận đặt thiết bị này làm ROUTER PHÁT CHÍNH (Master Controller)?\n- IP LAN: 192.168.1.1\n- Bật máy chủ DHCP và phát sóng Backhaul SysMesh_Athena.')) return;
-                ev.target.disabled = true;
-                ev.target.textContent = '⏳ Đang cấu hình...';
-                fetch('/cgi-bin/airdrop?action=mesh_set_controller')
-                    .then(function(r) { return r.json(); })
-                    .then(function(data) {
-                        ev.target.disabled = false;
-                        ev.target.textContent = '👑 ĐẶT LÀM ROUTER CHÍNH (192.168.1.1)';
-                        ui.addNotification(null, E('p', data.message || '✅ Đã đặt thiết bị làm Router Phát Chính!'), 'info');
-                        setTimeout(function() { refreshMeshDashboard(); }, 1500);
-                    }).catch(function(err) {
-                        ev.target.disabled = false;
-                        ev.target.textContent = '👑 ĐẶT LÀM ROUTER CHÍNH (192.168.1.1)';
-                        ui.addNotification(null, E('p', '❌ Lỗi: ' + err), 'error');
-                    });
-            }
-        }, '👑 ĐẶT LÀM ROUTER CHÍNH (192.168.1.1)');
-
-        var btnSetSlave = E('button', {
-            class: 'btn cbi-button',
-            style: 'background: #ea580c; color: #ffffff; font-size: 13px; font-weight: 800; padding: 10px 16px; border-radius: 8px; cursor: pointer; border: none;',
-            click: function(ev) {
-                if (!confirm('Xác nhận chuyển thiết bị này thành ROUTER PHỤ (Slave Node)?\n- IP LAN sẽ đổi sang 192.168.1.10\n- Tắt DHCP LAN để không xung đột với Router Chính\n- Tự kết nối vào Router Chính qua sóng 5GHz.\nTrang LuCI sẽ tự chuyển sang http://192.168.1.10.')) return;
-                ev.target.disabled = true;
-                ev.target.textContent = '⏳ Đang chuyển sang Router Phụ...';
-                fetch('/cgi-bin/airdrop?action=mesh_set_node&ip=192.168.1.10')
-                    .then(function(r) { return r.json(); })
-                    .then(function(data) {
-                        ui.addNotification(null, E('p', '✅ ' + (data.message || 'Đã chuyển thành Router Phụ tại IP 192.168.1.10!')), 'info');
-                        setTimeout(function() { window.location.href = 'http://192.168.1.10/cgi-bin/luci'; }, 3500);
-                    }).catch(function(err) {
-                        ev.target.disabled = false;
-                        ev.target.textContent = '📡 ĐẶT LÀM ROUTER PHỤ (192.168.1.10)';
-                        ui.addNotification(null, E('p', '❌ Lỗi: ' + err), 'error');
-                    });
-            }
-        }, '📡 ĐẶT LÀM ROUTER PHỤ (192.168.1.10)');
-
-        var btnMeshSyncWifi = E('button', {
-            class: 'btn cbi-button',
-            style: 'background: #10b981; color: #ffffff; font-size: 13px; font-weight: 800; padding: 10px 16px; border-radius: 8px; cursor: pointer; border: none;',
-            click: function() {
-                ui.showModal('Đang đồng bộ Wi-Fi...', [ E('p', { class: 'spinning' }, 'Đang đồng bộ tên Wi-Fi và mật khẩu sang Router Phụ...') ]);
-                fetch('/cgi-bin/airdrop?action=mesh_sync_wifi')
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        ui.hideModal();
-                        ui.addNotification(null, E('p', {}, res.message || 'Đã đồng bộ Wi-Fi sang Router Phụ!'), 'info');
-                        refreshMeshDashboard();
-                    }).catch(function(err) {
-                        ui.hideModal();
-                        ui.addNotification(null, E('p', {}, 'Lỗi: ' + err), 'error');
-                    });
-            }
-        }, '🔄 ĐỒNG BỘ WI-FI SANG ROUTER PHỤ');
-
-        var btnUnmesh = E('button', {
-            class: 'btn cbi-button',
-            style: 'background: #dc2626; color: #ffffff; font-size: 13px; font-weight: 800; padding: 10px 16px; border-radius: 8px; cursor: pointer; border: none;',
-            click: function(ev) {
-                if (!confirm('Xác nhận tắt chế độ Mesh?\nRouter sẽ quay về chế độ Wi-Fi Độc Lập (Standalone).')) return;
-                var btn = ev.target;
-                btn.disabled = true;
-                btn.textContent = '⏳ Đang tắt Mesh...';
-                fetch('/cgi-bin/airdrop?action=mesh_unmesh')
-                    .then(function(r) { return r.json(); })
-                    .then(function(data) {
-                        btn.disabled = false;
-                        btn.textContent = '⛔ TẮT CHẾ ĐỘ MESH';
-                        ui.addNotification(null, E('p', '✅ ' + (data.message || 'Đã tắt hoàn toàn chế độ Mesh!')), 'info');
-                        refreshMeshDashboard();
-                    }).catch(function(err) {
-                        btn.disabled = false;
-                        btn.textContent = '⛔ TẮT CHẾ ĐỘ MESH';
-                        ui.addNotification(null, E('p', '❌ Lỗi: ' + err), 'error');
-                    });
-            }
-        }, '⛔ TẮT CHẾ ĐỘ MESH');
-
-        var btnRefreshMesh = E('button', {
-            class: 'btn cbi-button',
-            style: 'font-weight: 700; padding: 10px 16px; border-radius: 8px; cursor: pointer; border: 1px solid #cbd5e1; background: #ffffff;',
-            click: function() { refreshMeshDashboard(); }
-        }, '🔄 Làm Tươi');
-
-        function buildSharedMeshTopologyHtml(d, fast) {
-            var isMaster = (d.role === 'controller' || d.role === 'main' || d.local_ip === '192.168.1.1');
-            var isSlave = !isMaster;
-
-            var roleBadge = !d.mesh_active ?
-                '<span style="background: #ffffff; color: #000000; padding: 5px 12px; border-radius: 6px; font-weight: 800; font-size: 13px;">🟢 ROUTER PHÁT (ĐỘC LẬP - STANDALONE)</span>' :
-                (isMaster ? 
-                    '<span style="background: #e0f2fe; color: #0369a1; border: 1.5px solid #0284c7; padding: 5px 12px; border-radius: 6px; font-weight: 800; font-size: 13px;">👑 THIẾT BỊ PHÁT CHÍNH (MASTER CONTROLLER - GỐC)</span>' : 
-                    '<span style="background: #ffedd5; color: #c2410c; border: 1.5px solid #ea580c; padding: 5px 12px; border-radius: 6px; font-weight: 800; font-size: 13px;">📡 THIẾT BỊ PHỤ (SLAVE NODE - ĐANG TRUY CẬP)</span>');
-
-            var speedDisplay = (d.htmode === 'HE160') ? '2402.0 Mbps (HE160)' : ((d.htmode === 'HE80') ? '1201.0 Mbps (HE80)' : (d.htmode || '2402.0 Mbps (HE160)'));
-            var activeBadge = d.mesh_active ? 
-                '<span style="background: #ffffff; color: #15803d; border: 1px solid #86efac; padding: 5px 10px; border-radius: 6px; font-weight: 700; font-size: 12.5px;">🟢 Cụm Mesh Đang Hoạt Động (Wi-Fi 6 ' + (d.htmode || 'HE160') + ' • ' + speedDisplay + ')</span>' : 
-                '<span style="background: #ffffff; color: #475569; border: 1px solid #cbd5e1; padding: 5px 10px; border-radius: 6px; font-weight: 700; font-size: 12.5px;">⚪ Đã Tắt Mesh (Chế Độ Độc Lập)</span>';
-            var inetBadge = d.has_internet ?
-                '<span style="background: #ffffff; color: #15803d; border: 1px solid #86efac; padding: 5px 10px; border-radius: 6px; font-weight: 800; font-size: 12.5px;">🌐 Internet: Sẵn Sàng (' + (d.internet_source || 'Trực Tiếp') + ')</span>' :
-                '<span style="background: #ffffff; color: #b91c1c; border: 1px solid #fca5a5; padding: 5px 10px; border-radius: 6px; font-weight: 800; font-size: 12.5px;">❌ Mất Internet</span>';
-
-            // 1. THIẾT BỊ PHÁT CHÍNH (MASTER GATEWAY - GỐC CÓ MẠNG 192.168.1.1)
-            var masterIp = '192.168.1.1';
-            var masterModel = d.master_model || (isMaster ? 
-                ((fast && (fast.board_model || fast.model)) || window._savedBoardModel || d.board_model || d.local_name || 'Router Chính (Gateway)') : 
-                (d.master_model || 'Router Chính (Gateway)'));
-            var masterName = isMaster ? (d.local_name || 'ImmortalWrt') : (d.master_name || 'Router Chính');
-            var masterMac = d.master_mac || (isMaster ? (d.local_mac || '192.168.1.1') : (d.master_mac || '192.168.1.1'));
-            var masterCpu = isMaster ? 
-                ((fast && fast.soc_family) ? (fast.soc_family + (fast.cpu_cores ? ' (' + fast.cpu_cores + ' Cores • ' + (fast.cpu_freq_ghz || '2.0 GHz') + (fast.ram_total_mb ? ' • ' + Math.round(fast.ram_total_mb/1024*10)/10 + 'GB RAM' : '') + ')' : '')) : (d.soc_family ? (d.soc_family + (d.cpu_cores ? ' (' + d.cpu_cores + ' Cores' + (d.ram_total_mb ? ' • ' + Math.round(d.ram_total_mb/1024*10)/10 + 'GB RAM' : '') + ')' : '')) : 'Bộ Xử Lý Trung Tâm')) : 
-                (d.master_soc || 'Bộ Xử Lý Trung Tâm (Gateway)');
-            var masterWifi = (d.radio || 'radio1') + ' • Kênh ' + (d.channel || '36') + ' (' + speedDisplay + ')';
-            var masterInternet = isMaster ? 
-                ((fast && fast.wwan_signal) ? (fast.wwan_signal + ' • ' + (fast.wwan_band_detail ? fast.wwan_band_detail.split('•')[0] : '5G Sub-6')) : (d.internet_source || 'Cổng WAN/WWAN Trực Tiếp')) :
-                'Đường Ra Internet Trực Tiếp (Gateway Trung Tâm)';
-            var masterClients = isMaster ? ((fast && fast.online_clients) || '12') : 'Thiết bị Gateway';
-
-            var masterStatusBadge = isMaster ? 
-                '<span style="background: #e0f2fe; color: #0369a1; border: 1.5px solid #0284c7; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 800;">👑 Đang Truy Cập (Trang Hiện Tại)</span>' : 
-                '<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 800;">🟢 Online (Gateway)</span>';
-
-            var masterFooterBtn = isMaster ?
-                '<span style="background: #ffffff; color: #000000; padding: 2px 8px; border-radius: 10px; font-weight: 700; font-size: 11px;">Trạm Phát Trung Tâm ⭐</span>' :
-                '<a href="http://192.168.1.1" target="_blank" class="btn" style="background: #2563eb; color: #ffffff; border: none; padding: 4px 14px; font-size: 12px; font-weight: 800; border-radius: 6px; text-decoration: none; box-shadow: 0 2px 4px rgba(37, 99, 235, 0.2);">Mở LuCI Router Chính (192.168.1.1) ↗</a>';
-
-            var masterCardHtml = 
-                '<div style="max-width: 640px; margin: 0 auto; background: #ffffff; border: 1.5px solid #38bdf8; border-radius: 12px; padding: 16px; box-shadow: 0 4px 12px rgba(14, 165, 233, 0.1);">' +
-                    '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">' +
-                        '<span style="background: #e0f2fe; color: #0369a1; padding: 3px 12px; border-radius: 20px; font-size: 11.5px; font-weight: 800; letter-spacing: 0.5px; display: inline-flex; align-items: center; gap: 5px;">👑 TẦNG 1: ROUTER CHÍNH (MASTER CONTROLLER - GỐC)</span>' +
-                        masterStatusBadge +
-                    '</div>' +
-                    '<div style="font-size: 16.5px; font-weight: 800; color: #000000; margin-bottom: 8px; display:flex; align-items:center; gap:6px;">' + masterModel + ' <span style="font-size: 12.5px; font-weight: 600; color: #64748b;">(' + masterName + ')</span></div>' +
-                    '<div style="font-size: 12.5px; color: #000000; line-height: 1.8; display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 4px 16px;">' +
-                        '<div>🌐 <b>IP Quản Trị (Gateway):</b> <code style="color: #0369a1; font-weight: 800; background: #f0f9ff; padding: 1px 7px; border-radius: 4px; font-size: 13px;">' + masterIp + '</code></div>' +
-                        '<div>🏷️ <b>Địa chỉ MAC:</b> <span style="font-family: monospace; color: #000000; font-weight: 600;">' + masterMac + '</span></div>' +
-                        '<div>⚡ <b>Bộ Xử Lý & RAM:</b> ' + masterCpu + '</div>' +
-                        '<div>📻 <b>Wi-Fi 6 Phát Sóng:</b> ' + masterWifi + '</div>' +
-                        '<div style="grid-column: 1 / -1;">🌍 <b>Đường Ra Internet:</b> <span style="color: #000000; font-weight: 700;">' + masterInternet + '</span></div>' +
-                    '</div>' +
-                    '<div style="margin-top: 12px; padding-top: 10px; border-top: 1px solid #bae6fd; display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #000000;">' +
-                        '<span>📱 Thiết bị kết nối trực tiếp: <b style="color: #000000; font-size:13px;">' + masterClients + ' Online</b></span>' +
-                        masterFooterBtn +
-                    '</div>' +
-                '</div>';
-
-            // 2. DANH SÁCH THIẾT BỊ PHỤ (SLAVE NODES)
-            var slaveNodes = [];
-            if (isMaster) {
-                if (d.peers && d.peers.length > 0) {
-                    slaveNodes = d.peers.filter(function(p) {
-                        return p.ip && p.ip !== '192.168.1.1';
-                    });
-                }
-            } else {
-                var currentSlaveName = d.board_model || (fast && (fast.board_model || fast.model)) || window._savedBoardModel || d.local_name || 'Router Phụ';
-                var currentSlaveMac = d.local_mac || (d.peers && d.peers[0] && d.peers[0].mac) || '';
-                var currentSlaveSig = (d.peers && d.peers[0] && d.peers[0].signal) || '-21 dBm';
-                var currentSlaveBitrate = (d.peers && d.peers[0] && d.peers[0].bitrate) || '2402.0 Mbps (HE160)';
-                var currentSlaveAdvice = (d.peers && d.peers[0] && d.peers[0].advice) || '🟢 ĐÃ TỐI ƯU HOÀN HẢO (Sóng cực mạnh, đạt max tốc độ 2402 Mbps)';
-                slaveNodes.push({
-                    ip: d.local_ip || '192.168.1.10',
-                    mac: currentSlaveMac,
-                    name: currentSlaveName,
-                    signal: currentSlaveSig,
-                    bitrate: currentSlaveBitrate,
-                    advice: currentSlaveAdvice,
-                    url: 'http://' + (d.local_ip || '192.168.1.10'),
-                    is_current: true
-                });
-                if (d.peers && d.peers.length > 1) {
-                    d.peers.slice(1).forEach(function(p) {
-                        if (p.ip && p.ip !== (d.local_ip || '192.168.1.10') && p.ip !== '192.168.1.1') {
-                            slaveNodes.push(p);
-                        }
-                    });
-                }
-            }
-
-            var hasSlaves = (slaveNodes.length > 0);
-            var connectorLineColor = hasSlaves ? '#10b981' : (d.mesh_active ? '#0284c7' : '#94a3b8');
-            var connectorBorder = hasSlaves ? '#86efac' : (d.mesh_active ? '#bae6fd' : '#cbd5e1');
-
-            var connectorHtml = 
-                '<div style="display: flex; flex-direction: column; align-items: center; margin: 6px 0 10px 0;">' +
-                    '<div style="width: 2.5px; height: 22px; background: ' + connectorLineColor + ';"></div>' +
-                    '<div style="background: #ffffff; border: 1.5px solid ' + connectorBorder + '; color: #000000; padding: 4px 18px; border-radius: 20px; font-size: 11.5px; font-weight: 800; display: inline-flex; align-items: center; gap: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.06);">' +
-                        '<span>⚡ PHÂN TẦNG KẾT NỐI MESH BACKHAUL (WI-FI 6 HE160 • 2402 MBPS) ▼</span>' +
-                    '</div>' +
-                    '<div style="width: 2.5px; height: 22px; background: ' + connectorLineColor + ';"></div>' +
-                '</div>';
-
-            var slavesGridHtml = '';
-            var tableRowsHtml = '';
-
-            if (hasSlaves) {
-                slavesGridHtml = '<div style="display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px;">';
-                slaveNodes.forEach(function(p, idx) {
-                    var isCurrentThisNode = (p.is_current === true || (isSlave && p.ip === (d.local_ip || '192.168.1.10')));
-                    var nodeStatusBadge = isCurrentThisNode ?
-                        '<span style="background: #dcfce7; color: #15803d; border: 1.5px solid #16a34a; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 800;">📡 Đang Truy Cập (Trang Hiện Tại)</span>' :
-                        '<span style="background: #ffffff; color: #15803d; border: 1px solid #86efac; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 800;">🟢 Đã Ghép Nối</span>';
-
-                    var nodeBtnHtml = isCurrentThisNode ?
-                        '<span style="background: #f0fdf4; color: #16a34a; border: 1px solid #86efac; padding: 4px 12px; font-size: 12px; font-weight: 800; border-radius: 6px;">(Trang Hiện Tại)</span>' :
-                        '<a href="' + (p.url || ('http://' + p.ip)) + '" target="_blank" class="btn" style="background: #ffffff; color: #000000; border: 1px solid #cbd5e1; padding: 4px 12px; font-size: 12px; font-weight: 800; border-radius: 6px; text-decoration: none; box-shadow: 0 2px 4px rgba(5, 150, 105, 0.2);">Mở LuCI Node ↗</a>';
-
-                    slavesGridHtml += 
-                        '<div style="background: #ffffff; border: 1.5px solid #86efac; border-radius: 12px; padding: 16px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.1); min-width: 300px; max-width: 440px; flex: 1; display: flex; flex-direction: column; justify-content: space-between;">' +
-                            '<div>' +
-                                '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">' +
-                                    '<span style="background: #ffedd5; color: #c2410c; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 800; letter-spacing: 0.5px; display: inline-flex; align-items: center; gap: 4px;">📡 TẦNG 2: ROUTER PHỤ (SLAVE NODE ' + (idx + 1) + ')</span>' +
-                                    nodeStatusBadge +
-                                '</div>' +
-                                '<div style="font-size: 16px; font-weight: 800; color: #000000; margin-bottom: 8px;">' + (p.name || 'Router Phụ ' + (idx + 1)) + '</div>' +
-                                '<div style="font-size: 12.5px; color: #000000; line-height: 1.8;">' +
-                                    '<div>🌐 <b>IP Quản Trị:</b> <a href="' + (p.url || ('http://' + p.ip)) + '" target="_blank" style="color: #0284c7; font-weight: 800; background: #f0f9ff; padding: 1px 7px; border-radius: 4px; text-decoration: none; font-size: 13px;">' + p.ip + ' ↗</a></div>' +
-                                    '<div>🏷️ <b>MAC Đối Tác:</b> <span style="font-family: monospace; color: #000000; font-weight: 600;">' + (p.mac || '-') + '</span></div>' +
-                                    '<div>📶 <b>Cường Độ Sóng:</b> <span style="color: #15803d; font-weight: 800; font-size: 13px;">' + p.signal + '</span></div>' +
-                                    '<div>🚀 <b>Tốc Độ Kết Nối:</b> <span style="color: #000000; font-weight: 700;">' + p.bitrate + '</span></div>' +
-                                    '<div>🛡️ <b>Đánh Giá Vị Trí:</b> <span style="font-size: 11.5px;">' + (p.advice || '🟢 ĐÃ TỐI ƯU HOÀN HẢO (Sóng cực mạnh, đạt max tốc độ 2402 Mbps)') + '</span></div>' +
-                                '</div>' +
-                            '</div>' +
-                            '<div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid #bbf7d0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">' +
-                                '<span style="font-size: 11px; color: #000000;">Fast Roaming: <b style="color: #15803d;">802.11r/k/v Bật</b></span>' +
-                                nodeBtnHtml +
-                            '</div>' +
-                        '</div>';
-
-                    var tableNodeAction = isCurrentThisNode ?
-                        '<span style="color: #15803d; font-weight:700; font-size:12px;">(Trang Hiện Tại)</span>' :
-                        '<a href="' + (p.url || ('http://' + p.ip)) + '" target="_blank" class="btn" style="background: #2563eb; color: #ffffff; border:none; padding:3px 10px; font-size:12px; font-weight:700; border-radius:4px; text-decoration:none;">Mở LuCI Node ↗</a>';
-
-                    tableRowsHtml += '<tr>' +
-                        '<td style="padding: 8px 10px;"><span style="background: #ffedd5; color: #c2410c; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:800;">📡 TẦNG 2 (NODE ' + (idx+1) + ')</span></td>' +
-                        '<td style="padding: 8px 10px;"><b>' + (p.name || 'Router Phụ') + '</b></td>' +
-                        '<td style="padding: 8px 10px;"><span style="color: #c2410c; font-weight: 800;">📡 THIẾT BỊ PHỤ (TIẾP SÓNG MESH)</span></td>' +
-                        '<td style="padding: 8px 10px;"><code>' + (p.ip || '-') + '</code></td>' +
-                        '<td style="padding: 8px 10px;"><span style="font-family:monospace; color: #000000;">' + (p.mac || '-') + '</span></td>' +
-                        '<td style="padding: 8px 10px;"><span style="color: #15803d; font-weight:700;">' + p.signal + '</span></td>' +
-                        '<td style="padding: 8px 10px;"><b>' + p.bitrate + '</b></td>' +
-                        '<td style="padding: 8px 10px;">' + (p.advice || '🟢 ĐÃ TỐI ƯU HOÀN HẢO') + '</td>' +
-                        '<td style="padding: 8px 10px;">' + tableNodeAction + '</td>' +
-                    '</tr>';
-                });
-                slavesGridHtml += '</div>';
-            } else {
-                var standbyBadge = d.mesh_active ?
-                    '<span style="background: #ffffff; color: #d97706; border: 1.5px solid #fcd34d; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 800;">⏳ Đang Quét & Chờ Bắt Tay</span>' :
-                    '<span style="background: #ffffff; color: #475569; border: 1.5px solid #cbd5e1; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 800;">💤 Sẵn Sàng (Cắm Điện Hoặc Bấm 1-Click)</span>';
-
-                slavesGridHtml = 
-                    '<div style="display: flex; justify-content: center; margin-bottom: 16px;">' +
-                        '<div style="max-width: 640px; width: 100%; background: #ffffff; border: 1.5px dashed #94a3b8; border-radius: 12px; padding: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">' +
-                            '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 6px;">' +
-                                '<span style="background: #ffedd5; color: #c2410c; padding: 3px 12px; border-radius: 20px; font-size: 11.5px; font-weight: 800; letter-spacing: 0.5px; display: inline-flex; align-items: center; gap: 5px;">📡 TẦNG 2: THIẾT BỊ PHỤ (SLAVE NODE - CHẾ ĐỘ CHỜ)</span>' +
-                                standbyBadge +
-                            '</div>' +
-                            '<div style="font-size: 16px; font-weight: 800; color: #000000; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">' +
-                                '🔄 Router Phụ Phân Tầng <span style="font-size: 12.5px; font-weight: 600; color: #64748b;">(Tự Động Nhận Diện Khi Cắm Điện)</span>' +
-                            '</div>' +
-                            '<div style="font-size: 12.5px; color: #000000; line-height: 1.8; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 4px 16px;">' +
-                                '<div>🌐 <b>IP Khi Kết Nối Mesh:</b> <code style="color: #0284c7; font-weight: 800; background: #f0f9ff; padding: 1px 7px; border-radius: 4px;">192.168.1.10</code> <span style="color: #64748b; font-size:11px;">(Tự tắt DHCP)</span></div>' +
-                                '<div>🔄 <b>IP Khi Ngắt Mesh:</b> <code style="color: #0284c7; font-weight: 800; background: #f0f9ff; padding: 1px 7px; border-radius: 4px;">192.168.1.1</code> <span style="color: #64748b; font-size:11px;">(Tự bật DHCP)</span></div>' +
-                                '<div>⚡ <b>Tốc Độ Kết Nối Chuẩn:</b> <b style="color: #15803d;">2402.0 Mbps (Wi-Fi 6 HE160)</b></div>' +
-                                '<div>🚀 <b>Chuyển Vùng Sóng:</b> <b style="color: #15803d;">Fast Roaming 802.11r/k/v</b></div>' +
-                                '<div style="grid-column: 1 / -1; background: #f8fafc; padding: 9px 14px; border-radius: 8px; font-size: 12px; color: #334155; line-height: 1.6; margin-top: 6px; border: 1px solid #e2e8f0;">' +
-                                    '💡 <b>Cơ Chế Hoàn Toàn Tự Động 100%:</b>' +
-                                    '<ul style="margin: 4px 0 0 16px; padding: 0;">' +
-                                        '<li>Router có Internet (WAN/5G) luôn là <b>Router Chính</b>, Router không có Internet tự làm <b>Router Phụ</b>.</li>' +
-                                        '<li>Khi kết nối Mesh: Router phụ tự đổi IP sang <code>192.168.1.10</code> và tắt DHCP.</li>' +
-                                        '<li>Khi ngắt kết nối Mesh: Router phụ tự khôi phục lại IP mặc định <code>192.168.1.1</code> và bật lại DHCP.</li>' +
-                                        '<li>Sau 10 phút khởi động nếu không ghép nối, cả chính và phụ sẽ <b>tự động tắt Mesh</b> để tiết kiệm sóng Wi-Fi và tài nguyên CPU/RAM. Bấm 1-Click bất kỳ lúc nào để ghép nối lại!</li>' +
-                                    '</ul>' +
-                                '</div>' +
-                            '</div>' +
-                        '</div>' +
-                    '</div>';
-            }
-
-            var tableMasterAction = isMaster ?
-                '<span style="color: #0369a1; font-weight:700; font-size:12px;">(Trang Hiện Tại)</span>' :
-                '<a href="http://192.168.1.1" target="_blank" class="btn" style="background: #2563eb; color: #ffffff; border:none; padding:3px 10px; font-size:12px; font-weight:700; border-radius:4px; text-decoration:none;">Mở LuCI Router Chính ↗</a>';
-
-            var fullTableHtml = '<table class="table" style="width:100%; margin-top: 10px; font-size: 13px; border-collapse: collapse;">' +
-                '<thead><tr style="background: #f8fafc; border-bottom: 1.5px solid #cbd5e1;">' +
-                    '<th style="padding: 8px 10px;">Phân Cấp</th>' +
-                    '<th style="padding: 8px 10px;">Tên Thiết Bị</th>' +
-                    '<th style="padding: 8px 10px;">Vai Trò Thực Tế</th>' +
-                    '<th style="padding: 8px 10px;">IP Quản Trị</th>' +
-                    '<th style="padding: 8px 10px;">Địa Chỉ MAC</th>' +
-                    '<th style="padding: 8px 10px;">Cường Độ Sóng</th>' +
-                    '<th style="padding: 8px 10px;">Băng Thông</th>' +
-                    '<th style="padding: 8px 10px;">Đánh Giá Vị Trí</th>' +
-                    '<th style="padding: 8px 10px;">Thao Tác</th>' +
-                '</tr></thead><tbody>' +
-                '<tr style="background: #ffffff; border-bottom: 1px solid #f1f5f9;">' +
-                    '<td style="padding: 8px 10px;"><span style="background: #e0f2fe; color: #0369a1; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:800;">👑 TẦNG 1 (GỐC)</span></td>' +
-                    '<td style="padding: 8px 10px;"><b>' + masterModel + '</b></td>' +
-                    '<td style="padding: 8px 10px;"><span style="color: #0369a1; font-weight: 800;">👑 THIẾT BỊ PHÁT CHÍNH (CÓ MẠNG GỐC)</span></td>' +
-                    '<td style="padding: 8px 10px;"><code style="font-weight:700; font-size:13px; color: #0369a1;">' + masterIp + '</code></td>' +
-                    '<td style="padding: 8px 10px;"><span style="font-family:monospace; color: #000000;">' + masterMac + '</span></td>' +
-                    '<td style="padding: 8px 10px;"><span style="color: #15803d; font-weight:700;">🟢 Cực Mạnh (Gốc)</span></td>' +
-                    '<td style="padding: 8px 10px;"><b>' + speedDisplay + '</b></td>' +
-                    '<td style="padding: 8px 10px;"><span style="color: #d97706; font-weight:700;">⭐ Gateway Trung Tâm</span></td>' +
-                    '<td style="padding: 8px 10px;">' + tableMasterAction + '</td>' +
-                '</tr>' +
-                tableRowsHtml +
-                '</tbody></table>';
-
-            var headerTitleHtml = d.mesh_active ?
-                '<div><h4 style="margin: 0; font-size: 16px; font-weight: 800; color: #0f172a;">📡 Bảng Điều Khiển Cụm Wi-Fi Mesh Tự Động (Live)</h4><div style="color: #64748b; font-size: 12.5px; margin-top: 2px;">Chuẩn Fast Roaming 802.11r/k/v chuyển vùng sóng tức thì không gián đoạn Game / Video Call</div></div>' :
-                '<div><h4 style="margin: 0; font-size: 16px; font-weight: 800; color: #0f172a;">📡 Bảng Quản Lý Wi-Fi Mesh (Hiện Đang Tắt - Chế Độ Độc Lập)</h4><div style="color: #64748b; font-size: 12.5px; margin-top: 2px;">Router đang hoạt động độc lập (Standalone), dành trọn 2402 Mbps băng thông Wi-Fi 6 cho thiết bị</div></div>';
-
-            var timeoutNotice = '';
-            if (d.mesh_active && d.mesh_timeout_left > 0 && (!d.peer_count || d.peer_count === 0)) {
-                var min = Math.floor(d.mesh_timeout_left / 60);
-                var sec = d.mesh_timeout_left % 60;
-                timeoutNotice = '<div style="margin-bottom: 12px; font-size: 13px; color: #b45309; font-weight: 700; background: #fffbeb; border: 1.5px solid #f59e0b; padding: 10px 14px; border-radius: 8px; display: flex; align-items: center; gap: 8px;">' +
-                    '⏱️ <b>Tự động tắt Mesh:</b> Còn <b>' + min + ' phút ' + (sec < 10 ? '0' : '') + sec + ' giây</b> (Hệ thống sẽ tự động tắt chế độ Mesh và ẩn thiết bị để giải phóng băng thông Wi-Fi nếu không có Router phụ)' +
-                '</div>';
-            }
-
-            var cardMeshIdHtml = d.mesh_active ?
-                ('<div style="background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0;">🏷️ <b>Mesh ID:</b> <code style="color: #0369a1; font-weight:700;">' + (d.mesh_id || 'immorWRT-5G') + '</code></div>') :
-                ('<div style="background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0;">🏷️ <b>Mesh ID:</b> <span style="color: #64748b; font-weight:700;">Đã tắt (Không phát sóng)</span></div>');
-
-            var cardFastRoamingHtml = (d.mesh_active && d.fast_roaming) ?
-                ('<div style="background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0;">🚀 <b>Fast Roaming:</b> <span style="color: #15803d; font-weight:700;">BẬT (802.11r)</span></div>') :
-                ('<div style="background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0;">🚀 <b>Fast Roaming:</b> <span style="color: #64748b; font-weight:700;">Tắt (Chế độ Độc Lập)</span></div>');
-
-            var cardChannelHtml = d.mesh_active ? 
-                ('<div style="background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0;">📻 <b>Card & Kênh Backhaul:</b> ' + (d.radio || 'radio1') + ' (Kênh ' + (d.channel || '36') + ' - ' + (d.htmode || 'HE160') + ')</div>') :
-                ('<div style="background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0;">📻 <b>Sóng Phụ Mesh:</b> <span style="color: #64748b; font-weight:700;">ĐÃ TẮT HOÀN TOÀN (Dành trọn 2402 Mbps cho thiết bị)</span></div>');
-
-            var totalNodeCount = hasSlaves ? slaveNodes.length : 0;
-
-            return '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">' +
-                    headerTitleHtml +
-                    '<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' + roleBadge + ' ' + activeBadge + ' ' + inetBadge + '</div>' +
-                '</div>' +
-                timeoutNotice +
-                '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 14px; font-size: 13.5px;">' +
-                    cardMeshIdHtml +
-                    cardChannelHtml +
-                    '<div style="background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0;">👥 <b>Số Node liên kết:</b> <b>' + totalNodeCount + ' Node</b></div>' +
-                    cardFastRoamingHtml +
-                '</div>' +
-                '<div style="margin-top: 14px; margin-bottom: 8px;"><b>Danh Sách Router Đã Bắt Tay & Kết Nối:</b></div>' +
-                masterCardHtml +
-                connectorHtml +
-                slavesGridHtml +
-                '<div style="margin-top: 16px;">' + fullTableHtml + '</div>';
-        }
-
-        function refreshMeshDashboard() {
-            Promise.all([
-                fetch('/cgi-bin/airdrop?action=mesh_status&t=' + Date.now()).then(function(r) { return r.json(); }).catch(function() { return {}; }),
-                fetch('/cgi-bin/airdrop?action=fast_stats&t=' + Date.now()).then(function(r) { return r.json(); }).catch(function() { return {}; })
-            ]).then(function(resList) {
-                var d = resList[0] || {};
-                var fast = resList[1] || {};
-                meshStatusCard.innerHTML = buildSharedMeshTopologyHtml(d, fast);
-            }).catch(function(err) {
-                meshStatusCard.innerHTML = '<div style="color: #dc2626; font-weight: 700; padding: 15px;">Lỗi tải dữ liệu Mesh: ' + err + '</div>';
-            });
-        }
-        refreshMeshDashboard();
-
-        var meshTabContent = E('div', { class: 'cbi-section', style: 'display: none; padding: 20px; background: #ffffff; border-radius: 10px; border: 1px solid #e2e8f0;' }, [
-            E('h3', { style: 'margin-top: 0; font-size: 18px; font-weight: 800; color: #1e293b; border-bottom: 1px solid #f1f5f9; padding-bottom: 10px;' }, '⚡ 1-Click Auto Mesh & Roaming Không Giây (802.11s / 802.11r/k/v)'),
-            meshStatusCard,
-            E('div', { style: 'display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding: 14px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0;' }, [
-                btnTriggerMeshPair,
-                btnSetMaster,
-                btnSetSlave,
-                btnMeshSyncWifi,
-                btnUnmesh,
-                btnRefreshMesh
-            ])
-        ]);
-        tabPanes['mesh'] = meshTabContent;
-
-        // ---------------- TAB 4: TELEGRAM BOT, AI SENTINEL, MULTI-KEY VAULT & REMOTE ACCESS ----------------
+        // ---------------- TAB 3: TELEGRAM BOT, AI SENTINEL, MULTI-KEY VAULT & REMOTE ACCESS ----------------
         var teleOwnerInput = E('input', { type: 'text', class: 'cbi-input-text', value: sentinelConfig.tg_owner_name || 'Anh Duy', placeholder: 'Tên chủ sở hữu (vd: Anh Duy)', style: 'width: 100%; height: 38px; font-weight: 700; border-radius: 6px; margin-bottom: 10px;' });
         var emgPhoneInput = E('input', { type: 'text', class: 'cbi-input-text', value: sentinelConfig.emergency_phone || '', placeholder: 'SĐT khẩn cấp gọi/nhắn tin báo động (vd: 0912345678)', style: 'width: 100%; height: 38px; font-weight: 700; border-radius: 6px; margin-bottom: 10px;' });
         var cloudRemoteInput = E('input', { type: 'text', class: 'cbi-input-text', value: sentinelConfig.cloud_remote || '', placeholder: 'Tên Remote Cloud Rclone (vd: gdrive, onedrive)', style: 'width: 100%; height: 38px; font-weight: 700; border-radius: 6px; margin-bottom: 10px;' });
@@ -1795,7 +1371,11 @@ return view.extend({
                 : E('span', { style: 'color: #64748b;' }, 'Chưa mở');
 
             remoteBodyContainer.innerHTML = '';
-            remoteBodyContainer.appendChild(E('div', { style: 'display: flex; flex-direction: column; gap: 12px;' }, [
+            var children = [];
+            if (st.has_root_password === false) {
+                children.push(E('div', { style: 'background: #fef3c7; border: 1px solid #f59e0b; color: #92400e; padding: 10px 14px; border-radius: 8px; font-weight: 700; font-size: 13px;' }, '⚠️ Router chưa đặt mật khẩu root! Hãy vào Hệ thống -> Quản trị đặt mật khẩu trước khi bật Funnel HTTPS, Tunnel hoặc mở cổng WAN.'));
+            }
+            children.push(
                 E('div', { style: 'background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 14px;' }, [
                     E('div', { style: 'font-weight: 750; color: #0f172a; margin-bottom: 6px;' }, '1️⃣ Tailscale VPN & Kết Nối Máy Ảo Debian: ' + (st.tailscale_installed ? (st.tailscale_up ? ('🟢 Đang kết nối (' + (st.tailscale_ip || '-') + (st.tailscale_dns ? (' | ' + st.tailscale_dns) : '') + ')') : '🟡 Đã cài sẵn (Chưa bật)') : '⚙️ Chưa có sẵn binary — tự động tải, cài đặt & nối máy ảo khi bấm hoặc khi có Key trong Vault')),
                     E('div', { style: 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center;' }, [
@@ -1873,7 +1453,8 @@ return view.extend({
                         }, '⏹️ Đóng Tunnel')
                     ])
                 ])
-            ]));
+            );
+            remoteBodyContainer.appendChild(E('div', { style: 'display: flex; flex-direction: column; gap: 12px;' }, children));
         }
         renderRemotePanel(remoteState);
 
@@ -1965,16 +1546,6 @@ return view.extend({
             }
         }, '⚡ Nạp Lại Toàn Bộ Key Từ Vault');
 
-        var testSirenBtn = E('button', {
-            class: 'btn cbi-button',
-            style: 'font-weight: 750; font-size: 13px; padding: 9px 16px; border-radius: 6px; background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5;',
-            click: function() {
-                callTriggerAITest('siren', 'all').then(function() {
-                    ui.addNotification(null, E('p', '🚨 Đang phát còi báo động khẩn cấp!'), 'info');
-                });
-            }
-        }, '🚨 Test Còi Báo Động');
-
         var sentinelTabContent = E('div', { class: 'cbi-section', style: 'display: none; padding: 20px; background: #ffffff; border-radius: 10px; border: 1px solid #e2e8f0;' }, [
             E('h3', { style: 'margin-top: 0; font-size: 18px; font-weight: 800; color: #1e293b; border-bottom: 1px solid #f1f5f9; padding-bottom: 10px;' }, '🤖 Telegram, AI Sentinel, Kho Key Đa Tài Khoản & Kết Nối Từ Xa'),
             E('div', { style: 'border: 1px solid #f1f5f9; border-radius: 8px; padding: 16px; background: #fafafa; margin-bottom: 14px;' }, [
@@ -2014,8 +1585,7 @@ return view.extend({
             ]),
             E('div', { style: 'display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 18px;' }, [
                 saveAllSentinelBtn,
-                loadVaultBtn,
-                testSirenBtn
+                loadVaultBtn
             ]),
             E('div', { style: 'border: 1px solid #dbeafe; border-radius: 8px; padding: 16px; background: #f8fafc;' }, [
                 E('div', { style: 'font-weight: 800; font-size: 15px; color: #0f172a; margin-bottom: 12px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;' }, '🌐 Kết Nối Từ Xa, Tailscale & Mở Port An Toàn'),
@@ -2028,7 +1598,6 @@ return view.extend({
             navBar,
             simTabContent,
             modemTabContent,
-            meshTabContent,
             sentinelTabContent
         ]);
 

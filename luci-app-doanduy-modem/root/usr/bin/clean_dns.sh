@@ -37,13 +37,25 @@ server=/trycloudflare.com/1.1.1.1
 server=/trycloudflare.com/8.8.8.8
 bogus-nxdomain=125.235.4.59
 EOF
-    cp -f "$CONF_FILE" "$PERM_CONF" 2>/dev/null
+    if [ ! -f "$PERM_CONF" ] || ! cmp -s "$CONF_FILE" "$PERM_CONF" 2>/dev/null; then
+        cp -f "$CONF_FILE" "$PERM_CONF" 2>/dev/null
+    fi
     
-    # Đảm bảo Smart DNS Racer (allservers), cache 10,000 mục và máy chủ DNS cố định trong UCI Flash
+    local mem_mb target_cache=10000
+    mem_mb=$(awk '/MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 256)
+    if [ "${mem_mb:-0}" -le 128 ]; then
+        target_cache=2000
+    elif [ "${mem_mb:-0}" -le 256 ]; then
+        target_cache=5000
+    fi
+
+    # Đảm bảo Smart DNS Racer (allservers), cache RAM theo cấu hình & máy chủ DNS cố định trong UCI Flash
     local need_commit=0
     [ "$(uci -q get dhcp.@dnsmasq[0].allservers)" != "1" ] && { uci -q set dhcp.@dnsmasq[0].allservers='1'; need_commit=1; }
-    [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" != "10000" ] && { uci -q set dhcp.@dnsmasq[0].cachesize='10000'; need_commit=1; }
+    [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" != "$target_cache" ] && { uci -q set dhcp.@dnsmasq[0].cachesize="$target_cache"; need_commit=1; }
     [ "$(uci -q get dhcp.@dnsmasq[0].min_cache_ttl)" != "300" ] && { uci -q set dhcp.@dnsmasq[0].min_cache_ttl='300'; need_commit=1; }
+    [ "$(uci -q get dhcp.@dnsmasq[0].dnsforwardmax)" != "512" ] && { uci -q set dhcp.@dnsmasq[0].dnsforwardmax='512'; need_commit=1; }
+    [ "$(uci -q get dhcp.@dnsmasq[0].nonegcache)" != "1" ] && { uci -q set dhcp.@dnsmasq[0].nonegcache='1'; need_commit=1; }
     for s in 8.8.8.8 1.1.1.1 9.9.9.9 203.113.131.1; do
         if ! uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -q "$s"; then
             uci -q add_list dhcp.@dnsmasq[0].server="$s"
@@ -60,22 +72,20 @@ EOF
 }
 
 enable_doh_privacy_shield() {
-    # Tính Năng 4: DoH/DoT Privacy Shield & Smart RAM Cache 1ms
-    # Thiết lập cache RAM 10.000 entries an toàn qua UCI
-    uci -q set dhcp.@dnsmasq[0].cachesize='10000'
-    uci -q set dhcp.@dnsmasq[0].dnsforwardmax='1000'
-    uci -q set dhcp.@dnsmasq[0].nonegcache='1'
-    uci -q commit dhcp 2>/dev/null
+    local mem_mb target_cache=10000
+    mem_mb=$(awk '/MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 256)
+    [ "${mem_mb:-0}" -le 128 ] && target_cache=2000
+    [ "${mem_mb:-0}" -gt 128 ] && [ "${mem_mb:-0}" -le 256 ] && target_cache=5000
     rm -f "$CONF_DIR/doh_shield.conf" 2>/dev/null
 
-    # Tạo trạng thái Privacy Shield JSON
+    # Tạo trạng thái Clean DNS JSON chính xác (Zero Flash wear)
     cat << EOF > /tmp/doh_privacy_shield.json.tmp
 {
-    "doh_shield": true,
-    "privacy_mode": "Encrypted-DoH-DoT-Hybrid",
+    "doh_shield": false,
+    "privacy_mode": "Quad-Stack-Anycast-DNS",
     "upstreams": ["1.1.1.1 (Cloudflare)", "8.8.8.8 (Google)", "9.9.9.9 (Quad9)"],
-    "ram_cache_entries": 10000,
-    "dnssec_validated": true,
+    "ram_cache_entries": $target_cache,
+    "dnssec_validated": false,
     "zero_leak_status": "protected",
     "updated_at": $(date +%s)
 }

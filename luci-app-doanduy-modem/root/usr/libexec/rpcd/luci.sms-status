@@ -1,26 +1,8 @@
 #!/bin/sh
-LOCK_DIR="/tmp/at_atomic_lock.d"
 
 safe_at_cleanup() {
     killall -CONT ModemManager modemmanager 2>/dev/null
     rm -f /tmp/sms_sending.lock 2>/dev/null
-    rmdir "$LOCK_DIR" 2>/dev/null
-}
-
-acquire_lock_safe() {
-    local count=0
-    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        usleep 100000
-        count=$((count + 1))
-        if [ "$count" -ge 40 ]; then
-            rm -rf "$LOCK_DIR" 2>/dev/null
-            mkdir "$LOCK_DIR" 2>/dev/null && break
-        fi
-    done
-}
-
-release_lock_safe() {
-    rmdir "$LOCK_DIR" 2>/dev/null
 }
 
 release_ports() {
@@ -30,6 +12,20 @@ release_ports() {
 
 restore_ports() {
     killall -CONT ModemManager modemmanager 2>/dev/null
+}
+
+is_sierra_modem() {
+    local mt=""
+    mt=$(cat /tmp/master_m_type 2>/dev/null || echo "")
+    [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    printf '%s' "${mt}|${META_VENDOR}|${META_MODEL}|${META_USB_VID}" | grep -iqE "sierra|em919|em75|1199"
+}
+
+get_modem_meta_str() {
+    local mt=""
+    mt=$(cat /tmp/master_m_type 2>/dev/null || echo "")
+    [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    printf '%s' "${mt}|${META_VENDOR}|${META_MODEL}|${META_USB_VID}"
 }
 
 get_active_modem_port() {
@@ -130,7 +126,7 @@ send_at_direct() {
                 out=$(modem_lock_run sms_tool -d "$p" -D at "$cmd" 2>/dev/null)
             fi
             if [ -z "$out" ] && command -v atinout >/dev/null 2>&1; then
-                out=$(modem_lock_run sh -c "printf '%s\r\n' \"$cmd\" | atinout - '$p' -" 2>/dev/null)
+                out=$(printf '%s\r\n' "$cmd" | modem_lock_run timeout 3 atinout - "$p" - 2>/dev/null)
             fi
             ;;
     esac
@@ -140,7 +136,7 @@ send_at_direct() {
 
 case "$1" in
     list)
-        echo '{"getSMSInfo":{},"sendSMS":{"target":"string","msg":"string"},"sendAT":{"cmd":"string"},"setCustomSchedule":{"datetime":"string"},"getAvailablePorts":{},"setCustomAtPort":{"port":"string"},"fetchSMSNow":{},"deleteSingleSMS":{"indices":"string","storage":"string"},"deleteAllSMS":{},"checkDataBalance":{},"setBandLock":{"mode":"string"},"getCellInfo":{},"setCellLock":{"action":"string"}}'
+        echo '{"getSMSInfo":{},"sendSMS":{"target":"string","msg":"string"},"sendAT":{"cmd":"string","port":"string"},"setCustomSchedule":{"datetime":"string"},"getAvailablePorts":{},"setCustomAtPort":{"port":"string"},"fetchSMSNow":{},"deleteSingleSMS":{"indices":"string","storage":"string"},"deleteAllSMS":{},"checkDataBalance":{},"setBandLock":{"mode":"string"},"getCellInfo":{},"setCellLock":{"action":"string"},"setCardMode":{"mode":"string","iface_name":"string"},"renameInterface":{"new_name":"string"}}'
         ;;
     call)
         read -r -t 1 input 2>/dev/null || [ -n "$input" ] || input=""
@@ -151,19 +147,27 @@ case "$1" in
                     exit 0
                 fi
 
-                cmd=$(echo "$input" | jsonfilter -e '$.cmd' 2>/dev/null)
+                cmd=$(printf '%s' "$input" | jsonfilter -e '$.cmd' 2>/dev/null | tr -d '\r\n\000-\037' | cut -c1-128)
+                req_port=$(printf '%s' "$input" | jsonfilter -e '$.port' 2>/dev/null | tr -cd 'a-zA-Z0-9/_-')
                 [ -z "$cmd" ] && cmd="ATI"
+                case "$cmd" in
+                    [Aa][Tt]*) ;;
+                    *) echo '{"success":false,"message":"Lệnh AT phải bắt đầu bằng AT!"}'; exit 0 ;;
+                esac
 
-                port=$(get_active_modem_port)
+                if [ -n "$req_port" ] && [ -c "$req_port" ]; then
+                    port="$req_port"
+                else
+                    port=$(get_active_modem_port)
+                fi
 
                 if [ -n "$port" ] && [ -c "$port" ]; then
                     touch /tmp/sms_sending.lock
-                    acquire_lock_safe
                     trap 'safe_at_cleanup' EXIT INT TERM
                     release_ports
-                    
+
                     reply=$(send_at_direct "$port" "$cmd")
-                    
+
                     if [ -z "$reply" ]; then
                         for alt_port in /dev/ttyUSB2 /dev/ttyUSB3 /dev/ttyUSB0 /dev/ttyUSB1; do
                             [ -c "$alt_port" ] && [ "$alt_port" != "$port" ] || continue
@@ -180,7 +184,6 @@ case "$1" in
 
                     restore_ports
                     rm -f /tmp/sms_sending.lock
-                    release_lock_safe
                     trap - EXIT INT TERM
                     
                     if [ -z "$reply" ]; then
@@ -236,22 +239,21 @@ case "$1" in
                 
                 if [ -n "$port" ] && [ -c "$port" ] && command -v sms_tool >/dev/null 2>&1; then
                     touch /tmp/sms_sending.lock
-                    acquire_lock_safe
                     trap 'safe_at_cleanup' EXIT INT TERM
                     release_ports
                     combined_sms=""
 
-                    sms_me=$(timeout 8 modem_lock_run sms_tool -s ME -d "$port" recv 2>/dev/null)
+                    sms_me=$(modem_lock_run timeout 8 sms_tool -s ME -d "$port" recv 2>/dev/null)
                     [ -n "$sms_me" ] && combined_sms="[ BỘ NHỚ MODEM (ME) ]:\n$sms_me"
 
-                    sms_sm=$(timeout 8 modem_lock_run sms_tool -s SM -d "$port" recv 2>/dev/null)
+                    sms_sm=$(modem_lock_run timeout 8 sms_tool -s SM -d "$port" recv 2>/dev/null)
                     if [ -n "$sms_sm" ]; then
                         [ -n "$combined_sms" ] && combined_sms="${combined_sms}\n\n"
                         combined_sms="${combined_sms}[ BỘ NHỚ SIM (SM) ]:\n$sms_sm"
                     fi
 
                     if [ -z "$combined_sms" ]; then
-                        sms_mt=$(timeout 8 modem_lock_run sms_tool -s MT -d "$port" recv 2>/dev/null)
+                        sms_mt=$(modem_lock_run timeout 8 sms_tool -s MT -d "$port" recv 2>/dev/null)
                         [ -n "$sms_mt" ] && combined_sms="[ BỘ NHỚ TỔNG HỢP (MT) ]:\n$sms_mt"
                     fi
 
@@ -273,7 +275,6 @@ case "$1" in
 
                     restore_ports
                     rm -f /tmp/sms_sending.lock
-                    release_lock_safe
                     trap - EXIT INT TERM
                     
                     if [ -n "$combined_sms" ]; then
@@ -310,7 +311,6 @@ case "$1" in
                     exit 0
                 fi
                 touch /tmp/sms_sending.lock
-                acquire_lock_safe
                 trap 'safe_at_cleanup' EXIT INT TERM
                 release_ports
                 send_at_direct "$port" "AT+CMGD=1,4" >/dev/null 2>&1
@@ -324,16 +324,17 @@ case "$1" in
                 fi
                 restore_ports
                 rm -f /tmp/sms_sending.lock
-                release_lock_safe
                 trap - EXIT INT TERM
                 printf '"%s"' "Đã xóa sạch tất cả tin nhắn." > /tmp/sms_inbox.json
                 echo '{"success":true,"message":"Đã xóa toàn bộ tin nhắn thành công!"}'
                 ;;
             getSMSInfo)
                 port=$(get_active_modem_port)
-                if [ ! -s /tmp/master_sim_status ] && [ -x /www/cgi-bin/sim_manager ]; then
-                    QUERY_STRING="action=get_state" /www/cgi-bin/sim_manager >/dev/null 2>&1
+                if [ ! -s /tmp/master_sim_status ] && [ -x /usr/libexec/rpcd/doanduy.sim ]; then
+                    /usr/libexec/rpcd/doanduy.sim call getState </dev/null >/dev/null 2>&1
                 fi
+                act_iface=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p" | head -n 1)
+                [ -z "$act_iface" ] && act_iface="duydoan_5g"
                 sim_info=$(cat /tmp/master_sim_info_luci 2>/dev/null || echo "SIM Viettel")
                 sim_status=$(cat /tmp/master_sim_status 2>/dev/null || echo "LOCKED")
                 cur_band=$(cat /etc/config/band_lock_mode 2>/dev/null || cat /tmp/band_lock_mode 2>/dev/null || echo "auto_carrier")
@@ -352,17 +353,19 @@ case "$1" in
                 [ -z "$inbox" ] && inbox="\"Hộp thư trống.\""
                 carrier_preset=$(cat /tmp/carrier_data_preset.json 2>/dev/null)
                 [ -z "$carrier_preset" ] && carrier_preset='{"carrier":"Viettel","dest":"191","syntax":"KTTK","status":"STANDBY"}'
-                printf '{"port":"%s","sim_info":"%s","sim_status":"%s","custom_send_epoch":"%s","is_authenticated":%d,"cur_band_lock":"%s","carrier_preset":%s,"inbox":%s}\n' \
-                    "$port" "$sim_info" "$sim_status" "$epoch" "$is_auth" "$cur_band" "$carrier_preset" "$inbox"
+                printf '{"port":"%s","act_iface":"%s","sim_info":"%s","sim_status":"%s","custom_send_epoch":"%s","is_authenticated":%d,"cur_band_lock":"%s","carrier_preset":%s,"inbox":%s}\n' \
+                    "$port" "$act_iface" "$sim_info" "$sim_status" "$epoch" "$is_auth" "$cur_band" "$carrier_preset" "$inbox"
                 ;;
             sendSMS)
                 target=$(echo "$input" | jsonfilter -e '$.target' 2>/dev/null)
                 msg=$(echo "$input" | jsonfilter -e '$.msg' 2>/dev/null)
                 port=$(get_active_modem_port)
                 if [ -c "/dev/wwan0qmi0" ]; then
+                    trap 'killall -CONT quectel-CM-M quectel-CM 2>/dev/null' EXIT INT TERM
                     killall -STOP quectel-CM-M quectel-CM 2>/dev/null
                     uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$msg" --send-message-target "$target" >/dev/null 2>&1
                     killall -CONT quectel-CM-M quectel-CM 2>/dev/null
+                    trap - EXIT INT TERM
                 else
                     case "$port" in
                         /dev/wwan*|/dev/mhi*)
@@ -370,13 +373,11 @@ case "$1" in
                             ;;
                         *)
                             touch /tmp/sms_sending.lock
-                            acquire_lock_safe
                             trap 'safe_at_cleanup' EXIT INT TERM
                             release_ports
                             modem_lock_run sms_tool -d "$port" send "$target" "$msg" >/dev/null 2>&1
                             restore_ports
                             rm -f /tmp/sms_sending.lock
-                            release_lock_safe
                             trap - EXIT INT TERM
                             ;;
                     esac
@@ -440,7 +441,6 @@ EOF
                         ;;
                     *)
                         touch /tmp/sms_sending.lock
-                        acquire_lock_safe
                         trap 'safe_at_cleanup' EXIT INT TERM
                         release_ports
 
@@ -449,7 +449,6 @@ EOF
 
                         restore_ports
                         rm -f /tmp/sms_sending.lock
-                        release_lock_safe
                         trap - EXIT INT TERM
                         ;;
                 esac
@@ -461,7 +460,7 @@ EOF
                 port=$(get_active_modem_port)
 
                 carrier=$(cat /tmp/master_carrier_name 2>/dev/null || echo "Viettel")
-                m_type=$(cat /tmp/master_m_type 2>/dev/null || echo "")
+                m_meta=$(get_modem_meta_str)
                 save_mode="$mode"
                 [ -z "$save_mode" ] && save_mode="auto_carrier"
                 
@@ -475,7 +474,7 @@ EOF
                     eff_mode="$mode"
                 fi
 
-                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:" || [ -c "/dev/wwan0at0" ]; then
+                if is_sierra_modem; then
                     # Sierra Wireless EM9190 / EM9191 Band Selection
                     send_at_direct "$port" 'AT!ENTERCND="A710"' >/dev/null 2>&1
                     if [ "$eff_mode" = "viettel_5g" ] || [ "$eff_mode" = "vina_5g" ] || [ "$eff_mode" = "mobi_5g" ]; then
@@ -500,34 +499,34 @@ EOF
                         msg="Sierra EM9190: Đã khôi phục chế độ Băng Tần Tự Động (Auto RAT + Toàn bộ băng tần)!"
                     fi
                 else
-                    # Quectel RM502Q / RM520N / EC25
+                    # Quectel RM502Q / RM520N / EC25 (PCIe MHI & USB TTY)
                     if [ "$eff_mode" = "viettel_5g" ]; then
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="nr5g_band",28:41:78' >/dev/null 2>&1
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="lte_band",1:3:7:8:28:40:41' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",28:41:78' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:7:8:28:40:41' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Đã khóa 5G Viettel: n41 (2600MHz Băng tần Vàng) + n78 (3500MHz) + n28 (700MHz) + LTE B1/B3/B7/B8/B28/B40/B41!"
                     elif [ "$eff_mode" = "vina_5g" ]; then
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="nr5g_band",77:78' >/dev/null 2>&1
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="lte_band",1:3:8' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",77:78' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:8' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Đã khóa 5G VinaPhone: n77/n78 (3700-3800MHz C-Band) + LTE B1/B3/B8 tối ưu sóng chuẩn!"
                     elif [ "$eff_mode" = "mobi_5g" ]; then
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="nr5g_band",77:78' >/dev/null 2>&1
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="lte_band",1:3:7:8' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",77:78' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:7:8' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Đã khóa 5G MobiFone: n77/n78 (3800-3900MHz C-Band) + LTE B1/B3/B7/B8 tối ưu sóng chuẩn!"
                     elif [ "$eff_mode" = "4g_ca" ]; then
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="lte_band",1:3:7:8:28:40:41' >/dev/null 2>&1
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="nr5g_band",28:41:77:78' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:7:8:28:40:41' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",28:41:77:78' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Đã khóa 4G CA (B1+B3+B7+B8+B28+B40+B41) gộp sóng đa tầng siêu ổn định!"
                     else
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="nr5g_band",1:2:3:5:7:8:12:20:25:28:38:40:41:48:66:71:77:78:79' >/dev/null 2>&1
-                        modem_lock_run sms_tool -d "$port" at 'AT+QNWPREFCFG="lte_band",1:2:3:4:5:7:8:12:13:14:17:18:19:20:25:26:28:29:30:32:34:38:39:40:41:42:43:46:48:66:71' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",1:2:3:5:7:8:12:20:25:28:38:40:41:48:66:71:77:78:79' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:2:3:4:5:7:8:12:13:14:17:18:19:20:25:26:28:29:30:32:34:38:39:40:41:42:43:46:48:66:71' >/dev/null 2>&1
                         echo "auto" > /etc/config/band_lock_mode
                         rm -f /tmp/band_lock_mode 2>/dev/null
                         msg="Đã khôi phục chế độ Băng Tần Tự Động (Auto) mở rộng toàn bộ!"
@@ -537,9 +536,9 @@ EOF
                 ;;
             getCellInfo)
                 port=$(get_active_modem_port)
-                m_type=$(cat /tmp/master_m_type 2>/dev/null || echo "")
+                m_meta=$(get_modem_meta_str)
 
-                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:" || [ -c "/dev/wwan0at0" ]; then
+                if is_sierra_modem; then
                     # Sierra Wireless EM9190 / EM9191 / EM7565 Parser
                     gstatus=$(send_at_direct "$port" "AT!GSTATUS?")
                     lteinfo=$(send_at_direct "$port" "AT!LTEINFO?")
@@ -574,7 +573,7 @@ EOF
                     nr_rsrp=$(echo "$gstatus" | grep -i "NR5G RSRP" | sed 's/.*NR5G RSRP (dBm):[[:space:]]*//' | awk '{print $1}' | tr -d '\r\n ')
 
                     nr_sinr=$(echo "$gstatus" | grep -i "NR5G SINR" | sed 's/.*NR5G SINR (dB):[[:space:]]*//' | awk '{print $1}' | tr -d '\r\n ')
-                elif echo "$m_type" | grep -iqE "fibocom|fm350|0e8d:7127"; then
+                elif printf '%s' "$m_meta" | grep -iqE "fibocom|fm350|2cb7|0e8d"; then
                     # Fibocom FM350-GL Parser
                     gt_out=$(send_at_direct "$port" "AT+GTCCINFO?")
                     csq_out=$(send_at_direct "$port" "AT+CSQ")
@@ -583,22 +582,14 @@ EOF
                         lte_rsrp=$(( -113 + csq_val * 2 ))
                     fi
                 else
-                    # Quectel RM502Q / RM520N / EC25 Parser
-                    qeng_file="/tmp/.qeng_out_$$.tmp"
-                    echo 'AT+QENG="servingcell"' > /tmp/.qeng_cmd_$$.at
-                    timeout 2 modem_lock_run atinout /tmp/.qeng_cmd_$$.at "$port" "$qeng_file" 2>/dev/null
-                    qeng_out=$(cat "$qeng_file" 2>/dev/null)
-                    rm -f /tmp/.qeng_cmd_$$.at "$qeng_file" 2>/dev/null
-
+                    # Quectel RM502Q / RM520N / EC25 Parser (works on both PCIe MHI & USB TTY)
+                    qeng_out=$(send_at_direct "$port" 'AT+QENG="servingcell"')
                     lte_line=$(echo "$qeng_out" | grep -i '+QENG: "LTE"')
                     nr_line=$(echo "$qeng_out" | grep -i '+QENG:"NR5G-NSA"')
 
                     if [ -z "$lte_line" ]; then
                         sleep 0.5
-                        echo 'AT+QENG="servingcell"' > /tmp/.qeng_cmd_$$.at
-                        timeout 2 modem_lock_run atinout /tmp/.qeng_cmd_$$.at "$port" "$qeng_file" 2>/dev/null
-                        qeng_out=$(cat "$qeng_file" 2>/dev/null)
-                        rm -f /tmp/.qeng_cmd_$$.at "$qeng_file" 2>/dev/null
+                        qeng_out=$(send_at_direct "$port" 'AT+QENG="servingcell"')
                         lte_line=$(echo "$qeng_out" | grep -i '+QENG: "LTE"')
                         nr_line=$(echo "$qeng_out" | grep -i '+QENG:"NR5G-NSA"')
                     fi
@@ -622,7 +613,7 @@ EOF
                 locked_details=$(cat /etc/config/cell_lock_mode 2>/dev/null || echo "")
 
                 supports_cell_lock="true"
-                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:|fibocom|fm350|usb|rndis"; then
+                if printf '%s' "$m_meta" | grep -iqE "sierra|em919|em75|1199|fibocom|fm350|2cb7|0e8d|usb|rndis"; then
                     supports_cell_lock="false"
                 fi
 
@@ -639,14 +630,12 @@ EOF
                 ;;
             setCellLock)
                 action=$(echo "$input" | jsonfilter -e '$.action' 2>/dev/null)
-                port=$(cat /tmp/master_sms_port 2>/dev/null || echo '/dev/ttyUSB2')
-                [ ! -c "$port" ] && [ -c "/dev/ttyUSB0" ] && port="/dev/ttyUSB0"
-                [ ! -c "$port" ] && port="/dev/ttyUSB2"
-                m_type=$(cat /tmp/master_m_type 2>/dev/null || echo "")
+                port=$(get_active_modem_port)
+                m_meta=$(get_modem_meta_str)
 
-                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:|fibocom|fm350|usb|rndis"; then
+                if printf '%s' "$m_meta" | grep -iqE "sierra|em919|em75|1199|fibocom|fm350|2cb7|0e8d|usb|rndis"; then
                     if [ "$action" = "lock" ]; then
-                        printf '{"success":false,"message":"Card WWAN (%s) không hỗ trợ khóa trạm phần cứng (Lock PCI). Bạn chỉ cần Khóa Băng Tần là sóng đã tối ưu tuyệt đối!","details":"Unsupported"}\n' "$m_type"
+                        printf '{"success":false,"message":"Card WWAN (%s) không hỗ trợ khóa trạm phần cứng (Lock PCI). Bạn chỉ cần Khóa Băng Tần là sóng đã tối ưu tuyệt đối!","details":"Unsupported"}\n' "$m_meta"
                     else
                         rm -f /etc/config/cell_lock_mode /tmp/cell_lock_mode 2>/dev/null
                         printf '{"success":true,"message":"Đã mở khóa trạm BTS thành công! Modem tự do chọn trạm tốt nhất."}\n'
@@ -654,21 +643,13 @@ EOF
                 else
                     # Quectel Cell Lock
                     if [ "$action" = "lock" ]; then
-                        qeng_file="/tmp/.qeng_lock_$$.tmp"
-                        echo 'AT+QENG="servingcell"' > /tmp/.qeng_lcmd_$$.at
-                        modem_lock_run atinout /tmp/.qeng_lcmd_$$.at "$port" "$qeng_file" 2>/dev/null
-                        qeng_out=$(cat "$qeng_file" 2>/dev/null)
-                        rm -f /tmp/.qeng_lcmd_$$.at "$qeng_file" 2>/dev/null
-
+                        qeng_out=$(send_at_direct "$port" 'AT+QENG="servingcell"')
                         lte_line=$(echo "$qeng_out" | grep -i '+QENG: "LTE"')
                         nr_line=$(echo "$qeng_out" | grep -i '+QENG:"NR5G-NSA"')
 
                         if [ -z "$lte_line" ]; then
-                            sleep 1.5
-                            echo 'AT+QENG="servingcell"' > /tmp/.qeng_lcmd_$$.at
-                            modem_lock_run atinout /tmp/.qeng_lcmd_$$.at "$port" "$qeng_file" 2>/dev/null
-                            qeng_out=$(cat "$qeng_file" 2>/dev/null)
-                            rm -f /tmp/.qeng_lcmd_$$.at "$qeng_file" 2>/dev/null
+                            sleep 1
+                            qeng_out=$(send_at_direct "$port" 'AT+QENG="servingcell"')
                             lte_line=$(echo "$qeng_out" | grep -i '+QENG: "LTE"')
                             nr_line=$(echo "$qeng_out" | grep -i '+QENG:"NR5G-NSA"')
                         fi
@@ -685,10 +666,7 @@ EOF
                         nr_band=$(echo "$nr_line" | cut -d',' -f9)
 
                         if [ -z "$lte_earfcn" ] || [ "$lte_earfcn" = "-" ]; then
-                            echo 'AT+QNWINFO' > /tmp/.qeng_nw.at
-                            modem_lock_run atinout /tmp/.qeng_nw.at "$port" "$qeng_file" 2>/dev/null
-                            nw_out=$(cat "$qeng_file" 2>/dev/null)
-                            rm -f /tmp/.qeng_nw.at "$qeng_file" 2>/dev/null
+                            nw_out=$(send_at_direct "$port" 'AT+QNWINFO')
                             lte_earfcn=$(echo "$nw_out" | grep -i 'LTE' | cut -d',' -f4 | tr -d '\r\n')
                             [ -z "$lte_pci" ] && lte_pci="27"
                             [ -z "$lte_band" ] && lte_band="3"
@@ -696,8 +674,7 @@ EOF
 
                         lock_info=""
                         if [ -n "$lte_earfcn" ] && [ -n "$lte_pci" ] && [ "$lte_pci" != "-" ]; then
-                            echo "AT+QNWLOCK=\"common/4g\",1,$lte_earfcn,$lte_pci" > /tmp/.at_l.at
-                            modem_lock_run atinout /tmp/.at_l.at "$port" - >/dev/null 2>&1
+                            send_at_direct "$port" "AT+QNWLOCK=\"common/4g\",1,$lte_earfcn,$lte_pci" >/dev/null 2>&1
                             lock_info="LTE B${lte_band:-3} (EARFCN ${lte_earfcn}, PCI ${lte_pci}, Cell ID ${lte_cellid:---}, RSRP ${lte_rsrp:---}dBm)"
                         fi
 
@@ -705,7 +682,6 @@ EOF
                             [ -n "$lock_info" ] && lock_info="${lock_info} + "
                             lock_info="${lock_info}5G NR n${nr_band} (ARFCN ${nr_arfcn}, PCI ${nr_pci}, RSRP ${nr_rsrp}dBm)"
                         fi
-                        rm -f /tmp/.at_l.at /tmp/.at_l5.at 2>/dev/null
 
                         if [ -n "$lock_info" ]; then
                             echo "$lock_info" > /etc/config/cell_lock_mode
@@ -715,13 +691,78 @@ EOF
                             printf '{"success":false,"message":"Không lấy được thông số trạm hiện tại để khóa!"}\n'
                         fi
                     else
-                        echo 'AT+QNWLOCK="common/4g",0' > /tmp/.at_u.at
-                        echo 'AT+QNWLOCK="common/5g",0' >> /tmp/.at_u.at
-                        modem_lock_run atinout /tmp/.at_u.at "$port" - >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWLOCK="common/4g",0' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWLOCK="common/5g",0' >/dev/null 2>&1
                         rm -f /tmp/.at_u.at /etc/config/cell_lock_mode /tmp/cell_lock_mode 2>/dev/null
                         printf '{"success":true,"message":"Đã mở khóa trạm BTS thành công! Modem tự do tìm trạm tốt nhất."}\n'
                     fi
                 fi
+                ;;
+            setCardMode)
+                mode=$(printf '%s' "$input" | jsonfilter -e '$.mode' 2>/dev/null | tr -cd 'a-zA-Z0-9_-')
+                if_in=$(printf '%s' "$input" | jsonfilter -e '$.iface_name' 2>/dev/null | tr -cd 'a-zA-Z0-9_-')
+                cur_iface=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p" | head -n 1)
+                [ -z "$cur_iface" ] && cur_iface="duydoan_5g"
+                case "$mode" in
+                    wwan_smart|"")
+                        target_proto="duydoan5g"
+                        uci -q delete "network.${cur_iface}.device"
+                        ;;
+                    xmm) target_proto="duydoan5g" ;;
+                    quectel) target_proto="duydoan5g" ;;
+                    mbim) target_proto="mbim" ;;
+                    qmi) target_proto="qmi" ;;
+                    ncm) target_proto="ncm" ;;
+                    modemmanager) target_proto="modemmanager" ;;
+                    ecm|rndis|dhcp) target_proto="dhcp" ;;
+                    *) echo '{"success":false,"message":"Giao thức không hợp lệ!"}'; exit 0 ;;
+                esac
+                uci -q set "network.${cur_iface}=interface"
+                uci -q set "network.${cur_iface}.proto=${target_proto}"
+                if [ -n "$if_in" ] && [ "$if_in" != "auto" ] && [ "$target_proto" != "duydoan5g" ]; then
+                    if [ "$target_proto" = "dhcp" ]; then
+                        uci -q set "network.${cur_iface}.device=${if_in}"
+                    elif [ -c "/dev/cdc-wdm0" ]; then
+                        uci -q set "network.${cur_iface}.device=/dev/cdc-wdm0"
+                    fi
+                fi
+                uci commit network
+                ( /etc/init.d/network reload >/dev/null 2>&1; sleep 1; ubus call "network.interface.${cur_iface}" up >/dev/null 2>&1 || ifup "$cur_iface" >/dev/null 2>&1 ) &
+                printf '{"success":true,"proto":"%s","iface":"%s","message":"Đã chuyển giao thức interface %s sang %s!"}\n' "$target_proto" "$cur_iface" "$cur_iface" "$target_proto"
+                ;;
+            renameInterface)
+                new_name=$(printf '%s' "$input" | jsonfilter -e '$.new_name' 2>/dev/null | tr -cd 'a-zA-Z0-9_')
+                if ! echo "$new_name" | grep -qE '^[a-zA-Z][a-zA-Z0-9_]{1,14}$'; then
+                    echo '{"success":false,"message":"Tên interface phải 2-15 ký tự, bắt đầu bằng chữ cái (vd: duydoan_5g)!"}'
+                    exit 0
+                fi
+                old_name=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p" | head -n 1)
+                [ -z "$old_name" ] && old_name="duydoan_5g"
+                if [ "$old_name" != "$new_name" ]; then
+                    ubus call "network.interface.${old_name}" down >/dev/null 2>&1 || ifdown "$old_name" >/dev/null 2>&1
+                    uci -q rename "network.${old_name}=${new_name}" 2>/dev/null || {
+                        uci -q set "network.${new_name}=interface"
+                        uci -q set "network.${new_name}.proto=duydoan5g"
+                        uci -q delete "network.${old_name}"
+                    }
+                    uci commit network
+                    if [ -f /etc/config/firewall ]; then
+                        wan_zone=""
+                        for zi in 0 1 2 3 4 5 6 7 8 9; do
+                            [ "$(uci -q get "firewall.@zone[$zi].name")" = "wan" ] && { wan_zone="@zone[$zi]"; break; }
+                        done
+                        [ -n "$wan_zone" ] || wan_zone="@zone[1]"
+                        uci -q del_list "firewall.${wan_zone}.network=${old_name}"
+                        uci -q del_list "firewall.${wan_zone}.network=${old_name}_6"
+                        uci -q del_list "firewall.${wan_zone}.network=${new_name}"
+                        uci -q del_list "firewall.${wan_zone}.network=${new_name}_6"
+                        uci add_list "firewall.${wan_zone}.network=${new_name}"
+                        uci add_list "firewall.${wan_zone}.network=${new_name}_6"
+                        uci commit firewall
+                    fi
+                    ( /etc/init.d/network reload >/dev/null 2>&1; /etc/init.d/firewall reload >/dev/null 2>&1; sleep 1; ubus call "network.interface.${new_name}" up >/dev/null 2>&1 || ifup "$new_name" >/dev/null 2>&1 ) &
+                fi
+                printf '{"success":true,"new_name":"%s","message":"Đã đổi tên interface thành %s và đồng bộ Firewall WAN!"}\n' "$new_name" "$new_name"
                 ;;
         esac
         ;;

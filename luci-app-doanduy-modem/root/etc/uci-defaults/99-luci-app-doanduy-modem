@@ -6,30 +6,22 @@ chmod +x /usr/bin/daily_vip_renew.sh 2>/dev/null
 chmod +x /usr/bin/duydoan5g_dialer.sh 2>/dev/null
 chmod +x /usr/bin/read_pcie_sms.lua 2>/dev/null
 chmod +x /usr/bin/smart_modem_watchdog.sh 2>/dev/null
-chmod +x /usr/bin/wwan_smart_dialer.sh 2>/dev/null
+chmod +x /usr/bin/modem_lock_run 2>/dev/null
 chmod +x /usr/bin/adshield /usr/bin/clean_dns.sh /usr/bin/remote_web_tunnel.sh /usr/bin/doanduy_remote_auto.sh /usr/bin/send_telegram /usr/bin/device_opt.sh 2>/dev/null
 chmod +x /usr/bin/logall /usr/bin/imei /usr/bin/restart_wwan /usr/bin/logchan 2>/dev/null
 chmod +x /usr/libexec/rpcd/luci.sms-status 2>/dev/null
 chmod +x /usr/libexec/rpcd/modem_ctrl 2>/dev/null
-chmod +x /usr/libexec/rpcd/doanduy.rf /usr/libexec/rpcd/doanduy.adshield /usr/libexec/rpcd/doanduy.remote /usr/libexec/rpcd/doanduy.vault /usr/libexec/rpcd/doanduy.opt 2>/dev/null
-chmod +x /etc/init.d/doanduy_auto 2>/dev/null
-chmod +x /www/cgi-bin/sim_manager 2>/dev/null
+chmod +x /usr/libexec/rpcd/doanduy.sim /usr/libexec/rpcd/doanduy.rf /usr/libexec/rpcd/doanduy.adshield /usr/libexec/rpcd/doanduy.remote /usr/libexec/rpcd/doanduy.vault /usr/libexec/rpcd/doanduy.opt 2>/dev/null
+chmod +x /etc/init.d/doanduy_auto /etc/init.d/smart_modem_watchdog 2>/dev/null
 chmod +x /lib/netifd/proto/duydoan5g.sh 2>/dev/null
 
-# Go bo menu Script ALL cu, menu modem cu & cac view thua da gom/an
-rm -f /usr/share/luci/menu.d/luci-app-all-control.json /usr/share/luci/menu.d/luci-app-modem-control.json 2>/dev/null
+# Go bo menu Script ALL cu, menu modem cu, CGI cu khong xac thuc & code chet
+rm -f /usr/share/luci/menu.d/luci-app-all-control.json /usr/share/luci/menu.d/luci-app-modem-control.json /www/cgi-bin/sim_manager /usr/bin/wwan_smart_dialer.sh 2>/dev/null
 rm -f /www/luci-static/resources/view/modem/imei.js /www/luci-static/resources/view/modem/adshield.js /www/luci-static/resources/view/modem/remote.js /www/luci-static/resources/view/modem/vault.js /www/luci-static/resources/view/modem/optimize.js 2>/dev/null
 
-# 2. Khoi tao va bao dam du 3 SIM VIP mac dinh goc trong allowed_iccids.dat
+# 2. Bao mat file danh muc SIM tuy chinh neu co (mac dinh 3 SIM VIP da bam SHA-256 Zero-Leak)
 mkdir -p /etc/config
-touch /etc/config/allowed_iccids.dat
-sed -i '/^89840480009647493181$/d' /etc/config/allowed_iccids.dat 2>/dev/null
-for vip_id in 89840480009484443869 89840480009578677539 89840480009579026074; do
-    if ! grep -qx "$vip_id" /etc/config/allowed_iccids.dat 2>/dev/null; then
-        echo "$vip_id" >> /etc/config/allowed_iccids.dat
-    fi
-done
-chmod 600 /etc/config/allowed_iccids.dat
+[ -f /etc/config/allowed_iccids.dat ] && chmod 600 /etc/config/allowed_iccids.dat 2>/dev/null
 
 if [ ! -s /etc/config/sms_custom_time.dat ]; then
     echo "01:25:30" > /etc/config/sms_custom_time.dat
@@ -140,6 +132,7 @@ chmod +x /etc/hotplug.d/net/99_wwan_net.sh
 
 # 5. Kich hoat service smart_modem_watchdog & doanduy_auto (tu dong toi uu & AdShield)
 /etc/init.d/smart_modem_watchdog enable 2>/dev/null
+/etc/init.d/smart_modem_watchdog start >/dev/null 2>&1
 /etc/init.d/doanduy_auto enable 2>/dev/null
 [ -x /usr/bin/device_opt.sh ] && /usr/bin/device_opt.sh apply >/dev/null 2>&1
 ad_st=$(cat /etc/config/adshield_status 2>/dev/null | tr -d ' \r\n')

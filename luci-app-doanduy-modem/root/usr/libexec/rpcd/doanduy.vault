@@ -353,8 +353,10 @@ Router: <b>${model}</b>
 Kênh Bot: <b>${b_label}</b>
 Trạng thái: Kết nối Telegram hoạt động bình thường!"
 				res=""
+				curl_tls="-k"
+				[ -s /etc/ssl/certs/ca-certificates.crt ] && curl_tls=""
 				if command -v curl >/dev/null 2>&1; then
-					res=$(curl -s -k -m 10 -X POST "https://api.telegram.org/bot${t_tok}/sendMessage" \
+					res=$(curl $curl_tls -s -m 10 -X POST "https://api.telegram.org/bot${t_tok}/sendMessage" \
 						-d "chat_id=${t_id}" \
 						-d "parse_mode=HTML" \
 						--data-urlencode "text=${nl_msg}" 2>/dev/null)

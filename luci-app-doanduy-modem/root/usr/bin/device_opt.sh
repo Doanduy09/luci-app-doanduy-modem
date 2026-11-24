@@ -30,15 +30,22 @@ detect_hw() {
 		SOC_LABEL="x86_64 Router / Mini PC"
 	fi
 
-	if [ "$MEM_MB" -le 256 ]; then
-		RAM_TIER="Low-RAM (<=256MB)"
+	if [ "$MEM_MB" -le 128 ]; then
+		RAM_TIER="Ultra-Low-RAM (<=128MB)"
+		CFG_CONNTRACK=8192; CFG_BUF=131072; CFG_MINFREE=2048; CFG_SWAP=10
+		CFG_BACKLOG=1000; CFG_SOMAX=512
+	elif [ "$MEM_MB" -le 256 ]; then
+		RAM_TIER="Low-RAM (129-256MB)"
 		CFG_CONNTRACK=16384; CFG_BUF=262144; CFG_MINFREE=4096; CFG_SWAP=10
+		CFG_BACKLOG=2000; CFG_SOMAX=1024
 	elif [ "$MEM_MB" -le 768 ]; then
 		RAM_TIER="Mid-Tier (256-768MB)"
 		CFG_CONNTRACK=65536; CFG_BUF=1048576; CFG_MINFREE=8192; CFG_SWAP=20
+		CFG_BACKLOG=16384; CFG_SOMAX=8192
 	else
 		RAM_TIER="High-Tier (>=1GB)"
 		CFG_CONNTRACK=131072; CFG_BUF=4194304; CFG_MINFREE=16384; CFG_SWAP=30
+		CFG_BACKLOG=16384; CFG_SOMAX=8192
 	fi
 
 	TEMP_C=""
@@ -105,8 +112,8 @@ net.core.rmem_max = ${CFG_BUF}
 net.core.wmem_max = ${CFG_BUF}
 net.ipv4.tcp_rmem = 4096 131072 ${CFG_BUF}
 net.ipv4.tcp_wmem = 4096 65536 ${CFG_BUF}
-net.core.netdev_max_backlog = $([ "$MEM_MB" -le 256 ] && echo 2000 || echo 16384)
-net.core.somaxconn = $([ "$MEM_MB" -le 256 ] && echo 1024 || echo 8192)
+net.core.netdev_max_backlog = ${CFG_BACKLOG}
+net.core.somaxconn = ${CFG_SOMAX}
 net.core.default_qdisc = ${qdisc}
 net.ipv4.tcp_congestion_control = ${cc}
 vm.min_free_kbytes = ${CFG_MINFREE}

@@ -27,36 +27,43 @@ fi
 mkdir -p "$HOSTS_DIR" "$CONF_DIR" /etc/config 2>/dev/null
 [ ! -f "$CUSTOM_FILE" ] && touch "$CUSTOM_FILE"
 
-create_logchan_command() {
-    cat << 'CMDLG' > /usr/bin/logchan
-#!/bin/sh
-LOGFILE="/tmp/log_chanquangcao"
-case "$1" in
-    clear|xoa|reset|clr) > "$LOGFILE" && echo "Đã xóa sạch nhật ký." ;;
-    last|recent) tail -n 50 "$LOGFILE" 2>/dev/null ;;
-    update|capnhat) /usr/bin/adshield update ;;
-    status) /usr/bin/adshield status ;;
-    *) echo "=== Xem lịch sử Log Chặn Quảng Cáo (Nhấn Ctrl+C để thoát) ==="; tail -f "$LOGFILE" 2>/dev/null ;;
-esac
-CMDLG
-    chmod +x /usr/bin/logchan 2>/dev/null
-    ln -sf /usr/bin/logchan /usr/bin/logadg 2>/dev/null
+get_lan_dev() {
+    local dev=""
+    dev=$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+    [ -n "$dev" ] && [ -d "/sys/class/net/$dev" ] || dev="br-lan"
+    printf '%s' "$dev"
 }
 
-# Đảm bảo cấu hình hệ thống: nạp /tmp/dnsmasq.d, bật filter_aaaa, tối ưu cache-size 10000, all-servers và Cron 04:00 AM
+get_ram_tier_limits() {
+    local mem_mb
+    mem_mb=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 256)
+    if [ "${mem_mb:-0}" -le 128 ]; then
+        TIER_CACHE=2000; TIER_ADG_CAP=5000; TIER_MAX_RULES=5000
+    elif [ "${mem_mb:-0}" -le 256 ]; then
+        TIER_CACHE=5000; TIER_ADG_CAP=15000; TIER_MAX_RULES=10000
+    elif [ "${mem_mb:-0}" -le 512 ]; then
+        TIER_CACHE=10000; TIER_ADG_CAP=30000; TIER_MAX_RULES=20000
+    elif [ "${mem_mb:-0}" -gt 1024 ]; then
+        TIER_CACHE=10000; TIER_ADG_CAP=30000; TIER_MAX_RULES=60000
+    else
+        TIER_CACHE=10000; TIER_ADG_CAP=30000; TIER_MAX_RULES=40000
+    fi
+}
+
+# Đảm bảo cấu hình hệ thống: nạp /tmp/dnsmasq.d, tối ưu cache theo RAM, IPv6 sạch & Cron 04:00 AM
 ensure_dnsmasq_config() {
-    create_logchan_command
-    local changed=0
+    get_ram_tier_limits
+    local lan_dev changed=0
+    lan_dev=$(get_lan_dev)
     if ! uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q '/tmp/dnsmasq.d'; then
         uci add_list dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null
         changed=1
     fi
-    if [ "$(uci get dhcp.@dnsmasq[0].filter_aaaa 2>/dev/null)" != "1" ]; then
-        uci set dhcp.@dnsmasq[0].filter_aaaa='1' 2>/dev/null
+    if [ "$(uci -q get dhcp.@dnsmasq[0].filter_aaaa)" = "1" ]; then
+        uci -q delete dhcp.@dnsmasq[0].filter_aaaa
         changed=1
     fi
-    # Tối ưu hóa Dnsmasq Engine chuẩn chuyên gia: phản hồi tên miền siêu tốc < 1ms (Chuẩn 10.000 domain, tránh xung đột băm)
-    local target_cache="10000"
+    local target_cache="$TIER_CACHE"
     if [ "$(uci get dhcp.@dnsmasq[0].cachesize 2>/dev/null)" != "$target_cache" ]; then
         uci set dhcp.@dnsmasq[0].cachesize="$target_cache" 2>/dev/null
         changed=1
@@ -73,15 +80,15 @@ ensure_dnsmasq_config() {
         uci set dhcp.@dnsmasq[0].domainneeded='1' 2>/dev/null
         changed=1
     fi
-    if [ "$(uci get dhcp.@dnsmasq[0].min_cache_ttl 2>/dev/null)" != "120" ]; then
-        uci set dhcp.@dnsmasq[0].min_cache_ttl='120' 2>/dev/null
+    if [ "$(uci get dhcp.@dnsmasq[0].min_cache_ttl 2>/dev/null)" != "300" ]; then
+        uci set dhcp.@dnsmasq[0].min_cache_ttl='300' 2>/dev/null
         changed=1
     fi
     if [ "$(uci get dhcp.@dnsmasq[0].dnsforwardmax 2>/dev/null)" != "512" ]; then
         uci set dhcp.@dnsmasq[0].dnsforwardmax='512' 2>/dev/null
         changed=1
     fi
-    local router_ll=$(ip -6 addr show dev br-lan scope link 2>/dev/null | grep -o 'fe80::[0-9a-f:]*' | head -n 1)
+    local router_ll=$(ip -6 addr show dev "$lan_dev" scope link 2>/dev/null | grep -o 'fe80::[0-9a-f:]*' | head -n 1)
     if [ -n "$router_ll" ]; then
         if ! uci get dhcp.lan.dns 2>/dev/null | grep -q "$router_ll"; then
             uci add_list dhcp.lan.dns="$router_ll" 2>/dev/null
@@ -102,48 +109,54 @@ ensure_dnsmasq_config() {
 ## 1. Kích hoạt Nftables Anti-Bypass Firewall (Chống thiết bị dùng DNS riêng 8.8.8.8 / 1.1.1.1, DoT 853 và giải phóng đường tải)
 apply_firewall_rules() {
     remove_firewall_rules
+    local lan_dev
+    lan_dev=$(get_lan_dev)
     if command -v nft >/dev/null 2>&1; then
-        cat << 'EOF_NFT' > "$NFT_FILE"
+        cat << EOF_NFT > "$NFT_FILE"
 table inet adshield {
     chain dstnat {
         type nat hook prerouting priority -105; policy accept;
-        iifname "br-lan" udp dport 53 redirect to :53
-        iifname "br-lan" tcp dport 53 redirect to :53
+        iifname "${lan_dev}" udp dport 53 redirect to :53
+        iifname "${lan_dev}" tcp dport 53 redirect to :53
     }
     chain forward {
         type filter hook forward priority -5; policy accept;
-        iifname "br-lan" tcp dport 853 reject
-        iifname "br-lan" udp dport 853 reject
-        meta l4proto tcp iifname "br-lan" ip daddr 0.0.0.0 reject with tcp reset
-        meta l4proto tcp iifname "br-lan" ip daddr 127.0.0.1 reject with tcp reset
-        meta l4proto udp iifname "br-lan" ip daddr 0.0.0.0 reject with icmp port-unreachable
-        meta l4proto udp iifname "br-lan" ip daddr 127.0.0.1 reject with icmp port-unreachable
+        iifname "${lan_dev}" tcp dport 853 reject
+        iifname "${lan_dev}" udp dport 853 reject
+        meta l4proto tcp iifname "${lan_dev}" ip daddr 0.0.0.0 reject with tcp reset
+        meta l4proto tcp iifname "${lan_dev}" ip daddr 127.0.0.1 reject with tcp reset
+        meta l4proto udp iifname "${lan_dev}" ip daddr 0.0.0.0 reject with icmp port-unreachable
+        meta l4proto udp iifname "${lan_dev}" ip daddr 127.0.0.1 reject with icmp port-unreachable
     }
 }
 EOF_NFT
         nft -f "$NFT_FILE" 2>/dev/null
         rm -f /etc/nftables.d/adshield.nft "$NFT_FILE" 2>/dev/null
     elif command -v iptables >/dev/null 2>&1; then
-        iptables -t nat -A PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
-        iptables -t nat -A PREROUTING -i br-lan -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
-        iptables -I FORWARD -i br-lan -p tcp --dport 853 -j REJECT 2>/dev/null
-        iptables -I FORWARD -i br-lan -p udp --dport 853 -j REJECT 2>/dev/null
-        iptables -I FORWARD -i br-lan -d 0.0.0.0 -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
-        iptables -I FORWARD -i br-lan -d 127.0.0.1 -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
-        iptables -I FORWARD -i br-lan -d 0.0.0.0 -p udp -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
-        iptables -I FORWARD -i br-lan -d 127.0.0.1 -p udp -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        iptables -t nat -A PREROUTING -i "$lan_dev" -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+        iptables -t nat -A PREROUTING -i "$lan_dev" -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+        iptables -I FORWARD -i "$lan_dev" -p tcp --dport 853 -j REJECT 2>/dev/null
+        iptables -I FORWARD -i "$lan_dev" -p udp --dport 853 -j REJECT 2>/dev/null
+        iptables -I FORWARD -i "$lan_dev" -d 0.0.0.0 -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
+        iptables -I FORWARD -i "$lan_dev" -d 127.0.0.1 -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
+        iptables -I FORWARD -i "$lan_dev" -d 0.0.0.0 -p udp -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        iptables -I FORWARD -i "$lan_dev" -d 127.0.0.1 -p udp -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
     fi
 }
 
 remove_firewall_rules() {
+    local lan_dev d
+    lan_dev=$(get_lan_dev)
     if command -v nft >/dev/null 2>&1; then
         nft delete table inet adshield 2>/dev/null
     fi
     if command -v iptables >/dev/null 2>&1; then
-        iptables -t nat -D PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
-        iptables -t nat -D PREROUTING -i br-lan -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
-        iptables -D FORWARD -i br-lan -p tcp --dport 853 -j REJECT 2>/dev/null
-        iptables -D FORWARD -i br-lan -p udp --dport 853 -j REJECT 2>/dev/null
+        for d in "$lan_dev" br-lan; do
+            iptables -t nat -D PREROUTING -i "$d" -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+            iptables -t nat -D PREROUTING -i "$d" -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+            iptables -D FORWARD -i "$d" -p tcp --dport 853 -j REJECT 2>/dev/null
+            iptables -D FORWARD -i "$d" -p udp --dport 853 -j REJECT 2>/dev/null
+        done
     fi
     rm -f /etc/nftables.d/adshield.nft "$NFT_FILE" 2>/dev/null
 }
@@ -339,19 +352,11 @@ EOF_FAMILY
     # Sinh blocklist song song bằng ĐỘNG CƠ AWK SIÊU TỐC (Single-Pass In-Memory Stream Processing)
     # Tích hợp Hard-Whitelist Bất Khả Xâm Phạm: Ngân Hàng, Ví Điện Tử, VNeID, Dịch Vụ Công, OTT, Game, Cloud
     # Tu dong gioi han quy tac theo dung luong RAM thuc te tren moi router
-    local mem_kb mem_mb max_rules=40000
-    mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 524288)
-    mem_mb=$((mem_kb / 1024))
-    if [ "$mem_mb" -le 256 ]; then
-        max_rules=10000
-    elif [ "$mem_mb" -le 512 ]; then
-        max_rules=20000
-    elif [ "$mem_mb" -gt 1024 ]; then
-        max_rules=60000
-    fi
+    get_ram_tier_limits
+    local max_rules="$TIER_MAX_RULES"
 
-    # Bổ sung danh sách tải về (hostsVN, ABPVN, AdguardDNS, FB tracking, cache) nếu có
-    for fl in /tmp/adshield_hostsvn.list /tmp/adshield_abpvn.list /tmp/adshield_adg.list /tmp/adshield_fb.list /etc/config/adshield_cached.list; do
+    # Bổ sung danh sách tải về hoàn toàn trong RAM (/tmp) -> 0% Flash Wear
+    for fl in /tmp/adshield_hostsvn.list /tmp/adshield_abpvn.list /tmp/adshield_adg.list /tmp/adshield_fb.list; do
         if [ -s "$fl" ]; then
             cat "$fl" >> "$raw_domains" 2>/dev/null
         fi
@@ -521,9 +526,11 @@ count_rules() {
 }
 
 check_hijack_active() {
+    local lan_dev
+    lan_dev=$(get_lan_dev)
     if command -v nft >/dev/null 2>&1 && nft list table inet adshield >/dev/null 2>&1; then
         echo 1
-    elif command -v iptables >/dev/null 2>&1 && iptables -t nat -C PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; then
+    elif command -v iptables >/dev/null 2>&1 && iptables -t nat -C PREROUTING -i "$lan_dev" -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; then
         echo 1
     else
         echo 0
@@ -532,12 +539,14 @@ check_hijack_active() {
 
 do_update() {
     ensure_dnsmasq_config
-    local log_file="/tmp/log_chanquangcao"
+    get_ram_tier_limits
+    local log_file="/tmp/log_chanquangcao" curl_tls="-k"
+    [ -s /etc/ssl/certs/ca-certificates.crt ] && curl_tls=""
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Bắt đầu kiểm tra và cập nhật bộ lọc Micro AdShield Chuyên Gia (04:00 AM)..." | tee -a "$log_file"
     
     # 1. Tải danh sách hostsVN (Bộ lọc chuyên sâu số 1 cho người dùng Internet Việt Nam: quảng cáo, mã độc, lừa đảo, web cờ bạc)
     local hostsvn_tmp="/tmp/adshield_hostsvn.tmp"
-    if curl -s -k -m 25 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts" -o "$hostsvn_tmp" && [ -s "$hostsvn_tmp" ]; then
+    if curl $curl_tls -s -m 25 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts" -o "$hostsvn_tmp" && [ -s "$hostsvn_tmp" ]; then
         local h_lines=$(grep -E '^(0\.0\.0\.0|127\.0\.0\.1) ' "$hostsvn_tmp" 2>/dev/null | wc -l)
         if [ "$h_lines" -gt 500 ]; then
             grep -E '^(0\.0\.0\.0|127\.0\.0\.1) ' "$hostsvn_tmp" 2>/dev/null | awk '{print $2}' | tr -d ' \r\t' | grep -vE '^(localhost|0\.0\.0\.0|::1)$' | grep -v '^$' > /tmp/adshield_hostsvn.list
@@ -551,7 +560,7 @@ do_update() {
 
     # 2. Tải danh sách ABPVN (Bộ lọc chuyên sâu cho các website báo chí & TMĐT Việt Nam)
     local abpvn_tmp="/tmp/adshield_abpvn.tmp"
-    if curl -s -k -m 25 -L "https://adguardteam.github.io/HostlistsRegistry/assets/filter_16.txt" -o "$abpvn_tmp" && [ -s "$abpvn_tmp" ]; then
+    if curl $curl_tls -s -m 25 -L "https://adguardteam.github.io/HostlistsRegistry/assets/filter_16.txt" -o "$abpvn_tmp" && [ -s "$abpvn_tmp" ]; then
         local a_lines=$(grep '^0\.0\.0\.0 ' "$abpvn_tmp" 2>/dev/null | wc -l)
         if [ "$a_lines" -gt 100 ]; then
             grep '^0\.0\.0\.0 ' "$abpvn_tmp" 2>/dev/null | awk '{print $2}' | tr -d ' \r\t' | grep -v '^$' > /tmp/adshield_abpvn.list
@@ -563,12 +572,12 @@ do_update() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️ Không thể kết nối máy chủ tải ABPVN, duy trì danh sách bộ lọc hiện tại." | tee -a "$log_file"
     fi
 
-    # 3. Tải danh sách AdGuardDNS (Bộ lọc quảng cáo quốc tế, tracking & mobile ads)
+    # 3. Tải danh sách AdGuardDNS (Bộ lọc quảng cáo quốc tế, tracking & mobile ads - giới hạn theo RAM tier)
     local adg_tmp="/tmp/adshield_adg.tmp"
-    if curl -s -k -m 25 -L "https://v.firebog.net/hosts/AdguardDNS.txt" -o "$adg_tmp" && [ -s "$adg_tmp" ]; then
+    if curl $curl_tls -s -m 25 -L "https://v.firebog.net/hosts/AdguardDNS.txt" -o "$adg_tmp" && [ -s "$adg_tmp" ]; then
         local g_lines=$(grep -v '^[#[:space:]]' "$adg_tmp" 2>/dev/null | wc -l)
         if [ "$g_lines" -gt 500 ]; then
-            grep -v '^[#[:space:]]' "$adg_tmp" 2>/dev/null | tr -d ' \r\t' | grep -v '^$' | head -n 30000 > /tmp/adshield_adg.list
+            grep -v '^[#[:space:]]' "$adg_tmp" 2>/dev/null | tr -d ' \r\t' | grep -v '^$' | head -n "$TIER_ADG_CAP" > /tmp/adshield_adg.list
             local adg_cnt=$(wc -l < /tmp/adshield_adg.list 2>/dev/null || echo 0)
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📥 Tải thành công bộ lọc AdGuardDNS ($adg_cnt tên miền quốc tế)." | tee -a "$log_file"
         fi
@@ -577,7 +586,7 @@ do_update() {
 
     # 4. Tải danh sách chuyên sâu Facebook/Meta Ad Telemetry & Tracking (hostsVN-FB)
     local fb_tmp="/tmp/adshield_fb.tmp"
-    if curl -s -k -m 20 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/option/hostsVN-surge-FB.conf" -o "$fb_tmp" && [ -s "$fb_tmp" ]; then
+    if curl $curl_tls -s -m 20 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/option/hostsVN-surge-FB.conf" -o "$fb_tmp" && [ -s "$fb_tmp" ]; then
         local f_lines=$(grep '^DOMAIN-SUFFIX,' "$fb_tmp" 2>/dev/null | wc -l)
         if [ "$f_lines" -gt 10 ]; then
             grep '^DOMAIN-SUFFIX,' "$fb_tmp" 2>/dev/null | cut -d',' -f2 | tr -d ' \r\t' | grep -v '^$' > /tmp/adshield_fb.list
@@ -589,15 +598,16 @@ do_update() {
 
     generate_blocklist
 
-    # Lưu cache cố định vào Flash /etc/config/adshield_cached.list (giới hạn theo RAM tier) để khi reboot nạp tức thì
-    if [ -f "$BLOCK_FILE" ] && [ -s "$BLOCK_FILE" ]; then
-        awk '$1 == "0.0.0.0" {print $2}' "$BLOCK_FILE" 2>/dev/null | head -n 40000 > /etc/config/adshield_cached.list
-    fi
+    # Zero Flash Wear: Không ghi 40K dòng cache xuống Flash; dọn cache cũ nếu Flash nhỏ (<15MB)
+    local ov_avail
+    ov_avail=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print $4}')
+    [ "${ov_avail:-0}" -lt 15000 ] && rm -f /etc/config/adshield_cached.list 2>/dev/null
+
     reload_dns
     apply_firewall_rules
     local cnt=$(count_rules)
     echo "$(date '+%Y-%m-%d %H:%M:%S')|$cnt" > /tmp/adshield_last_update.txt
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🎉 Cập nhật hoàn tất! Đang bảo vệ toàn mạng với $cnt quy tắc (0% RAM tiêu thụ thừa, 0 Flash wear, Dnsmasq Cache 10.000)." | tee -a "$log_file"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🎉 Cập nhật hoàn tất! Đang bảo vệ toàn mạng với $cnt quy tắc (0% RAM tiêu thụ thừa, 0 Flash wear, Dnsmasq Cache ${TIER_CACHE})." | tee -a "$log_file"
     echo "{\"success\":true,\"rules\":$cnt,\"message\":\"Đã cập nhật tự động Micro AdShield thành công ($cnt quy tắc)!\"}"
 }
 

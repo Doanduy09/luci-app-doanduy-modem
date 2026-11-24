@@ -40,6 +40,22 @@ read_tailscale_key() {
 	printf '%s' "$val"
 }
 
+has_root_password() {
+	local h
+	h=$(awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null)
+	case "$h" in
+		""|"!"|"*"|"!!"|"x") return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+get_lan_dev() {
+	local dev=""
+	dev=$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	[ -n "$dev" ] && [ -d "/sys/class/net/$dev" ] || dev="br-lan"
+	printf '%s' "$dev"
+}
+
 find_ts_bin() {
 	local b
 	for b in /usr/sbin/tailscale /usr/bin/tailscale $(command -v tailscale 2>/dev/null); do
@@ -53,22 +69,28 @@ ensure_tailscale_binary() {
 	[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null
 
 	if [ ! -x /usr/sbin/tailscaled ] && [ ! -x /usr/bin/tailscaled ]; then
-		local pkg_f="" fetched_tmp=0 avail_kb=0
+		local pkg_f="" fetched_tmp=0 avail_kb=0 mem_mb=0
+		mem_mb=$(awk '/MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+		avail_kb=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print $4}')
+		if [ "${avail_kb:-0}" -le 35000 ] && [ "${mem_mb:-0}" -lt 220 ]; then
+			return 1
+		fi
 		pkg_f=$(ls /tmp/tailscale*.apk /rom/tailscale*.apk /etc/tailscale/tailscale*.apk 2>/dev/null | head -n 1)
 		if [ -z "$pkg_f" ] && command -v apk >/dev/null 2>&1; then
-			apk update --allow-untrusted >/dev/null 2>&1 || apk update >/dev/null 2>&1
-			apk fetch --allow-untrusted -o /tmp tailscale >/dev/null 2>&1 || apk fetch -o /tmp tailscale >/dev/null 2>&1
+			( apk update >/dev/null 2>&1 && apk fetch -o /tmp tailscale >/dev/null 2>&1 ) || \
+			{ apk update --allow-untrusted >/dev/null 2>&1 && apk fetch --allow-untrusted -o /tmp tailscale >/dev/null 2>&1; }
 			pkg_f=$(ls /tmp/tailscale*.apk 2>/dev/null | head -n 1)
 			[ -n "$pkg_f" ] && fetched_tmp=1
 		fi
 		if [ -n "$pkg_f" ] && command -v apk >/dev/null 2>&1; then
 			mkdir -p /tmp/ts_ext_tmp
-			apk extract --allow-untrusted --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1
+			apk extract --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1 || \
+				apk extract --allow-untrusted --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1
 			avail_kb=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print $4}')
 			if [ -f /tmp/ts_ext_tmp/usr/sbin/tailscaled ]; then
 				if [ "${avail_kb:-0}" -gt 35000 ]; then
 					cp -f /tmp/ts_ext_tmp/usr/sbin/tailscaled /usr/sbin/tailscaled
-				else
+				elif [ "${mem_mb:-0}" -ge 220 ]; then
 					mkdir -p /tmp/tailscaled_ram
 					cp -f /tmp/ts_ext_tmp/usr/sbin/tailscaled /tmp/tailscaled_ram/tailscaled
 					chmod +x /tmp/tailscaled_ram/tailscaled
@@ -152,14 +174,15 @@ TS_CONF_EOF
 }
 
 resolve_hostname() {
-	local h mac4 model
+	local h mac4 model lan_dev
+	lan_dev=$(get_lan_dev)
 	h=$(cat /etc/config/tailscale_hostname 2>/dev/null | tr -d '\r\n ')
 	if [ -z "$h" ]; then
 		h=$(uci -q get system.@system[0].hostname)
 		case "$h" in
 			""|OpenWrt|ImmortalWrt|DOANDUY|localhost)
 				model=$(cat /tmp/sysinfo/model 2>/dev/null | tr -cs 'a-zA-Z0-9-' '-' | sed 's/^-//;s/-$//')
-				mac4=$(cat /sys/class/net/br-lan/address 2>/dev/null | tr -d ':\r\n' | tail -c 5)
+				mac4=$(cat "/sys/class/net/${lan_dev}/address" 2>/dev/null | tr -d ':\r\n' | tail -c 5)
 				h="${model:-router}-${mac4:-0001}"
 				;;
 		esac
@@ -169,11 +192,12 @@ resolve_hostname() {
 }
 
 resolve_subnet() {
-	local saved lan_ip
+	local saved lan_ip lan_dev
 	saved=$(cat /etc/config/tailscale_subnet 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -n 1)
 	[ -n "$saved" ] && { printf '%s' "$saved"; return 0; }
+	lan_dev=$(get_lan_dev)
 	lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null | cut -d'/' -f1)
-	[ -z "$lan_ip" ] && lan_ip=$(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n 1)
+	[ -z "$lan_ip" ] && lan_ip=$(ip -4 addr show dev "$lan_dev" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n 1)
 	[ -z "$lan_ip" ] && lan_ip="192.168.1.1"
 	printf '%s' "$lan_ip" | awk -F. '{print $1"."$2"."$3".0/24"}'
 }
@@ -228,11 +252,6 @@ configure_vm_routing() {
 		uci commit uhttpd
 		/etc/init.d/uhttpd restart >/dev/null 2>&1 &
 	fi
-	if [ "$(uci -q get dhcp.@dnsmasq[0].localservice)" != "0" ]; then
-		uci set dhcp.@dnsmasq[0].localservice='0'
-		uci commit dhcp
-		/etc/init.d/dnsmasq reload >/dev/null 2>&1 &
-	fi
 }
 
 cmd_up() {
@@ -284,7 +303,7 @@ cmd_up() {
 
 	configure_vm_routing
 
-	set -- up "--hostname=$hn" "--advertise-routes=$subnet" --advertise-exit-node --accept-routes=true --accept-dns=false
+	set -- up "--hostname=$hn" "--advertise-routes=$subnet" --advertise-exit-node --accept-dns=false
 	[ -n "$key" ] && set -- "$@" "--authkey=$key"
 	[ "$is_new" = "1" ] && set -- "$@" --reset
 	timeout 15 "$ts_bin" "$@" >/tmp/.ts_up.log 2>&1
@@ -298,10 +317,15 @@ cmd_up() {
 	done
 
 	if [ -n "$ts_ip" ]; then
+		local funnel_note=""
 		printf '%s\n' "$ts_ip" > /etc/config/tailscale_ip
 		if [ "$enable_funnel" = "1" ] || [ "$enable_funnel" = "true" ]; then
-			"$ts_bin" serve --bg 80 >/dev/null 2>&1 || true
-			"$ts_bin" funnel --bg 80 >/dev/null 2>&1 &
+			if has_root_password; then
+				"$ts_bin" serve --bg 80 >/dev/null 2>&1 || true
+				"$ts_bin" funnel --bg 80 >/dev/null 2>&1 &
+			else
+				funnel_note=" (Đã bỏ qua Funnel HTTPS vì router chưa đặt mật khẩu root!)"
+			fi
 		fi
 		[ "$quiet" = "1" ] && return 0
 		json_init
@@ -309,7 +333,7 @@ cmd_up() {
 		json_add_string "tailscale_ip" "$ts_ip"
 		json_add_string "hostname" "$hn"
 		json_add_string "subnet" "$subnet"
-		json_add_string "message" "Đã tự động cài đặt, nối mạng Tailscale & Debian VM thành công! IP: ${ts_ip} (${hn})"
+		json_add_string "message" "Đã tự động cài đặt, nối mạng Tailscale & Debian VM thành công! IP: ${ts_ip} (${hn})${funnel_note}"
 		json_dump
 	else
 		[ "$quiet" = "1" ] && return 1
@@ -362,7 +386,7 @@ cmd_ensure() {
 		i=$((i + 1))
 	done
 	[ "$ready" = "1" ] || [ -x /usr/sbin/tailscaled ] || exit 0
-	cmd_up "$key" "1" "1"
+	cmd_up "$key" "0" "1"
 }
 
 case "$1" in

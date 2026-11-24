@@ -75,84 +75,36 @@ if ! check_rate_limit; then
     exit 0
 fi
 
-pfile="/tmp/.tg_send_$$.txt"
-lua - "$ADMIN_CHAT_ID" "$msg" "${markup:-}" "$pfile" << 'LUAPOST' 2>/dev/null
-local cid, text, markup, outpath = arg[1], arg[2], arg[3], arg[4]
-text = text or ''
-text = string.gsub(text, '\\n', '\n')
-text = string.gsub(text, '\r', '')
-
-local function sanitize_tg_html(s)
-    if not s or #s == 0 then return "" end
-    local tags, counter = {}, 0
-    local p = s:gsub("<(/?)([a-zA-Z0-9_-]+)([^>]*)>", function(slash, tag, attrs)
-        local t = tag:lower()
-        if t == "b" or t == "strong" or t == "i" or t == "em" or t == "u" or t == "ins" or
-           t == "s" or t == "strike" or t == "del" or t == "code" or t == "pre" or
-           t == "a" or t == "tg-spoiler" or t == "blockquote" then
-            counter = counter + 1
-            local ph = "\001TAG" .. counter .. "\002"
-            tags[ph] = "<" .. slash .. tag .. attrs .. ">"
-            return ph
-        end
-        return "&lt;" .. slash .. tag .. attrs .. "&gt;"
-    end)
-    p = p:gsub("&", "&amp;"):gsub("&amp;([a-zA-Z0-9]+);", "&%1;")
-    p = p:gsub("<", "&lt;"):gsub(">", "&gt;")
-    for ph, tag in pairs(tags) do p = p:gsub(ph, tag) end
-    if #p > 4000 then p = p:sub(1, 3950) .. "..." end
-    return p
-end
-
-text = sanitize_tg_html(text)
-local enc = (string.gsub(text, '([^%w_.~-])', function(c)
-    return string.format('%%%02X', string.byte(c))
-end))
-local post_data = 'chat_id=' .. cid .. '&parse_mode=HTML&text=' .. enc
-if markup and #markup > 0 and markup:match('^%s*{') then
-    local enc_markup = (string.gsub(markup, '([^%w_.~-])', function(c)
-        return string.format('%%%02X', string.byte(c))
-    end))
-    post_data = post_data .. '&reply_markup=' .. enc_markup
-end
-local f = io.open(outpath, 'w')
-if f then
-    f:write(post_data)
-    f:close()
-end
-LUAPOST
+clean_msg=$(printf '%s' "$msg" | awk '{gsub(/\\n/,"\n"); printf "%s", $0}' | cut -c1-4000)
+curl_tls="-k"
+uf_tls="--no-check-certificate"
+if [ -s /etc/ssl/certs/ca-certificates.crt ]; then
+    curl_tls=""
+    uf_tls=""
+fi
 
 res=""
 if command -v curl >/dev/null 2>&1; then
-    res=$(curl -s -m 8 -d @"$pfile" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+    set -- $curl_tls -s -m 8 -X POST -d "chat_id=${ADMIN_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=${clean_msg}"
+    case "$markup" in
+        *{*) set -- "$@" --data-urlencode "reply_markup=${markup}" ;;
+    esac
+    res=$(curl "$@" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
 else
-    res=$(uclient-fetch -q -O - --no-check-certificate --timeout=8 --post-file="$pfile" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+    res=$(uclient-fetch -q -O - $uf_tls --timeout=8 --post-data="chat_id=${ADMIN_CHAT_ID}" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?text=$(printf '%s' "$clean_msg" | sed 's/ /%20/g')" 2>/dev/null)
 fi
-rm -f "$pfile" 2>/dev/null
 record_rate_limit "$res"
 
 if ! echo "$res" | grep -q '"ok":true'; then
     check_rate_limit || exit 0
-    plain_text=$(echo "$msg" | sed 's/<[^>]*>/ /g' | tr -s ' ' | cut -c 1-4000)
-    pfile_fb="/tmp/.tg_send_fb_$$.txt"
-    lua - "$ADMIN_CHAT_ID" "$plain_text" "${markup:-}" "$pfile_fb" << 'LUAFB' 2>/dev/null
-local cid, text, markup, outpath = arg[1], arg[2], arg[3], arg[4]
-text = text or ''
-local enc = (string.gsub(text, '([^%w_.~-])', function(c) return string.format('%%%02X', string.byte(c)) end))
-local post_data = 'chat_id=' .. cid .. '&text=' .. enc
-if markup and #markup > 0 and markup:match('^%s*{') then
-    local enc_markup = (string.gsub(markup, '([^%w_.~-])', function(c) return string.format('%%%02X', string.byte(c)) end))
-    post_data = post_data .. '&reply_markup=' .. enc_markup
-end
-local f = io.open(outpath, 'w')
-if f then f:write(post_data); f:close() end
-LUAFB
+    plain_text=$(printf '%s' "$clean_msg" | sed 's/<[^>]*>/ /g' | tr -s ' ' | cut -c 1-4000)
     if command -v curl >/dev/null 2>&1; then
-        res=$(curl -s -m 8 -d @"$pfile_fb" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
-    else
-        res=$(uclient-fetch -q -O - --no-check-certificate --timeout=8 --post-file="$pfile_fb" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+        set -- $curl_tls -s -m 8 -X POST -d "chat_id=${ADMIN_CHAT_ID}" --data-urlencode "text=${plain_text}"
+        case "$markup" in
+            *{*) set -- "$@" --data-urlencode "reply_markup=${markup}" ;;
+        esac
+        res=$(curl "$@" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
     fi
-    rm -f "$pfile_fb" 2>/dev/null
     record_rate_limit "$res"
 fi
 
@@ -165,9 +117,9 @@ if [ -n "$autodel" ] && [ "$autodel" -gt 0 ] 2>/dev/null && [ -n "$msg_id" ]; th
         if [ -x /usr/bin/delete_telegram ]; then
             /usr/bin/delete_telegram "$msg_id" "$ADMIN_CHAT_ID" >/dev/null 2>&1
         elif command -v curl >/dev/null 2>&1; then
-            curl -s -m 6 -d "chat_id=${ADMIN_CHAT_ID}&message_id=${msg_id}" "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" >/dev/null 2>&1
+            curl $curl_tls -s -m 6 -d "chat_id=${ADMIN_CHAT_ID}&message_id=${msg_id}" "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" >/dev/null 2>&1
         else
-            uclient-fetch -q -O - --no-check-certificate --timeout=6 --post-data="chat_id=${ADMIN_CHAT_ID}&message_id=${msg_id}" "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" >/dev/null 2>&1
+            uclient-fetch -q -O - $uf_tls --timeout=6 --post-data="chat_id=${ADMIN_CHAT_ID}&message_id=${msg_id}" "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" >/dev/null 2>&1
         fi
     ) >/dev/null 2>&1 &
 fi

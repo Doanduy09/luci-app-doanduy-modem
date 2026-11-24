@@ -294,41 +294,43 @@ local function read_qmi_sms()
     if not nixio.fs.stat(dev) then dev = "/dev/cdc-wdm0" end
     os.execute("killall -STOP quectel-CM-M quectel-CM 2>/dev/null")
     local raw_messages = {}
-    for _, st in ipairs({"me", "sim"}) do
-        local h = io.popen(string.format("uqmi -s -t 2500 -d %s --storage %s --list-messages 2>/dev/null", dev, st))
-        if h then
-            local out = (h:read("*a") or ""):gsub("[%[%]\r\n%s]+", "")
-            h:close()
-            for id in out:gmatch("%d+") do
-                local h_msg = io.popen(string.format("uqmi -s -t 2000 -d %s --storage %s --get-message %s 2>/dev/null", dev, st, id))
-                if h_msg then
-                    local json_str = h_msg:read("*a") or ""
-                    h_msg:close()
-                    if json_str:find('"sender"') then
-                        local sender = json_str:match('"sender"%s*:%s*"([^"]*)"') or "Tong Dai"
-                        local ts = json_str:match('"timestamp"%s*:%s*"([^"]*)"') or ""
-                        local text = json_str:match('"text"%s*:%s*"([^"]*)"')
-                        local ucs2 = json_str:match('"ucs%-2"%s*:%s*"([^"]*)"')
-                        local ref = json_str:match('"concat_ref"%s*:%s*(%d+)')
-                        local part = json_str:match('"concat_part"%s*:%s*(%d+)')
-                        local parts = json_str:match('"concat_parts"%s*:%s*(%d+)')
-                        local body = ""
-                        if ucs2 and #ucs2 > 0 then body = ucs2_to_utf8(ucs2)
-                        elseif text then body = text:gsub("\\n", "\n"):gsub("\\r", ""):gsub('\\"', '"'):gsub("\\\\", "\\") end
-                        table.insert(raw_messages, {
-                            id = tonumber(id), storage = st, sender = sender:gsub("@", ""),
-                            timestamp = ts, body = body,
-                            ref = ref and tonumber(ref) or nil,
-                            part = part and tonumber(part) or nil,
-                            parts = parts and tonumber(parts) or nil
-                        })
+    local ok, err = pcall(function()
+        for _, st in ipairs({"me", "sim"}) do
+            local h = io.popen(string.format("uqmi -s -t 2500 -d %s --storage %s --list-messages 2>/dev/null", dev, st))
+            if h then
+                local out = (h:read("*a") or ""):gsub("[%[%]\r\n%s]+", "")
+                h:close()
+                for id in out:gmatch("%d+") do
+                    local h_msg = io.popen(string.format("uqmi -s -t 2000 -d %s --storage %s --get-message %s 2>/dev/null", dev, st, id))
+                    if h_msg then
+                        local json_str = h_msg:read("*a") or ""
+                        h_msg:close()
+                        if json_str:find('"sender"') then
+                            local sender = json_str:match('"sender"%s*:%s*"([^"]*)"') or "Tong Dai"
+                            local ts = json_str:match('"timestamp"%s*:%s*"([^"]*)"') or ""
+                            local text = json_str:match('"text"%s*:%s*"([^"]*)"')
+                            local ucs2 = json_str:match('"ucs%-2"%s*:%s*"([^"]*)"')
+                            local ref = json_str:match('"concat_ref"%s*:%s*(%d+)')
+                            local part = json_str:match('"concat_part"%s*:%s*(%d+)')
+                            local parts = json_str:match('"concat_parts"%s*:%s*(%d+)')
+                            local body = ""
+                            if ucs2 and #ucs2 > 0 then body = ucs2_to_utf8(ucs2)
+                            elseif text then body = text:gsub("\\n", "\n"):gsub("\\r", ""):gsub('\\"', '"'):gsub("\\\\", "\\") end
+                            table.insert(raw_messages, {
+                                id = tonumber(id), storage = st, sender = sender:gsub("@", ""),
+                                timestamp = ts, body = body,
+                                ref = ref and tonumber(ref) or nil,
+                                part = part and tonumber(part) or nil,
+                                parts = parts and tonumber(parts) or nil
+                            })
+                        end
                     end
                 end
             end
         end
-    end
+    end)
     os.execute("killall -CONT quectel-CM-M quectel-CM 2>/dev/null")
-    group_and_save(raw_messages)
+    if ok then group_and_save(raw_messages) end
 end
 
 local function read_at_sms(port)

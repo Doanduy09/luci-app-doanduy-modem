@@ -1,0 +1,8 @@
+#!/bin/sh
+[ "$#" -gt 0 ] || exit 1
+mkdir -p /var/lock 2>/dev/null
+if command -v flock >/dev/null 2>&1; then
+	exec 9>"/var/lock/modem_at.lock"
+	flock -x -w 6 9 || exit 1
+fi
+exec "$@"

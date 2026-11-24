@@ -23,7 +23,6 @@ stop_tunnel() {
     for p in $(pgrep -f "cloudflared.*127\.0\.0\.1:80$" 2>/dev/null); do
         kill -9 "$p" 2>/dev/null
     done
-    ps | grep "nokey@localhost.run" | grep -v grep | awk '{print $1}' | xargs -r kill -9 2>/dev/null
     
     local old_url=""
     [ -f "$STATE_FILE" ] && old_url=$(grep "^URL=" "$STATE_FILE" | cut -d'=' -f2-)
@@ -41,7 +40,20 @@ stop_tunnel() {
     echo "STOPPED"
 }
 
+has_root_password() {
+    local h
+    h=$(awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null)
+    case "$h" in
+        ""|"!"|"*"|"!!"|"x") return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 start_tunnel() {
+    if ! has_root_password; then
+        echo '{"status":"ERROR","msg":"Bắt buộc đặt mật khẩu root trước khi mở đường hầm công khai!"}'
+        return 1
+    fi
     local dur="${1:-10}"
     dur=$(echo "$dur" | tr -cd '0-9')
     [ -z "$dur" ] || [ "$dur" -lt 1 ] && dur=10
@@ -89,38 +101,9 @@ start_tunnel() {
         fi
     fi
 
-    # Phương án dự phòng số 3: Localhost.run (nếu không có funnel và cloudflared lỗi)
-    if [ -z "$public_url" ]; then
-        tunnel_type="LOCALHOST_RUN"
-        [ -n "$t_pid" ] && kill -9 "$t_pid" 2>/dev/null
-        rm -f "$PID_FILE" "$LOG_FILE"
-
-        uci set uhttpd.main.rfc1918_filter='0' 2>/dev/null
-        uci set uhttpd.main.max_requests='30' 2>/dev/null
-        uci set uhttpd.main.max_connections='100' 2>/dev/null
-        uci set uhttpd.main.http_keepalive='30' 2>/dev/null
-        uci commit uhttpd 2>/dev/null
-
-        if command -v dbclient >/dev/null 2>&1; then
-            dbclient -y -y -T -W 1048576 -K 15 -R 80:127.0.0.1:80 nokey@localhost.run > "$LOG_FILE" 2>&1 < /dev/null &
-        else
-            ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=15 -R 80:127.0.0.1:80 nokey@localhost.run > "$LOG_FILE" 2>&1 < /dev/null &
-        fi
-        t_pid=$!
-        echo "$t_pid" > "$PID_FILE"
-
-        local count=0
-        while [ $count -lt 24 ]; do
-            sleep 0.5
-            count=$((count + 1))
-            public_url=$(grep -oE 'https://[a-zA-Z0-9.-]+\.lhr\.life' "$LOG_FILE" 2>/dev/null | head -n 1)
-            [ -n "$public_url" ] && break
-        done
-    fi
-
     if [ -z "$public_url" ]; then
         stop_tunnel "silent" >/dev/null 2>&1
-        echo "{\"status\":\"ERROR\",\"msg\":\"Timeout connecting to tunnel server\"}"
+        echo "{\"status\":\"ERROR\",\"msg\":\"Cần bật Tailscale Funnel hoặc cài cloudflared để mở Tunnel an toàn\"}"
         return 1
     fi
 

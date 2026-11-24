@@ -78,21 +78,29 @@ else
     rm -f /tmp/sms_current_iccid /tmp/current_sim_iccid 2>/dev/null
 fi
 
-# 2. Kiem tra Whitelist: CHI CAC SIM VIP MAC DINH MOI DUOC PHEP GIA HAN GOI CUOC
-STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074"
+# 2. Kiem tra Whitelist: CHI CAC SIM VIP MAC DINH MOI DUOC PHEP GIA HAN GOI CUOC (Zero-Leak SHA-256)
+DEFAULT_HASHES="a7a16520a4144e79d6b262ce4265a5d585154221b52803d8e8e6b62213e49865 c317b0ec0ee235c2bae6baf0efde7b03a05e35ad84cf794fc71a809802d47df9 e972c309ace289c3037d4479d79b983d02151f3868f003073085abf4bf508575"
 ALLOWED_ICCIDS=$(cat /etc/config/allowed_iccids.dat 2>/dev/null | tr '\r\n' ' ')
-[ -z "$ALLOWED_ICCIDS" ] && ALLOWED_ICCIDS="$STRICT_DEFAULT_ICCIDS"
 
 is_sim_allowed=0
 if [ -n "$cur_iccid" ]; then
-    for a in $ALLOWED_ICCIDS; do
-        clean_a=$(echo "$a" | tr -d '\r\n[:space:]')
-        [ -z "$clean_a" ] && continue
-        if [ "$cur_iccid" = "$clean_a" ]; then
+    cur_hash=$(printf '%s' "$cur_iccid" | sha256sum 2>/dev/null | awk '{print $1}')
+    for d_h in $DEFAULT_HASHES; do
+        if [ -n "$cur_hash" ] && [ "$cur_hash" = "$d_h" ]; then
             is_sim_allowed=1
             break
         fi
     done
+    if [ "$is_sim_allowed" -ne 1 ] && [ -n "$ALLOWED_ICCIDS" ]; then
+        for a in $ALLOWED_ICCIDS; do
+            clean_a=$(echo "$a" | tr -d '\r\n[:space:]')
+            [ -z "$clean_a" ] && continue
+            if [ "$cur_iccid" = "$clean_a" ] || { [ -n "$cur_hash" ] && [ "$cur_hash" = "$clean_a" ]; }; then
+                is_sim_allowed=1
+                break
+            fi
+        done
+    fi
 fi
 
 masked_cur_iccid="898404******"
@@ -189,9 +197,11 @@ run_send_sms() {
     local dest="$1"
     local text="$2"
     if [ -c "/dev/wwan0qmi0" ]; then
+        trap 'killall -CONT quectel-CM-M quectel-CM 2>/dev/null; rm -f /tmp/sms_sending.lock' EXIT INT TERM
         killall -STOP quectel-CM-M quectel-CM 2>/dev/null
         uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$text" --send-message-target "$dest" >/dev/null 2>&1
         killall -CONT quectel-CM-M quectel-CM 2>/dev/null
+        trap - EXIT INT TERM
         return 0
     fi
     case "$port" in

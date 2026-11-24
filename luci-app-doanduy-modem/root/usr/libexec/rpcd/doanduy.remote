@@ -6,6 +6,15 @@ VAULT_FILE="/etc/config/doanduy_vault"
 SECRETS_FILE="/etc/config/router_secrets.conf"
 PERS_VAULT="/etc/config/personal_vault.conf"
 
+has_root_password() {
+	local h
+	h=$(awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null)
+	case "$h" in
+		""|"!"|"*"|"!!"|"x") return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
 read_tailscale_key() {
 	local val="" f
 	for f in "$VAULT_FILE" "$SECRETS_FILE" "$PERS_VAULT"; do
@@ -57,9 +66,11 @@ case "$1" in
 				luci_r=$(wan_rule_info "doanduy_wan_luci" "80")
 				ssh_r=$(wan_rule_info "doanduy_wan_ssh" "22")
 				ts_key=$(read_tailscale_key)
+				has_pw=0; has_root_password && has_pw=1
 
 				json_init
 				json_add_boolean "success" 1
+				json_add_boolean "has_root_password" "$has_pw"
 				json_add_boolean "tailscale_installed" "$ts_inst"
 				json_add_boolean "tailscale_up" "$ts_up"
 				json_add_string "tailscale_ip" "${ts_ip:-}"
@@ -104,6 +115,10 @@ case "$1" in
 				esac
 				[ -n "$port" ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || port="$def_p"
 				if [ "$en" = "1" ] || [ "$en" = "true" ]; then
+					if ! has_root_password; then
+						echo '{"success":false,"message":"Bắt buộc đặt mật khẩu root trong Hệ thống -> Quản trị trước khi mở cổng WAN!"}'
+						exit 0
+					fi
 					uci -q set "firewall.${rname}=rule"
 					uci -q set "firewall.${rname}.name=DOANDUY-Allow-${label}-WAN"
 					uci -q set "firewall.${rname}.src=wan"
