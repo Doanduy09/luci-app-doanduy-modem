@@ -51,9 +51,10 @@ touch /etc/config/.wwan_custom_setup_done /etc/config/.doanduy_modem_managed 2>/
 uci -q delete network.wwan0
 uci -q delete network.wwan0_4
 uci -q delete network.wwan0_6
+prev_proto=$(uci -q get network.duydoan_5g.proto)
 uci set network.duydoan_5g=interface
 uci set network.duydoan_5g.proto='duydoan5g'
-uci -q delete network.duydoan_5g.device
+[ "$prev_proto" = "duydoan5g" ] || uci -q delete network.duydoan_5g.device
 [ -z "$(uci -q get network.duydoan_5g.apn)" ] && uci set network.duydoan_5g.apn='v-internet'
 [ -z "$(uci -q get network.duydoan_5g.pdptype)" ] && uci set network.duydoan_5g.pdptype='ipv4v6'
 [ -z "$(uci -q get network.duydoan_5g.mtu)" ] && uci set network.duydoan_5g.mtu='1460'
@@ -63,7 +64,9 @@ uci commit network
 # Vo hieu hoa ubus-at-daemon, qmodem dialer va modemmanager auto-dial tranh tranh chap /dev/wwan0*
 if [ -f /etc/config/qmodem ]; then
     uci -q set qmodem.main.enable_dial='0'
-    uci -q set qmodem.0000_01_00_0.enable_dial='0'
+    for qsec in $(uci -q show qmodem 2>/dev/null | sed -n 's/^qmodem\.\([^.=]*\)=modem-device$/\1/p'); do
+        uci -q set "qmodem.${qsec}.enable_dial='0'"
+    done
     uci commit qmodem
 fi
 /etc/init.d/ubus-at-daemon stop 2>/dev/null
@@ -107,12 +110,16 @@ case "$INTERFACE" in
         (
             sleep 2
             if command -v ubus >/dev/null 2>&1; then
-                st=$(ubus call network.interface.duydoan_5g status 2>/dev/null)
-                up=$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)
-                pending=$(echo "$st" | jsonfilter -e '@.pending' 2>/dev/null)
-                if [ "$up" != "true" ] && [ "$pending" != "true" ]; then
-                    ubus call network.interface.duydoan_5g up 2>/dev/null || ifup duydoan_5g 2>/dev/null
-                fi
+                ifaces=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p")
+                [ -n "$ifaces" ] || ifaces="duydoan_5g"
+                for iface in $ifaces; do
+                    st=$(ubus call "network.interface.${iface}" status 2>/dev/null)
+                    up=$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)
+                    pending=$(echo "$st" | jsonfilter -e '@.pending' 2>/dev/null)
+                    if [ "$up" != "true" ] && [ "$pending" != "true" ]; then
+                        ubus call "network.interface.${iface}" up 2>/dev/null || ifup "$iface" 2>/dev/null
+                    fi
+                done
             fi
         ) &
         ;;

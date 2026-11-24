@@ -16,17 +16,20 @@ shift 9 2>/dev/null || shift $#
 delay="${1:-0}"
 user_pdp_index="$2"
 force_apn="${3:-0}"
+user_device="$4"
 
 [ -n "$interface" ] || exit 1
 [ -z "$pincode" ] && pincode=$(uci -q get "network.${interface}.pincode" 2>/dev/null)
 [ -z "$username" ] && username=$(uci -q get "network.${interface}.username" 2>/dev/null)
 [ -z "$password" ] && password=$(uci -q get "network.${interface}.password" 2>/dev/null)
+[ -z "$user_device" ] && user_device=$(uci -q get "network.${interface}.device" 2>/dev/null)
 
 sanitize_at_val() { printf '%s' "$1" | tr -d '"\r\n;\\'; }
 apn=$(sanitize_at_val "$apn")
 username=$(sanitize_at_val "$username")
 password=$(sanitize_at_val "$password")
 pincode=$(printf '%s' "$pincode" | tr -cd '0-9')
+user_device=$(printf '%s' "$user_device" | tr -cd 'a-zA-Z0-9._/-')
 
 case "$mtu" in ''|*[!0-9]*) mtu=1460 ;; esac
 [ "$mtu" -lt 1280 ] && mtu=1280
@@ -69,6 +72,7 @@ UMBIM_ACTIVE=0
 UMBIM_TID=""
 UMBIM_LAST_SIG=""
 UMBIM_LAST_V4=""
+UMBIM_LAST_V6=""
 AT_DIAL_ACTIVE=0
 CTRL_DEV=""
 IFNAME=""
@@ -274,6 +278,11 @@ resolve_netdev_from_ctrl() {
     return 1
 }
 
+matches_user_device() {
+    [ -z "$user_device" ] && return 0
+    [ "$1" = "$user_device" ] || { [ -n "$2" ] && [ "$2" = "$user_device" ]; }
+}
+
 detect_endpoint() {
     while [ "$STOP_REQ" = "0" ]; do
         heal_pcie_mhi_id
@@ -290,6 +299,7 @@ detect_endpoint() {
                 for d in /dev/wwan*mbim*; do
                     [ -c "$d" ] && { CTRL_DEV="$d"; break; }
                 done
+                matches_user_device "$net" "$CTRL_DEV" || continue
                 IFNAME="$net"; NET_DRV="$drv"; MODE="mtk_pcie"
                 return 0
             fi
@@ -300,7 +310,7 @@ detect_endpoint() {
             [ -c "$d" ] || continue
             b="${d##*/}"
             net=$(resolve_netdev_from_ctrl "/sys/class/wwan/$b" "mhi_hwip0 rmnet_mhi0.1 rmnet_mhi0 wwan0")
-            if is_real_wwan_netdev "$net"; then
+            if is_real_wwan_netdev "$net" && matches_user_device "$net" "$d"; then
                 CTRL_DEV="$d"; IFNAME="$net"; NET_DRV=$(netdev_driver "$net"); MODE="cm_qmi"
                 return 0
             fi
@@ -311,7 +321,7 @@ detect_endpoint() {
             [ -c "$d" ] || continue
             b="${d##*/}"
             net=$(resolve_netdev_from_ctrl "/sys/class/wwan/$b" "wwan0 mhi_hwip0")
-            if is_real_wwan_netdev "$net"; then
+            if is_real_wwan_netdev "$net" && matches_user_device "$net" "$d"; then
                 CTRL_DEV="$d"; IFNAME="$net"; NET_DRV=$(netdev_driver "$net"); MODE="cm_mbim"
                 return 0
             fi
@@ -325,7 +335,7 @@ detect_endpoint() {
                 /dev/qcqmi*) net=$(resolve_netdev_from_ctrl "/sys/class/GobiQMI/$b" "wwan0 eth2 usb0") ;;
                 *) net=$(resolve_netdev_from_ctrl "/sys/class/usbmisc/$b" "wwan0 usb0 eth2") ;;
             esac
-            if is_real_wwan_netdev "$net"; then
+            if is_real_wwan_netdev "$net" && matches_user_device "$net" "$d"; then
                 CTRL_DEV="$d"; IFNAME="$net"; NET_DRV=$(netdev_driver "$net"); MODE="cm_usb"
                 return 0
             fi
@@ -336,6 +346,7 @@ detect_endpoint() {
             [ -e "$entry" ] || continue
             net="${entry##*/}"
             is_real_wwan_netdev "$net" || continue
+            matches_user_device "$net" "" || continue
             drv=$(netdev_driver "$net")
             case "$drv" in
                 cdc_ncm|huawei_cdc_ncm|cdc_ether|rndis_host|sierra_net|cdc_subset|ipheth)
@@ -346,6 +357,7 @@ detect_endpoint() {
         done
         for cand in usb0 rndis0 eth2; do
             is_real_wwan_netdev "$cand" || continue
+            matches_user_device "$cand" "" || continue
             drv=$(netdev_driver "$cand")
             case "$drv" in
                 r8152|ax88179_178a|asix|nss-dp|igc|r8169|e1000e) continue ;;
@@ -527,11 +539,12 @@ find_working_at_port() {
         for tpath in $(find "$usb_root" -maxdepth 4 \( -name 'ttyUSB[0-9]*' -o -name 'ttyACM[0-9]*' \) 2>/dev/null | sort); do
             append_unique_port "/dev/${tpath##*/}"
         done
+    else
+        # Global fallback only for PCIe / non-USB modems to avoid USB/PCIe AT cross-talk
+        for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB4 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0; do
+            append_unique_port "$p"
+        done
     fi
-
-    for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB4 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0; do
-        append_unique_port "$p"
-    done
 
     for p in $CAND_PORTS; do
         [ -c "$p" ] || continue
@@ -910,23 +923,29 @@ publish_netifd_up() {
     proto_init_update "$IFNAME" 1
     if [ -n "$v4" ]; then
         proto_add_ipv4_address "$v4" "${m4:-30}"
-        [ -n "$gw4" ] && proto_add_ipv4_route 0.0.0.0 0 "$gw4" "" "$metric"
+        if [ -n "$gw4" ]; then
+            proto_add_ipv4_route 0.0.0.0 0 "$gw4" "" "$metric"
+        else
+            proto_add_ipv4_route 0.0.0.0 0 "" "" "$metric"
+        fi
     fi
     if [ -n "$extra_dns" ]; then
         for d in $extra_dns; do
             [ "$d" = "0.0.0.0" ] || [ -z "$d" ] && continue
+            case " $added_dns " in *" $d "*) continue ;; esac
             proto_add_dns_server "$d"
             added_dns="$added_dns $d"
         done
     elif [ -f "$LOG_FILE" ]; then
-        for d in $(sed -n 's/.*[Dd][Nn][Ss][12][[:space:]]*[=:][[:space:]]*\([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' "$LOG_FILE" 2>/dev/null | tail -n 4); do
+        for d in $(sed -n 's/.*[Dd][Nn][Ss][12][[:space:]]*[=:][[:space:]]*\([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' "$LOG_FILE" 2>/dev/null | tail -n 2); do
             [ "$d" = "0.0.0.0" ] || [ -z "$d" ] && continue
+            case " $added_dns " in *" $d "*) continue ;; esac
             proto_add_dns_server "$d"
             added_dns="$added_dns $d"
         done
     fi
     for d in 8.8.8.8 1.1.1.1; do
-        case " $added_dns " in *" $d "*) ;; *) proto_add_dns_server "$d" ;; esac
+        case " $added_dns " in *" $d "*) ;; *) proto_add_dns_server "$d"; added_dns="$added_dns $d" ;; esac
     done
     if [ -n "$v6" ]; then
         proto_add_ipv6_address "$v6" "${m6:-64}"
@@ -943,12 +962,19 @@ run_uqmi_fallback() {
     ip link set dev "$IFNAME" up 2>/dev/null || true
 
     uqmi -s -d "$CTRL_DEV" -t 1000 --wda-set-data-format raw-ip >/dev/null 2>&1 || true
-    local cid4 settings4 v4 m4 gw4 d1 d2
+    local cid4 settings4 v4 m4 gw4 d1 d2 u_auth=""
     cid4=$(uqmi -s -d "$CTRL_DEV" -t 2000 --get-client-id wds 2>/dev/null)
     case "$cid4" in ''|*[!0-9]*) return 1 ;; esac
 
-    uqmi -s -d "$CTRL_DEV" -t 5000 --set-client-id "wds,$cid4" --set-ip-family ipv4 \
-        --start-network --apn "$apn" --keep-client-id wds >/dev/null 2>&1 || {
+    set -- -s -d "$CTRL_DEV" -t 5000 --set-client-id "wds,$cid4" --set-ip-family ipv4 --start-network --apn "$apn"
+    if [ -n "$username" ] && [ -n "$password" ]; then
+        case "$auth" in
+            pap|chap|both) u_auth="$auth" ;;
+            *) u_auth="both" ;;
+        esac
+        set -- "$@" --auth-type "$u_auth" --username "$username" --password "$password"
+    fi
+    uqmi "$@" --keep-client-id wds >/dev/null 2>&1 || {
         uqmi -s -d "$CTRL_DEV" -t 1000 --set-client-id "wds,$cid4" --release-client-id wds >/dev/null 2>&1 || true
         return 1
     }
@@ -1000,6 +1026,7 @@ publish_umbim_config() {
     publish_netifd_up "$v4" "$m4" "$gw4" "$v6" "$m6" "$gw6" "$dns4"
     UMBIM_LAST_SIG="${v4:+${v4}/${m4}}|${gw4}|${v6:+${v6}/${m6}}"
     UMBIM_LAST_V4="$v4"
+    UMBIM_LAST_V6="$v6"
     return 0
 }
 
@@ -1009,7 +1036,7 @@ run_umbim_fallback() {
     ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
     ip link set dev "$IFNAME" up 2>/dev/null || true
 
-    local tid=2 tries=0 ok=0 pdp_req="ipv4v6:" mbimconfig
+    local tid=2 tries=0 ok=0 pdp_req="ipv4v6:" mbimconfig m_auth="none"
     UMBIM_ACTIVE=1
     while [ "$tries" -lt 3 ] && [ "$STOP_REQ" = "0" ]; do
         timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" caps >/dev/null 2>&1 && { ok=1; break; }
@@ -1037,7 +1064,10 @@ run_umbim_fallback() {
     tid=$((tid + 1))
 
     case "$pdptype" in ip|ipv4) pdp_req="ipv4:" ;; ipv6) pdp_req="ipv6:" ;; *) pdp_req="ipv4v6:" ;; esac
-    timeout 12 umbim -n -t "$tid" -d "$CTRL_DEV" connect "$pdp_req$apn" >/dev/null 2>&1 || {
+    case "$auth" in pap|chap|both) m_auth="$auth" ;; *) [ -n "$username$password" ] && m_auth="pap" || m_auth="none" ;; esac
+    set -- -n -t "$tid" -d "$CTRL_DEV" connect "$pdp_req$apn"
+    [ "$m_auth" != "none" ] && [ -n "$username$password" ] && set -- "$@" "$m_auth" "$username" "$password"
+    timeout 12 umbim "$@" >/dev/null 2>&1 || {
         tid=$((tid + 1))
         timeout 12 umbim -n -t "$tid" -d "$CTRL_DEV" connect "$apn" "none" >/dev/null 2>&1 || { UMBIM_ACTIVE=0; return 1; }
     }
@@ -1055,9 +1085,11 @@ run_umbim_fallback() {
 
     while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
         clamp_mtu
-        local live4
+        local live4 live6
         live4=$(ip -4 addr show dev "$IFNAME" 2>/dev/null | awk '/inet /{print $2; exit}')
+        live6=$(ip -6 addr show dev "$IFNAME" scope global 2>/dev/null | awk '/inet6 /{print $2; exit}')
         [ -n "$UMBIM_LAST_V4" ] && [ -z "$live4" ] && break
+        [ -n "$UMBIM_LAST_V6" ] && [ -z "$live6" ] && break
         sleep 5
     done
     if [ "$STOP_REQ" = "0" ]; then
@@ -1215,7 +1247,7 @@ run_at_dhcp_monitor() {
     ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
     ip link set dev "$IFNAME" up 2>/dev/null || true
 
-    local check_cid="$MODEM_PDP_IDX" is_auto=0 want_v6=0 pdp_miss=0 cgp v4 v6 cur_sig last_sig=""
+    local check_cid="$MODEM_PDP_IDX" is_auto=0 want_v6=0 pdp_miss=0 cgp v4 v6 cur_sig last_sig="" prev_carrier="" cur_carrier=""
     case "$pdptype" in ip|ipv4) want_v6=0 ;; *) want_v6=1 ;; esac
     if [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1; then
         rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true
@@ -1243,6 +1275,13 @@ run_at_dhcp_monitor() {
         [ "$STOP_REQ" = "0" ] || break
         detach_bridge_master
         clamp_mtu
+        cur_carrier=$(cat "/sys/class/net/$IFNAME/carrier" 2>/dev/null || true)
+        if [ "$prev_carrier" = "0" ] && [ "$cur_carrier" = "1" ]; then
+            logger -t duydoan5g "Carrier recovered on $IFNAME; renewing DHCP"
+            [ -n "$UDHCPC_PID" ] && kill -USR1 "$UDHCPC_PID" 2>/dev/null || true
+            [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1 && { rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true; }
+        fi
+        [ -n "$cur_carrier" ] && prev_carrier="$cur_carrier"
         [ "$is_auto" = "1" ] && continue
         [ -c "$AT_PORT" ] || continue
 
@@ -1340,7 +1379,13 @@ fi
 
 fail_streak=0
 while [ "$STOP_REQ" = "0" ]; do
-    [ -d "/sys/class/net/$IFNAME" ] || detect_endpoint || exit 1
+    if [ ! -d "/sys/class/net/$IFNAME" ]; then
+        proto_init_update "$IFNAME" 0
+        proto_send_update "$interface"
+        logger -t duydoan5g "Interface $IFNAME vanished; re-initializing dialer detection"
+        exec 8>&-
+        exec /usr/bin/duydoan5g_dialer.sh "$interface" "$apn" "$pdptype" "$mtu" "$metric" "$pincode" "$username" "$password" "$auth" "0" "$user_pdp_index" "$force_apn" "$user_device"
+    fi
     local_qcm=""
     for bin in /usr/bin/quectel-CM-M /usr/bin/quectel-CM /usr/bin/quectel-cm; do
         [ -x "$bin" ] && { local_qcm="$bin"; break; }

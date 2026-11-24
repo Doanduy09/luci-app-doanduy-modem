@@ -101,5 +101,9 @@ return network.registerProtocol('duydoan5g', {
 		o = s.taboption('advanced', form.Flag, 'force_apn', _('Ép đặt lại APN (Telit / QMI nghiêm ngặt)'));
 		o.default = '0';
 		o.rmempty = true;
+
+		o = s.taboption('advanced', form.Value, 'device', _('Thiết bị Modem cố định (Tùy chọn đa modem)'));
+		o.placeholder = 'Auto (wwan0 / mhi_hwip0 / eth2 / /dev/cdc-wdm0)';
+		o.rmempty = true;
 	}
 });

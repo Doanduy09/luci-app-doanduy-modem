@@ -16,13 +16,14 @@ proto_duydoan5g_init_config() {
 	proto_config_add_int "delay"
 	proto_config_add_string "pdp_index"
 	proto_config_add_boolean "force_apn"
+	proto_config_add_string "device"
 	proto_config_add_defaults
 }
 
 proto_duydoan5g_setup() {
 	local interface="$1"
-	local apn pincode username password auth pdptype mtu delay metric pdp_index force_apn
-	json_get_vars apn pincode username password auth pdptype mtu delay metric pdp_index force_apn
+	local apn pincode username password auth pdptype mtu delay metric pdp_index force_apn device
+	json_get_vars apn pincode username password auth pdptype mtu delay metric pdp_index force_apn device
 
 	[ -z "$apn" ] && apn="v-internet"
 	[ -z "$pdptype" ] && pdptype="ipv4v6"
@@ -33,7 +34,7 @@ proto_duydoan5g_setup() {
 
 	logger -t duydoan5g "Launching supervised 5G dialer for $interface (APN: $apn, PDP: $pdptype, MTU: $mtu)"
 	proto_run_command "$interface" /usr/bin/duydoan5g_dialer.sh \
-		"$interface" "$apn" "$pdptype" "$mtu" "$metric" "" "" "" "$auth" "$delay" "$pdp_index" "$force_apn"
+		"$interface" "$apn" "$pdptype" "$mtu" "$metric" "" "" "" "$auth" "$delay" "$pdp_index" "$force_apn" "$device"
 }
 
 proto_duydoan5g_teardown() {
