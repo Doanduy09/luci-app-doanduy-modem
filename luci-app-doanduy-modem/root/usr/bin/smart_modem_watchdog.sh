@@ -79,8 +79,7 @@ local f = io.open(outpath, 'w')
 if f then f:write('chat_id=' .. cid .. '&parse_mode=HTML&text=' .. enc); f:close() end
 LUAPOST
     if [ -f "$pfile" ]; then
-        curl -4 --http1.1 -s -m 8 -d @"$pfile" "https://api.telegram.org/bot${token}/sendMessage" >/dev/null 2>&1 &
-        rm -f "$pfile" 2>/dev/null
+        ( curl -4 --http1.1 -s -m 8 -d @"$pfile" "https://api.telegram.org/bot${token}/sendMessage" >/dev/null 2>&1; rm -f "$pfile" 2>/dev/null ) &
     fi
 }
 
@@ -379,7 +378,7 @@ heal_tier3_cfun_cell_failover() {
     fi
 
     # 2. Bỏ qua nếu quectel-cm đang trong quá trình quay số
-    if [ -f /tmp/quectel_dialing ]; then
+    if [ -f "/tmp/quectel_dialing_${iface}" ] || [ -f /tmp/quectel_dialing ]; then
         echo "$(date): [Tầng 3] Modem đang quay số (quectel_dialing), tạm hoãn can thiệp..."
         return 1
     fi
@@ -813,10 +812,13 @@ SLEEP_INTERVAL=20
 while true; do
     ACT_IFACE=$(get_smart_iface)
 
-    # [ZERO-DELAY INTERFACE GUARD] Tự động bật lại NGAY LẬP TỨC nếu LuCI bấm Dừng hoặc interface bị ngắt
+    # [ZERO-DELAY INTERFACE GUARD] Tự động bật lại khi interface rớt bất ngờ (chờ xong boot grace 90s và không cắt ngang quá trình quay số)
     if command -v ubus >/dev/null 2>&1; then
-        if_state=$(ubus call network.interface."$ACT_IFACE" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
-        if [ "$if_state" != "true" ]; then
+        up_sec=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999)
+        if_json=$(ubus call network.interface."$ACT_IFACE" status 2>/dev/null)
+        if_state=$(echo "$if_json" | jsonfilter -e '@.up' 2>/dev/null)
+        if_pending=$(echo "$if_json" | jsonfilter -e '@.pending' 2>/dev/null)
+        if [ "$up_sec" -ge 90 ] && [ "$if_state" != "true" ] && [ "$if_pending" != "true" ] && [ ! -f "/tmp/quectel_dialing_${ACT_IFACE}" ] && [ ! -f /tmp/quectel_dialing ]; then
             echo "$(date): [Interface Guard] ⚠️ Phát hiện giao diện $ACT_IFACE đang TẮT/DỪNG! Tự động bật lại ngay lập tức (ifup $ACT_IFACE)..." >> "$LOG_FILE"
             ubus call network.interface."$ACT_IFACE" up 2>/dev/null || ifup "$ACT_IFACE" 2>/dev/null
             sleep 2
@@ -981,31 +983,49 @@ while true; do
         fi
     fi
 
-    # TẦNG 4: HARDWARE USB BUS RESET & PHYSICAL RE-ENUMERATION
+    # TẦNG 4: HARDWARE USB/PCIE BUS RESET & PHYSICAL RE-ENUMERATION
     # KÍCH HOẠT KHI MẤT MẠNG KÉO DÀI >= 15 LẦN (~5-6 PHÚT)
     if [ "$FAIL_STREAK" -ge 15 ]; then
-        echo "$(date): [Tầng 4 Cứu Hộ Cứng] Cả 3 tầng trước chưa khôi phục. Kích hoạt Hardware USB Reset toàn diện..." >> "$LOG_FILE"
+        echo "$(date): [Tầng 4 Cứu Hộ Cứng] Cả 3 tầng trước chưa khôi phục. Kích hoạt Hardware Bus Reset toàn diện..." >> "$LOG_FILE"
         rotate_log_if_needed
 
-        # 1. usbreset nếu có nhị phân
-        local usb_id=$(lsusb 2>/dev/null | grep -iE "1199:|2c7c:|2cb7:|05c6:" | awk '{print $6}' | head -n 1)
-        [ -z "$usb_id" ] && usb_id="1199:90d3"
-        if command -v usbreset >/dev/null 2>&1; then
-            usbreset "$usb_id" >/dev/null 2>&1
-        fi
-
-        # 2. Tái cấp quyền USB sysfs (ngắt và cấp lại nguồn logic USB)
-        for auth_f in /sys/bus/usb/devices/2-*/authorized /sys/bus/usb/devices/1-*/authorized; do
-            if [ -f "$auth_f" ]; then
-                echo 0 > "$auth_f" 2>/dev/null
-                sleep 2
-                echo 1 > "$auth_f" 2>/dev/null
-            fi
+        local pcie_healed=0 dev slot
+        for dev in /sys/bus/pci/drivers/mhi-pci-generic/0000:*; do
+            [ -d "$dev" ] || continue
+            slot="${dev##*/}"
+            pcie_healed=1
+            echo "$(date): [Tầng 4] Rescan PCIe MHI slot $slot..." >> "$LOG_FILE"
+            killall -9 quectel-CM-M quectel-CM quectel-cm umbim atinout sms_tool 2>/dev/null
+            sleep 1
+            rm -f /tmp/.mhi_pcie_healed_* 2>/dev/null
+            echo "$slot" > /sys/bus/pci/drivers/mhi-pci-generic/unbind 2>/dev/null || true
+            echo 1 > "/sys/bus/pci/devices/$slot/remove" 2>/dev/null || true
+            sleep 1
+            echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
+            sleep 6
         done
 
-        # 3. Dọn dẹp triệt để tiến trình treo
-        killall -9 umbim atinout sms_tool 2>/dev/null
-        sleep 10
+        if [ "$pcie_healed" -eq 0 ]; then
+            # 1. usbreset nếu có nhị phân
+            local usb_id=$(lsusb 2>/dev/null | grep -iE "1199:|2c7c:|2cb7:|05c6:" | awk '{print $6}' | head -n 1)
+            [ -z "$usb_id" ] && usb_id="1199:90d3"
+            if command -v usbreset >/dev/null 2>&1; then
+                usbreset "$usb_id" >/dev/null 2>&1
+            fi
+
+            # 2. Tái cấp quyền USB sysfs (ngắt và cấp lại nguồn logic USB)
+            for auth_f in /sys/bus/usb/devices/2-*/authorized /sys/bus/usb/devices/1-*/authorized; do
+                if [ -f "$auth_f" ]; then
+                    echo 0 > "$auth_f" 2>/dev/null
+                    sleep 2
+                    echo 1 > "$auth_f" 2>/dev/null
+                fi
+            done
+
+            # 3. Dọn dẹp triệt để tiến trình treo
+            killall -9 umbim atinout sms_tool 2>/dev/null
+            sleep 10
+        fi
 
         # 4. Kích hoạt lại interface
         ubus call network.interface."$ACT_IFACE" up 2>/dev/null || ifup "$ACT_IFACE" 2>/dev/null

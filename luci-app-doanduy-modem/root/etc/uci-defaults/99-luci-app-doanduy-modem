@@ -54,7 +54,7 @@ uci -q delete network.wwan0_6
 uci set network.duydoan_5g=interface
 uci set network.duydoan_5g.proto='duydoan5g'
 uci -q delete network.duydoan_5g.device
-uci set network.duydoan_5g.apn='v-internet'
+[ -z "$(uci -q get network.duydoan_5g.apn)" ] && uci set network.duydoan_5g.apn='v-internet'
 [ -z "$(uci -q get network.duydoan_5g.pdptype)" ] && uci set network.duydoan_5g.pdptype='ipv4v6'
 [ -z "$(uci -q get network.duydoan_5g.mtu)" ] && uci set network.duydoan_5g.mtu='1460'
 [ -z "$(uci -q get network.duydoan_5g.metric)" ] && uci set network.duydoan_5g.metric='10'
@@ -91,18 +91,25 @@ cat << 'HP_EOF' > /etc/hotplug.d/net/99_wwan_net.sh
 #!/bin/sh
 [ "$ACTION" = "add" ] || exit 0
 case "$INTERFACE" in
-    wwan*|mhi_hwip*|rmnet*|usb0|rndis0|eth2)
-        if [ "$INTERFACE" = "eth2" ]; then
-            drv_link=$(readlink -f /sys/class/net/eth2/device/driver 2>/dev/null)
-            case "$drv_link" in
-                *r8152*|*ax88179*|*asix*|*nss*|*igc*|*r8169*) exit 0 ;;
-            esac
-        fi
+    wwan*|mhi_hwip*|rmnet*|usb*|rndis*|eth*)
+        case "$INTERFACE" in
+            eth*)
+                drv_link=$(readlink -f "/sys/class/net/${INTERFACE}/device/driver" 2>/dev/null)
+                case "${drv_link##*/}" in
+                    cdc_ncm|huawei_cdc_ncm|cdc_ether|rndis_host|sierra_net|cdc_subset|ipheth|qmi_wwan|qmi_wwan_q|cdc_mbim|GobiNet) ;;
+                    *) exit 0 ;;
+                esac
+                ;;
+        esac
         (
             sleep 2
             if command -v ubus >/dev/null 2>&1; then
-                up=$(ubus call network.interface.duydoan_5g status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
-                [ "$up" != "true" ] && { ubus call network.interface.duydoan_5g up 2>/dev/null || ifup duydoan_5g 2>/dev/null; }
+                st=$(ubus call network.interface.duydoan_5g status 2>/dev/null)
+                up=$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)
+                pending=$(echo "$st" | jsonfilter -e '@.pending' 2>/dev/null)
+                if [ "$up" != "true" ] && [ "$pending" != "true" ]; then
+                    ubus call network.interface.duydoan_5g up 2>/dev/null || ifup duydoan_5g 2>/dev/null
+                fi
             fi
         ) &
         ;;

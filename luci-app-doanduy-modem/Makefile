@@ -14,7 +14,7 @@ PKG_LICENSE:=GPL-3.0-or-later
 PKG_MAINTAINER:=DOANDUY <doanduy09@gmail.com>
 
 LUCI_TITLE:=Quản Trị Modem 5G PCIe & USB, SMS Engine, Auto-Renew & AI Sentinel
-LUCI_DEPENDS:=+luci-base +rpcd +ubus +jsonfilter +kmod-mhi-bus +kmod-mhi-net +atinout
+LUCI_DEPENDS:=+luci-base +rpcd +ubus +jsonfilter +atinout
 LUCI_PKGARCH:=all
 
 define Package/$(PKG_NAME)/conffiles

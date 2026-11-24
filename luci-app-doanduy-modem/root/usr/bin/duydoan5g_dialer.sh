@@ -18,6 +18,16 @@ user_pdp_index="$2"
 force_apn="${3:-0}"
 
 [ -n "$interface" ] || exit 1
+[ -z "$pincode" ] && pincode=$(uci -q get "network.${interface}.pincode" 2>/dev/null)
+[ -z "$username" ] && username=$(uci -q get "network.${interface}.username" 2>/dev/null)
+[ -z "$password" ] && password=$(uci -q get "network.${interface}.password" 2>/dev/null)
+
+sanitize_at_val() { printf '%s' "$1" | tr -d '"\r\n;\\'; }
+apn=$(sanitize_at_val "$apn")
+username=$(sanitize_at_val "$username")
+password=$(sanitize_at_val "$password")
+pincode=$(printf '%s' "$pincode" | tr -cd '0-9')
+
 case "$mtu" in ''|*[!0-9]*) mtu=1460 ;; esac
 [ "$mtu" -lt 1280 ] && mtu=1280
 [ "$mtu" -gt 1500 ] && mtu=1500
@@ -27,16 +37,24 @@ case "$user_pdp_index" in ''|*[!0-9]*) user_pdp_index="" ;; esac
 [ "$force_apn" = "1" ] || force_apn=0
 
 mkdir -p /var/lock /var/run /tmp/quectel_cm
-exec 8>"/var/lock/duydoan5g_dial.lock"
+exec 8>"/var/lock/duydoan5g_${interface}.lock"
 flock -x -w 10 8 || exit 1
 
-LOG_FILE="/tmp/quectel_cm/quectel-cm.log"
-PID_FILE="/var/run/duydoan5g.pid"
+if [ "$interface" = "duydoan_5g" ]; then
+    LOG_FILE="/tmp/quectel_cm/quectel-cm.log"
+else
+    LOG_FILE="/tmp/quectel_cm/${interface}.log"
+fi
+PID_FILE="/var/run/duydoan5g_${interface}.pid"
+DIALING_FLAG="/tmp/quectel_dialing_${interface}"
+PIN_FLAG="/var/run/duydoan5g_pin_${interface}"
 STOP_REQ=0
 CM_PID=""
 CM_START=""
 UDHCPC_PID=""
 UDHCPC_START=""
+ODHCP6C_PID=""
+ODHCP6C_START=""
 UMBIM_ACTIVE=0
 UMBIM_TID=""
 UMBIM_LAST_SIG=""
@@ -75,9 +93,10 @@ stop_pid_graceful() {
 
 cleanup_and_exit() {
     STOP_REQ=1
-    rm -f /tmp/quectel_dialing
+    rm -f "$DIALING_FLAG"
     stop_pid_graceful "$CM_PID" "$CM_START"
     stop_pid_graceful "$UDHCPC_PID" "$UDHCPC_START"
+    stop_pid_graceful "$ODHCP6C_PID" "$ODHCP6C_START"
     if [ "$UMBIM_ACTIVE" = "1" ] && [ -n "$UMBIM_TID" ] && [ -c "$CTRL_DEV" ]; then
         timeout 4 umbim -n -t "$UMBIM_TID" -d "$CTRL_DEV" disconnect >/dev/null 2>&1 || true
     fi
@@ -114,14 +133,28 @@ netdev_driver() {
 }
 
 is_real_wwan_netdev() {
-    local name="$1" real_path
+    local name="$1" real_path drv
     [ -n "$name" ] && [ -d "/sys/class/net/$name" ] || return 1
     case "$name" in
-        lo|br-*|lan*|wan*|eth0|eth1|wlan*|phy*|mhi_swip*|erspan*|gre*|miireg) return 1 ;;
+        lo|br-*|lan*|wan*|wlan*|phy*|mhi_swip*|erspan*|gre*|miireg) return 1 ;;
     esac
     real_path=$(readlink -f "/sys/class/net/$name" 2>/dev/null)
     case "$real_path" in
         */mhi*_IP_SW/*) return 1 ;;
+    esac
+    case "$name" in
+        eth*)
+            drv=$(netdev_driver "$name")
+            case "$drv" in
+                qmi_wwan|qmi_wwan_q|cdc_mbim|cdc_ncm|huawei_cdc_ncm|cdc_ether|rndis_host|sierra_net|cdc_subset|ipheth|GobiNet|mhi_net|mtk_t7xx|rmnet_nss)
+                    return 0 ;;
+                r8152|ax88179_178a|asix|nss-dp|igc|r8169|e1000e|stmmac|mvneta|mvpp2|mtk_soc_eth)
+                    return 1 ;;
+            esac
+            case "$name" in
+                eth0|eth1) return 1 ;;
+            esac
+            ;;
     esac
     return 0
 }
@@ -316,15 +349,40 @@ safe_at_once() {
 
 stop_competing_dialers() {
     local procs="quectel-CM-M quectel-CM quectel-cm umbim"
-    if pidof $procs >/dev/null 2>&1; then
-        killall -TERM $procs 2>/dev/null || true
-        local i=0
-        while [ "$i" -lt 3 ] && pidof $procs >/dev/null 2>&1; do
-            sleep 1
-            i=$((i + 1))
-        done
-        pidof $procs >/dev/null 2>&1 && killall -KILL $procs 2>/dev/null || true
+    local p cmd match targets="" cm_if_cmp="$IFNAME" i=0 alive
+    if [ -z "$IFNAME" ] && [ -z "$CTRL_DEV" ]; then
+        if pidof $procs >/dev/null 2>&1; then
+            killall -TERM $procs 2>/dev/null || true
+            while [ "$i" -lt 3 ] && pidof $procs >/dev/null 2>&1; do
+                sleep 1
+                i=$((i + 1))
+            done
+            pidof $procs >/dev/null 2>&1 && killall -KILL $procs 2>/dev/null || true
+        fi
+        return 0
     fi
+    case "$IFNAME" in
+        wwan*_*) cm_if_cmp="${IFNAME%%_*}" ;;
+        rmnet*.*) cm_if_cmp="${IFNAME%%.*}" ;;
+    esac
+    for p in $(pidof $procs 2>/dev/null); do
+        cmd=$(tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+        match=0
+        [ -n "$IFNAME" ] && case "$cmd" in *"$IFNAME"*) match=1 ;; esac
+        [ -n "$cm_if_cmp" ] && case "$cmd" in *"$cm_if_cmp"*) match=1 ;; esac
+        [ -n "$CTRL_DEV" ] && case "$cmd" in *"$CTRL_DEV"*) match=1 ;; esac
+        [ "$match" = "1" ] && targets="$targets $p"
+    done
+    [ -n "$targets" ] || return 0
+    for p in $targets; do kill -TERM "$p" 2>/dev/null || true; done
+    while [ "$i" -lt 3 ]; do
+        alive=0
+        for p in $targets; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [ "$alive" = "0" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    for p in $targets; do kill -KILL "$p" 2>/dev/null || true; done
 }
 
 extract_cgpaddr_ipv4() {
@@ -491,11 +549,11 @@ pre_dial_prepare() {
         sleep 3
     fi
 
-    if [ -n "$pincode" ] && [ ! -f /var/run/duydoan5g_pin_tried ]; then
+    if [ -n "$pincode" ] && [ ! -f "$PIN_FLAG" ]; then
         cpin_res=$(safe_at_once "$AT_PORT" "AT+CPIN?")
         if echo "$cpin_res" | grep -qi "SIM PIN"; then
             safe_at_once "$AT_PORT" "AT+CPIN=\"$pincode\"" >/dev/null
-            echo "tried" > /var/run/duydoan5g_pin_tried
+            echo "tried" > "$PIN_FLAG"
             sleep 2
         fi
     fi
@@ -535,7 +593,9 @@ at_dial_activate() {
                     ;;
                 *)
                     cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
-                    nat_cmd='AT+QCFG="nat",1'
+                    if ! safe_at_once "$AT_PORT" 'AT+QCFG="nat"' | grep -qE '\+QCFG:[[:space:]]*"nat",1'; then
+                        nat_cmd='AT+QCFG="nat",1'
+                    fi
                     act_cmd="AT+QNETDEVCTL=3,$cid,1"
                     ;;
             esac
@@ -624,7 +684,7 @@ at_hangup() {
         huawei)
             [ "$MODEM_PLATFORM" = "unisoc" ] && hcmd="AT^SETAUTODIAL=0" || hcmd="AT^NDISDUP=0,0"
             ;;
-        quectel) hcmd="AT+QNETDEVCTL=$cid,2,1" ;;
+        quectel) hcmd="AT+QNETDEVCTL=0,$cid,1" ;;
         fibocom) [ "$MODEM_PLATFORM" = "mediatek" ] && hcmd="AT+CGACT=0,$cid" || hcmd="AT+GTRNDIS=0,$cid" ;;
         meig) hcmd="AT\$QCRMCALL=0,0,3,2,$cid" ;;
         neoway) hcmd='AT$MYUSBNETACT=0,0' ;;
@@ -661,7 +721,7 @@ publish_netifd_up() {
             added_dns="$added_dns $d"
         done
     elif [ -f "$LOG_FILE" ]; then
-        for d in $(grep -E 'dns[12] = [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$LOG_FILE" 2>/dev/null | tail -n 2 | awk '{print $NF}'); do
+        for d in $(sed -n 's/.*[Dd][Nn][Ss][12][[:space:]]*[=:][[:space:]]*\([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*/\1/p' "$LOG_FILE" 2>/dev/null | tail -n 4); do
             [ "$d" = "0.0.0.0" ] || [ -z "$d" ] && continue
             proto_add_dns_server "$d"
             added_dns="$added_dns $d"
@@ -705,7 +765,7 @@ run_uqmi_fallback() {
         return 1
     fi
 
-    rm -f /tmp/quectel_dialing
+    rm -f "$DIALING_FLAG"
     publish_netifd_up "$v4" "${m4:-255.255.255.252}" "$gw4" "" "" "" "$d1 $d2"
     logger -t duydoan5g "Connected via uqmi fallback! IP: $v4, GW: $gw4"
 
@@ -723,18 +783,24 @@ run_uqmi_fallback() {
 }
 
 publish_umbim_config() {
-    local mbimconfig="$1" cidr4 m4 v4 gw4 dns4 cidr6 v6 m6 gw6
+    local mbimconfig="$1" cidr4 m4="" v4 gw4 dns4 cidr6 v6 m6="" gw6
     cidr4=$(echo "$mbimconfig" | awk '/ipv4address:/{print $2; exit}')
-    v4="${cidr4%/*}"; m4="${cidr4#*/}"; [ "$m4" = "$cidr4" ] && m4=30
+    v4="${cidr4%/*}"
+    if [ -n "$v4" ]; then
+        m4="${cidr4#*/}"; [ "$m4" = "$cidr4" ] && m4=30
+    fi
     gw4=$(echo "$mbimconfig" | awk '/ipv4gateway:/{print $2; exit}')
     dns4=$(echo "$mbimconfig" | awk '/ipv4dnsserver:/{printf "%s ", $2}')
     cidr6=$(echo "$mbimconfig" | awk '/ipv6address:/{print $2; exit}')
-    v6="${cidr6%/*}"; m6="${cidr6#*/}"; [ "$m6" = "$cidr6" ] && m6=64
+    v6="${cidr6%/*}"
+    if [ -n "$v6" ]; then
+        m6="${cidr6#*/}"; [ "$m6" = "$cidr6" ] && m6=64
+    fi
     gw6=$(echo "$mbimconfig" | awk '/ipv6gateway:/{print $2; exit}')
     [ -n "$v4" ] || [ -n "$v6" ] || return 1
-    rm -f /tmp/quectel_dialing
+    rm -f "$DIALING_FLAG"
     publish_netifd_up "$v4" "$m4" "$gw4" "$v6" "$m6" "$gw6" "$dns4"
-    UMBIM_LAST_SIG="${v4}/${m4}|${gw4}|${v6}/${m6}"
+    UMBIM_LAST_SIG="${v4:+${v4}/${m4}}|${gw4}|${v6:+${v6}/${m6}}"
     UMBIM_LAST_V4="$v4"
     return 0
 }
@@ -832,11 +898,14 @@ run_mtk_pcie_dial() {
                 sleep 15
                 [ "$STOP_REQ" = "0" ] || break
                 mbimconfig=$(timeout 8 umbim -d "$CTRL_DEV" config 2>/dev/null)
-                local c4 c6 cur_sig
+                local c4 g4 c6 cur_sig
                 c4=$(echo "$mbimconfig" | awk '/ipv4address:/{print $2; exit}')
+                g4=$(echo "$mbimconfig" | awk '/ipv4gateway:/{print $2; exit}')
                 c6=$(echo "$mbimconfig" | awk '/ipv6address:/{print $2; exit}')
                 [ -n "$c4" ] || [ -n "$c6" ] || break
-                cur_sig="${c4}|$(echo "$mbimconfig" | awk '/ipv4gateway:/{print $2; exit}')|${c6}"
+                [ -n "$c4" ] && case "$c4" in */*) ;; *) c4="${c4}/30" ;; esac
+                [ -n "$c6" ] && case "$c6" in */*) ;; *) c6="${c6}/64" ;; esac
+                cur_sig="${c4}|${g4}|${c6}"
                 if [ "$cur_sig" != "$prev_sig" ]; then
                     publish_umbim_config "$mbimconfig" || break
                     prev_sig="$UMBIM_LAST_SIG"
@@ -873,7 +942,7 @@ run_fm350_usb_dial() {
             sleep 5
             continue
         fi
-        gw4=""; [ -n "$v4" ] && gw4="${v4%.*}.1"
+        gw4=""; [ -n "$v4" ] && { gw4="${v4%.*}.1"; [ "$gw4" = "$v4" ] && gw4="${v4%.*}.2"; }
         dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$cid")")
         last_sig="${v4}|${gw4}|${v6}"
         publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
@@ -886,7 +955,7 @@ run_fm350_usb_dial() {
             v4=$(extract_cgpaddr_ipv4 "$cgp")
             v6=$(extract_cgpaddr_ipv6 "$cgp")
             [ -n "$v4" ] || [ -n "$v6" ] || break
-            gw4=""; [ -n "$v4" ] && gw4="${v4%.*}.1"
+            gw4=""; [ -n "$v4" ] && { gw4="${v4%.*}.1"; [ "$gw4" = "$v4" ] && gw4="${v4%.*}.2"; }
             sig="${v4}|${gw4}|${v6}"
             if [ "$sig" != "$last_sig" ]; then
                 dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$cid")")
@@ -907,7 +976,11 @@ run_at_dhcp_monitor() {
     ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
     ip link set dev "$IFNAME" up 2>/dev/null || true
 
-    local check_cid="$MODEM_PDP_IDX" is_auto=0 cgp v4 v6 cur_sig last_sig=""
+    local check_cid="$MODEM_PDP_IDX" is_auto=0 want_v6=0 cgp v4 v6 cur_sig last_sig=""
+    case "$pdptype" in ip|ipv4) want_v6=0 ;; *) want_v6=1 ;; esac
+    if [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1; then
+        rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true
+    fi
     [ "$MODEM_VENDOR" = "simcom" ] && [ "$MODEM_PLATFORM" = "qualcomm" ] && check_cid="6"
     [ "$MODEM_VENDOR" = "neoway" ] && check_cid="1"
     if [ "$MODEM_VENDOR" = "openluat" ] || { [ "$MODEM_VENDOR" = "huawei" ] && [ "$MODEM_PLATFORM" = "unisoc" ]; }; then
@@ -919,6 +992,13 @@ run_at_dhcp_monitor() {
             INTERFACE="$interface" /sbin/udhcpc -f -p "$PID_FILE" -i "$IFNAME" -s /lib/netifd/dhcp.script >/dev/null 2>&1 &
             UDHCPC_PID=$!
             UDHCPC_START=$(awk '{print $22}' "/proc/$UDHCPC_PID/stat" 2>/dev/null)
+        fi
+        if [ "$want_v6" = "1" ] && [ -x /lib/netifd/dhcpv6.script ] && command -v odhcp6c >/dev/null 2>&1; then
+            if [ -z "$ODHCP6C_PID" ] || ! kill -0 "$ODHCP6C_PID" 2>/dev/null; then
+                INTERFACE="$interface" odhcp6c -s /lib/netifd/dhcpv6.script -Ntry "$IFNAME" >/dev/null 2>&1 &
+                ODHCP6C_PID=$!
+                ODHCP6C_START=$(awk '{print $22}' "/proc/$ODHCP6C_PID/stat" 2>/dev/null)
+            fi
         fi
         sleep 15
         [ "$STOP_REQ" = "0" ] || break
@@ -935,16 +1015,20 @@ run_at_dhcp_monitor() {
             logger -t duydoan5g "PDP $check_cid dropped on $IFNAME; re-dialing AT"
             at_dial_activate
             [ -n "$UDHCPC_PID" ] && kill -USR1 "$UDHCPC_PID" 2>/dev/null || true
+            [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1 && { rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true; }
             last_sig=""
         elif [ -n "$last_sig" ] && [ "$cur_sig" != "$last_sig" ]; then
             [ -n "$UDHCPC_PID" ] && kill -USR1 "$UDHCPC_PID" 2>/dev/null || true
+            [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1 && { rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true; }
             last_sig="$cur_sig"
         else
             last_sig="$cur_sig"
         fi
     done
     stop_pid_graceful "$UDHCPC_PID" "$UDHCPC_START"
+    stop_pid_graceful "$ODHCP6C_PID" "$ODHCP6C_START"
     UDHCPC_PID=""; UDHCPC_START=""
+    ODHCP6C_PID=""; ODHCP6C_START=""
 }
 
 rotate_cm_log() {
@@ -1000,7 +1084,9 @@ while [ "$STOP_REQ" = "0" ]; do
         if [ -n "$apn" ]; then
             set -- "$@" -s "$apn"
             if [ -n "$username" ] && [ -n "$password" ]; then
-                set -- "$@" "$username" "$password" "$(at_auth_num)"
+                q_auth=$(at_auth_num)
+                [ "$q_auth" = "0" ] && q_auth="3"
+                set -- "$@" "$username" "$password" "$q_auth"
             fi
         fi
         [ -n "$pincode" ] && set -- "$@" -p "$pincode"
@@ -1017,8 +1103,9 @@ while [ "$STOP_REQ" = "0" ]; do
 
         ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
         ip link set dev "$IFNAME" up 2>/dev/null || true
-        touch /tmp/quectel_dialing
+        touch "$DIALING_FLAG"
         : > "$LOG_FILE"
+        chmod 600 "$LOG_FILE" 2>/dev/null || true
 
         "$local_qcm" "$@" </dev/null >/dev/null 2>&1 &
         CM_PID=$!
@@ -1041,7 +1128,7 @@ while [ "$STOP_REQ" = "0" ]; do
 
             sig="${v4}/${m4}|${gw4}|${v6}/${m6}"
             if { [ -n "$v4" ] || [ -n "$v6" ]; } && [ "$sig" != "$last_sig" ]; then
-                rm -f /tmp/quectel_dialing
+                rm -f "$DIALING_FLAG"
                 publish_netifd_up "$v4" "$m4" "$gw4" "$v6" "$m6" "$gw6" ""
                 logger -t duydoan5g "Connected! IP: $v4, GW: $gw4, IPv6: $v6"
                 last_sig="$sig"
@@ -1053,7 +1140,7 @@ while [ "$STOP_REQ" = "0" ]; do
                 proto_send_update "$interface"
                 is_up=0
                 last_sig=""
-                touch /tmp/quectel_dialing
+                touch "$DIALING_FLAG"
             elif [ "$is_up" = "0" ]; then
                 connecting_sec=$((connecting_sec + 1))
                 if [ "$connecting_sec" -ge 45 ]; then
@@ -1070,7 +1157,7 @@ while [ "$STOP_REQ" = "0" ]; do
 
         wait "$CM_PID" 2>/dev/null || true
         CM_PID=""; CM_START=""
-        rm -f /tmp/quectel_dialing "$PID_FILE"
+        rm -f "$DIALING_FLAG" "$PID_FILE"
         [ "$STOP_REQ" = "0" ] || break
 
         if [ "$is_up" = "1" ]; then

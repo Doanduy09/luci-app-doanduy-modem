@@ -33,7 +33,7 @@ proto_duydoan5g_setup() {
 
 	logger -t duydoan5g "Launching supervised 5G dialer for $interface (APN: $apn, PDP: $pdptype, MTU: $mtu)"
 	proto_run_command "$interface" /usr/bin/duydoan5g_dialer.sh \
-		"$interface" "$apn" "$pdptype" "$mtu" "$metric" "$pincode" "$username" "$password" "$auth" "$delay" "$pdp_index" "$force_apn"
+		"$interface" "$apn" "$pdptype" "$mtu" "$metric" "" "" "" "$auth" "$delay" "$pdp_index" "$force_apn"
 }
 
 proto_duydoan5g_teardown() {
@@ -42,14 +42,12 @@ proto_duydoan5g_teardown() {
 	proto_kill_command "$interface" 15
 	local w=0 pid=""
 	while [ "$w" -lt 6 ]; do
-		pid=$(cat /var/run/duydoan5g.pid 2>/dev/null)
-		[ -z "$pid" ] && ! pidof quectel-CM-M >/dev/null 2>&1 && break
+		pid=$(cat "/var/run/duydoan5g_${interface}.pid" 2>/dev/null)
+		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || break
 		sleep 1
 		w=$((w + 1))
 	done
-	rm -f /var/run/duydoan5g.pid /tmp/quectel_dialing
-	proto_init_update "*" 0
-	proto_send_update "$interface"
+	rm -f "/var/run/duydoan5g_${interface}.pid" "/tmp/quectel_dialing_${interface}" /var/run/duydoan5g.pid /tmp/quectel_dialing
 }
 
 add_protocol duydoan5g
