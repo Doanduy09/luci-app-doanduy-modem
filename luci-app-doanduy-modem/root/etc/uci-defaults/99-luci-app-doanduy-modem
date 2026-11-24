@@ -1,0 +1,50 @@
+#!/bin/sh
+# DOANDUY 5G Master Suite - System Initialization & Auto-Setup
+
+# 1. Cap quyen thuc thi cho toan bo script he thong
+chmod +x /usr/bin/daily_vip_renew.sh 2>/dev/null
+chmod +x /usr/bin/read_pcie_sms.lua 2>/dev/null
+chmod +x /usr/bin/smart_modem_watchdog.sh 2>/dev/null
+chmod +x /usr/bin/wwan_smart_dialer.sh 2>/dev/null
+chmod +x /usr/libexec/rpcd/luci.sms-status 2>/dev/null
+chmod +x /usr/libexec/rpcd/modem_ctrl 2>/dev/null
+chmod +x /www/cgi-bin/sim_manager 2>/dev/null
+chmod +x /lib/netifd/proto/duydoan5g.sh 2>/dev/null
+
+# 2. Khoi tao danh sach SIM VIP mac dinh goc neu chua co
+if [ ! -s /etc/config/allowed_iccids.dat ]; then
+cat << 'EOF' > /etc/config/allowed_iccids.dat
+89840480009484443869
+89840480009578677539
+89840480009579026074
+EOF
+fi
+
+if [ ! -s /etc/config/default_sim_iccid ]; then
+    echo "89840480009484443869" > /etc/config/default_sim_iccid
+fi
+
+if [ ! -s /etc/config/sms_custom_time.dat ]; then
+    echo "01:25:30" > /etc/config/sms_custom_time.dat
+fi
+
+if [ ! -s /etc/config/sms_renew_package.dat ]; then
+    echo "5G150N" > /etc/config/sms_renew_package.dat
+fi
+
+if [ ! -s /etc/config/sms_renew_dest.dat ]; then
+    echo "191" > /etc/config/sms_renew_dest.dat
+fi
+
+# 3. Dang ky cron gia han tu dong moi ngay
+CRON_FILE="/etc/crontabs/root"
+mkdir -p /etc/crontabs
+if ! grep -q "daily_vip_renew.sh" "$CRON_FILE" 2>/dev/null; then
+    echo "25 1 * * * /usr/bin/daily_vip_renew.sh >/dev/null 2>&1" >> "$CRON_FILE"
+    /etc/init.d/cron restart 2>/dev/null
+fi
+
+# 4. Tai lai ubus rpcd de LuCI nhan dien toan bo method moi
+/etc/init.d/rpcd restart 2>/dev/null
+
+exit 0

@@ -93,6 +93,7 @@ for _, msg in ipairs(raw_messages) do
         local key = msg.sender .. "_" .. tostring(msg.ref)
         if not grouped[key] then
             grouped[key] = {
+                storage = msg.storage or "me",
                 sender = msg.sender,
                 timestamp = msg.timestamp,
                 parts = {}
@@ -101,6 +102,7 @@ for _, msg in ipairs(raw_messages) do
         grouped[key].parts[msg.part or 1] = msg.body
     else
         table.insert(final_list, {
+            storage = msg.storage or "me",
             sender = msg.sender,
             timestamp = msg.timestamp,
             body = msg.body
@@ -115,6 +117,7 @@ for key, g in pairs(grouped) do
         if g.parts[i] then table.insert(full_body, g.parts[i]) end
     end
     table.insert(final_list, {
+        storage = g.storage or "me",
         sender = g.sender,
         timestamp = g.timestamp,
         body = table.concat(full_body)
@@ -128,7 +131,8 @@ end)
 
 local formatted = {}
 for i, m in ipairs(final_list) do
-    table.insert(formatted, string.format("[ Tin nhắn #%d từ %s (%s) ]:\n%s", i, m.sender, m.timestamp, m.body))
+    local st_label = (m.storage == "sim") and "[ THẺ SIM (SM) ]" or "[ ROUTER (ME) ]"
+    table.insert(formatted, string.format("%s\nMSG: %d\nFrom: %s\nDate/Time: %s\n%s", st_label, i, m.sender, m.timestamp, m.body))
 end
 
 local out_f = io.open("/tmp/sms_inbox.json", "w")

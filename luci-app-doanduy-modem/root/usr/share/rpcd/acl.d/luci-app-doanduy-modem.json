@@ -1,0 +1,22 @@
+{
+	"luci-app-doanduy-modem": {
+		"description": "Grant access to DOANDUY 5G Modem suite RPCD methods",
+		"read": {
+			"ubus": {
+				"luci.sms-status": [ "*" ],
+				"modem_ctrl": [ "*" ],
+				"network.interface": [ "dump", "status" ],
+				"uci": [ "get", "changes" ]
+			},
+			"uci": [ "network", "system" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.sms-status": [ "*" ],
+				"modem_ctrl": [ "*" ],
+				"uci": [ "set", "commit", "apply" ]
+			},
+			"uci": [ "network", "system" ]
+		}
+	}
+}

@@ -33,7 +33,7 @@ var callSetCard = rpc.declare({ object: 'luci.weather-status', method: 'setCardM
 var callRenameInterface = rpc.declare({ object: 'luci.sms-status', method: 'renameInterface', params: ['new_name'] });
 
 function parseAndRenderSMS(rawText) {
-    if (!rawText || typeof rawText !== 'string' || rawText.indexOf('MSG:') === -1) {
+    if (!rawText || typeof rawText !== 'string' || (!rawText.match(/MSG:\s*[0-9]+/i) && !rawText.match(/Tin nhắn\s*#[0-9]+/i))) {
         return [ E('div', { style: 'padding: 24px; text-align: center; color: #475569; font-size: 14px; background: #f8fafc; border-radius: 10px; border: 1px dashed #cbd5e1;' }, '📭 Hộp thư trống hoặc chưa có tin nhắn mới.') ];
     }
     var lines = rawText.split('\n'), rawMessages = [], curMsg = null, curStorage = 'Router (ME)';
@@ -41,6 +41,22 @@ function parseAndRenderSMS(rawText) {
         var line = lines[i], trimmed = line.trim();
         if (/\[.*(SIM|\(SM\)).*\]/i.test(trimmed)) { curStorage = 'Thẻ SIM (SM)'; continue; }
         else if (/\[.*(ROUTER|MODEM|\(ME\)|\(MT\)).*\]/i.test(trimmed)) { curStorage = 'Router (ME)'; continue; }
+
+        var pcieMatch = trimmed.match(/^\[\s*Tin nhắn\s*#([0-9]+)\s*từ\s*([^(\]]+)\s*\(([^)]*)\)\s*\]/i);
+        if (pcieMatch) {
+            if (curMsg) rawMessages.push(curMsg);
+            curMsg = {
+                id: pcieMatch[1].trim(),
+                storage: curStorage,
+                from: pcieMatch[2].trim(),
+                datetime: pcieMatch[3].trim(),
+                refNum: '',
+                segIndex: 1,
+                segTotal: 1,
+                contentLines: []
+            };
+            continue;
+        }
 
         if (trimmed.match(/^MSG:\s*[0-9]+/i)) {
             if (curMsg) rawMessages.push(curMsg);
@@ -86,9 +102,16 @@ function parseAndRenderSMS(rawText) {
                 var dParts = dtParts[0].split(/[\/\-]/);
                 var tParts = dtParts[1].split(':');
                 if (dParts.length === 3 && tParts.length >= 2) {
-                    var yr = parseInt(dParts[2]) > 50 ? 1900 + parseInt(dParts[2]) : 2000 + parseInt(dParts[2]);
-                    var mo = parseInt(dParts[0]) - 1;
-                    var da = parseInt(dParts[1]);
+                    var yr, mo, da;
+                    if (parseInt(dParts[0]) > 1000) {
+                        yr = parseInt(dParts[0]);
+                        mo = parseInt(dParts[1]) - 1;
+                        da = parseInt(dParts[2]);
+                    } else {
+                        yr = parseInt(dParts[2]) > 50 ? 1900 + parseInt(dParts[2]) : 2000 + parseInt(dParts[2]);
+                        mo = parseInt(dParts[0]) - 1;
+                        da = parseInt(dParts[1]);
+                    }
                     var hr = parseInt(tParts[0]);
                     var mi = parseInt(tParts[1]);
                     var sc = parseInt(tParts[2] || 0);

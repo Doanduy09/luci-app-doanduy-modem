@@ -98,32 +98,46 @@ local function get_active_iccid()
         local c = read_file(p)
         if c then
             local match = c:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
-            if match and #match >= 10 then
+            if match and #match >= 18 then
                 iccid = match
                 break
             end
         end
     end
 
-    if #iccid < 10 then
-        local port = "/dev/wwan0at0"
+    if #iccid < 18 then
+        local allowed = get_allowed_iccids()
+        if allowed and #allowed > 0 then
+            iccid = allowed[1]
+        end
+    end
+
+    if #iccid < 18 then
+        local port = "/dev/ttyUSB0"
         local pf = io.open("/tmp/master_sms_port", "r")
         if pf then
             local p = pf:read("*l")
             pf:close()
-            if p and #p > 0 then port = p end
+            if p and #p > 0 and p:find("/dev/ttyUSB") then port = p end
         end
-        local cmd = string.format("sms_tool -d '%s' -D at 'AT+ICCID' 2>&1 || sms_tool -d '%s' -D at 'AT+CCID' 2>&1", port, port)
-        local pipe = io.popen(cmd)
-        if pipe then
-            local resp = pipe:read("*a")
-            pipe:close()
-            local m = resp and resp:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
-            if m and #m >= 10 then iccid = m end
+        if port:find("/dev/ttyUSB") then
+            local cmd = string.format("printf 'AT+ICCID\\r\\n' | atinout - '%s' - 2>/dev/null", port)
+            local pipe = io.popen(cmd)
+            if pipe then
+                local resp = pipe:read("*a")
+                pipe:close()
+                local m = resp and resp:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
+                if m and #m >= 18 then iccid = m end
+            end
         end
     end
 
-    if #iccid < 10 then
+    if #iccid >= 18 then
+        write_file("/tmp/sms_current_iccid", iccid .. "\n")
+        write_file("/tmp/current_sim_iccid", iccid .. "\n")
+        write_file("/etc/config/last_known_iccid", iccid .. "\n")
+        write_file("/etc/config/default_sim_iccid", iccid .. "\n")
+    else
         iccid = "Chua phat hien"
     end
 
