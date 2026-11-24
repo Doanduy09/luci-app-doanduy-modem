@@ -78,12 +78,15 @@ if [ -f /etc/config/firewall ]; then
         [ "$(uci -q get firewall.@zone[$zi].name)" = "wan" ] && { wan_zone="@zone[$zi]"; break; }
     done
     [ -n "$wan_zone" ] || wan_zone="@zone[1]"
-    for old_if in wwan0 wwan0_4 wwan0_6 duydoan_5g; do
+    for old_if in wwan0 wwan0_4 wwan0_6 duydoan_5g duydoan_5g_6; do
         uci del_list "firewall.${wan_zone}.network=$old_if" 2>/dev/null
     done
     uci add_list "firewall.${wan_zone}.network=duydoan_5g"
+    uci add_list "firewall.${wan_zone}.network=duydoan_5g_6"
     uci commit firewall
 fi
+
+rm -f /etc/hotplug.d/net/25-wwan-autodial 2>/dev/null
 
 # Dong bo hotplug WWAN de bat dung interface duydoan_5g cho moi card PCIe/USB
 mkdir -p /etc/hotplug.d/net

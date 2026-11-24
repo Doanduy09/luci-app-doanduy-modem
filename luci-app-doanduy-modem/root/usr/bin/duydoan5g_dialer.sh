@@ -37,8 +37,18 @@ case "$user_pdp_index" in ''|*[!0-9]*) user_pdp_index="" ;; esac
 [ "$force_apn" = "1" ] || force_apn=0
 
 mkdir -p /var/lock /var/run /tmp/quectel_cm
+acquire_fd_lock() {
+    local fd="$1" secs="${2:-10}" w=0
+    command -v flock >/dev/null 2>&1 || return 0
+    while [ "$w" -lt "$secs" ]; do
+        flock -x -n "$fd" 2>/dev/null && return 0
+        sleep 1
+        w=$((w + 1))
+    done
+    return 1
+}
 exec 8>"/var/lock/duydoan5g_${interface}.lock"
-flock -x -w 10 8 || exit 1
+acquire_fd_lock 8 10 || exit 1
 
 if [ "$interface" = "duydoan_5g" ]; then
     LOG_FILE="/tmp/quectel_cm/quectel-cm.log"
@@ -124,6 +134,10 @@ wake_hardware() {
     for f in /sys/bus/usb/devices/*/bConfigurationValue; do
         [ -f "$f" ] && [ -z "$(cat "$f" 2>/dev/null)" ] && echo 1 > "$f" 2>/dev/null || true
     done
+}
+
+detach_bridge_master() {
+    [ -L "/sys/class/net/$IFNAME/master" ] && ip link set dev "$IFNAME" nomaster 2>/dev/null || true
 }
 
 netdev_driver() {
@@ -327,9 +341,12 @@ safe_at_once() {
             ;;
         *)
             (
-                /usr/bin/flock -x -w 4 9 2>/dev/null || true
+                acquire_fd_lock 9 4 || true
+                if command -v stty >/dev/null 2>&1; then
+                    stty -F "$port" 115200 raw -echo -echoe -echok -echoctl -echoke -icrnl -onlcr 2>/dev/null || true
+                fi
                 if command -v atinout >/dev/null 2>&1; then
-                    printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null && exit 0
+                    printf '%s\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null && exit 0
                 fi
                 if command -v tom_modem >/dev/null 2>&1; then
                     timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null && exit 0
@@ -416,19 +433,22 @@ read_usb_ids_for_netdev() {
 
 find_working_at_port() {
     AT_PORT=""; ATI_INFO=""
-    local p out cgmm
-    for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyUSB3 /dev/ttyUSB4 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0; do
+    read_usb_ids_for_netdev || true
+    local p out cgmm ports
+    ports="/dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB4 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0"
+    for p in $ports; do
         [ -c "$p" ] || continue
-        out=$(safe_at_once "$p" "ATI")
-        if echo "$out" | grep -qE 'OK|Sierra|Quectel|Fibocom|FIBOCOM|FM350|Huawei|HUAWEI|Simcom|SIMCOM|Meig|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Air724|OpenLuat'; then
+        out=$(safe_at_once "$p" "ATI" | head -c 512)
+        if echo "$out" | grep -qE '(^|[[:space:]])OK([[:space:]]|$)|Sierra|Quectel|Fibocom|FIBOCOM|FM350|Huawei|HUAWEI|Simcom|SIMCOM|Meig|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Air724|OpenLuat'; then
             AT_PORT="$p"; ATI_INFO="$out"
             case "$ATI_INFO" in
                 *Sierra*|*Quectel*|*Fibocom*|*FIBOCOM*|*FM350*|*Huawei*|*HUAWEI*|*Simcom*|*SIMCOM*|*Meig*|*MeiG*|*Neoway*|*Gosuncn*|*Telit*|*Thales*|*Air724*) ;;
                 *)
-                    cgmm=$(safe_at_once "$p" "AT+CGMM")
+                    cgmm=$(safe_at_once "$p" "AT+CGMM" | head -c 256)
                     [ -n "$cgmm" ] && ATI_INFO="${ATI_INFO} ${cgmm}"
                     ;;
             esac
+            echo "$AT_PORT" > /tmp/master_sms_port 2>/dev/null || true
             return 0
         fi
     done
@@ -446,7 +466,7 @@ detect_modem_profile() {
         *mtk_t7xx*|0e8d:*|*FM350*|*T700*)
             MODEM_VENDOR="fibocom"
             MODEM_PLATFORM="mediatek"
-            MODEM_PDP_IDX="0"
+            [ "$NET_DRV" = "mtk_t7xx" ] && MODEM_PDP_IDX="0" || MODEM_PDP_IDX="1"
             ;;
         2c7c:*|*Quectel*)
             MODEM_VENDOR="quectel"
@@ -461,7 +481,7 @@ detect_modem_profile() {
             case "$ATI_INFO" in
                 *FM350*|*T700*|*MTK*)
                     MODEM_PLATFORM="mediatek"
-                    MODEM_PDP_IDX="0"
+                    [ "$NET_DRV" = "mtk_t7xx" ] && MODEM_PDP_IDX="0" || MODEM_PDP_IDX="1"
                     ;;
                 *FG650*|*FM650*|*NL668*|*L610*|*Unisoc*) MODEM_PLATFORM="unisoc" ;;
                 *) MODEM_PLATFORM="qualcomm" ;;
@@ -537,10 +557,32 @@ detect_modem_profile() {
     fi
 }
 
+sync_sim_status() {
+    [ -c "$AT_PORT" ] || return 0
+    local iccid="" cmd out
+    for cmd in "AT+ICCID" "AT+QCCID" "AT+CCID"; do
+        out=$(safe_at_once "$AT_PORT" "$cmd" | head -c 256)
+        iccid=$(echo "$out" | grep -oE '[0-9]{18,22}' | head -n 1)
+        [ -n "$iccid" ] && break
+    done
+    [ -n "$iccid" ] || return 0
+    echo "$iccid" > /tmp/sms_current_iccid 2>/dev/null || true
+    if [ -x /usr/bin/sms_security_guardian ]; then
+        /usr/bin/sms_security_guardian check >/dev/null 2>&1 || true
+    elif [ -f /etc/config/allowed_iccids.dat ]; then
+        if grep -qx "$iccid" /etc/config/allowed_iccids.dat 2>/dev/null; then
+            echo "VALID" > /tmp/master_sim_status 2>/dev/null || true
+        else
+            echo "LOCKED" > /tmp/master_sim_status 2>/dev/null || true
+        fi
+    fi
+}
+
 pre_dial_prepare() {
     stop_competing_dialers
     find_working_at_port || { detect_modem_profile; return 0; }
     detect_modem_profile
+    sync_sim_status
     local cfun_res cpin_res
     cfun_res=$(safe_at_once "$AT_PORT" "AT+CFUN?")
     if echo "$cfun_res" | grep -qE '\+CFUN:[[:space:]]*[04]'; then
@@ -578,7 +620,9 @@ at_dial_activate() {
     auth_num=$(at_auth_num)
 
     if [ "$MODEM_VENDOR" != "openluat" ]; then
-        safe_at_once "$AT_PORT" "AT+COPS=0,0" >/dev/null
+        if ! safe_at_once "$AT_PORT" "AT+COPS?" | grep -qE '\+COPS:[[:space:]]*[0-9]+,[0-9]+,"[^"]+"'; then
+            safe_at_once "$AT_PORT" "AT+COPS=0" >/dev/null
+        fi
     fi
 
     case "$MODEM_VENDOR" in
@@ -604,6 +648,9 @@ at_dial_activate() {
             cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
             if [ "$MODEM_PLATFORM" = "mediatek" ]; then
                 act_cmd="AT+CGACT=1,$cid"
+                if [ -n "$username$password" ] && [ "$auth_num" != "0" ]; then
+                    auth_cmd="AT+CGAUTH=$cid,$auth_num,\"$username\",\"$password\""
+                fi
             else
                 act_cmd="AT+GTRNDIS=1,$cid"
                 if [ -n "$username$password" ] && [ "$auth_num" != "0" ]; then
@@ -879,6 +926,7 @@ run_mtk_pcie_dial() {
     fi
     logger -t duydoan5g "Starting MTK PCIe MBIM dialer on $IFNAME (Ctrl: $CTRL_DEV, APN: $apn)"
     while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
+        detach_bridge_master
         ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
         ip link set dev "$IFNAME" up 2>/dev/null || true
         local rf_state mbimconfig prev_sig="" ok_cfg=0
@@ -922,19 +970,43 @@ run_mtk_pcie_dial() {
     done
 }
 
+ensure_dynamic_dhcpv6() {
+    case "$pdptype" in ip|ipv4) return 0 ;; esac
+    local v6_iface="${interface}_6"
+    ubus list 2>/dev/null | grep -qx "network.interface.${v6_iface}" && return 0
+    json_init
+    json_add_string name "$v6_iface"
+    json_add_string ifname "@${interface}"
+    json_add_string proto "dhcpv6"
+    json_add_string extendprefix "1"
+    json_add_string zone "wan"
+    json_add_int metric "$metric"
+    json_close_object
+    ubus call network add_dynamic "$(json_dump)" >/dev/null 2>&1 || true
+}
+
 run_fm350_usb_dial() {
-    local cid="$MODEM_PDP_IDX" cgp v4 v6 gw4 dns4 sig last_sig=""
+    local cid="$MODEM_PDP_IDX" active_cid="$MODEM_PDP_IDX" cgp v4 v6 gw4 dns4 sig last_sig=""
     logger -t duydoan5g "Starting FM350 USB static IP dialer on $IFNAME (pdp=$cid, APN=$apn)"
     while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
         at_dial_activate
+        detach_bridge_master
+        ip link set dev "$IFNAME" arp off 2>/dev/null || true
         ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
         ip link set dev "$IFNAME" up 2>/dev/null || true
-        v4=""; v6=""
+        v4=""; v6=""; active_cid="$cid"
         local t=0
         while [ "$t" -lt 4 ] && [ "$STOP_REQ" = "0" ]; do
             cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$cid")
             v4=$(extract_cgpaddr_ipv4 "$cgp")
             v6=$(extract_cgpaddr_ipv6 "$cgp")
+            active_cid="$cid"
+            if [ -z "$v4" ] && [ -z "$v6" ] && [ "$cid" != "0" ]; then
+                cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=0")
+                v4=$(extract_cgpaddr_ipv4 "$cgp")
+                v6=$(extract_cgpaddr_ipv6 "$cgp")
+                [ -n "$v4" ] || [ -n "$v6" ] && active_cid="0"
+            fi
             [ -n "$v4" ] || [ -n "$v6" ] && break
             t=$((t + 1)); sleep 2
         done
@@ -943,23 +1015,38 @@ run_fm350_usb_dial() {
             continue
         fi
         gw4=""; [ -n "$v4" ] && { gw4="${v4%.*}.1"; [ "$gw4" = "$v4" ] && gw4="${v4%.*}.2"; }
-        dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$cid")")
+        dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")")
+        if [ -z "$dns4" ]; then
+            sleep 1
+            dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")")
+        fi
         last_sig="${v4}|${gw4}|${v6}"
         publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
-        logger -t duydoan5g "FM350 USB connected! IP: $v4, GW: $gw4, IPv6: $v6"
+        [ -z "$v6" ] && ensure_dynamic_dhcpv6
+        logger -t duydoan5g "FM350 USB connected! IP: $v4, GW: $gw4, DNS: ${dns4:-fallback}, IPv6: ${v6:-dhcpv6}"
 
+        local miss=0
         while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
             sleep 15
             [ "$STOP_REQ" = "0" ] || break
-            cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$cid")
+            detach_bridge_master
+            ip link set dev "$IFNAME" arp off 2>/dev/null || true
+            clamp_mtu
+            cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$active_cid")
             v4=$(extract_cgpaddr_ipv4 "$cgp")
             v6=$(extract_cgpaddr_ipv6 "$cgp")
-            [ -n "$v4" ] || [ -n "$v6" ] || break
+            if [ -z "$v4" ] && [ -z "$v6" ]; then
+                miss=$((miss + 1))
+                [ "$miss" -ge 3 ] && break
+                continue
+            fi
+            miss=0
             gw4=""; [ -n "$v4" ] && { gw4="${v4%.*}.1"; [ "$gw4" = "$v4" ] && gw4="${v4%.*}.2"; }
             sig="${v4}|${gw4}|${v6}"
             if [ "$sig" != "$last_sig" ]; then
-                dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$cid")")
+                dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")")
                 publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
+                [ -z "$v6" ] && ensure_dynamic_dhcpv6
                 last_sig="$sig"
             fi
         done
@@ -973,10 +1060,11 @@ run_fm350_usb_dial() {
 
 run_at_dhcp_monitor() {
     at_dial_activate
+    detach_bridge_master
     ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
     ip link set dev "$IFNAME" up 2>/dev/null || true
 
-    local check_cid="$MODEM_PDP_IDX" is_auto=0 want_v6=0 cgp v4 v6 cur_sig last_sig=""
+    local check_cid="$MODEM_PDP_IDX" is_auto=0 want_v6=0 pdp_miss=0 cgp v4 v6 cur_sig last_sig=""
     case "$pdptype" in ip|ipv4) want_v6=0 ;; *) want_v6=1 ;; esac
     if [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1; then
         rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true
@@ -1002,6 +1090,7 @@ run_at_dhcp_monitor() {
         fi
         sleep 15
         [ "$STOP_REQ" = "0" ] || break
+        detach_bridge_master
         clamp_mtu
         [ "$is_auto" = "1" ] && continue
         [ -c "$AT_PORT" ] || continue
@@ -1012,16 +1101,21 @@ run_at_dhcp_monitor() {
         v6=$(extract_cgpaddr_ipv6 "$cgp")
         cur_sig="${v4}|${v6}"
         if [ -z "$v4" ] && [ -z "$v6" ]; then
+            pdp_miss=$((pdp_miss + 1))
+            [ "$pdp_miss" -lt 3 ] && continue
+            pdp_miss=0
             logger -t duydoan5g "PDP $check_cid dropped on $IFNAME; re-dialing AT"
             at_dial_activate
             [ -n "$UDHCPC_PID" ] && kill -USR1 "$UDHCPC_PID" 2>/dev/null || true
             [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1 && { rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true; }
             last_sig=""
         elif [ -n "$last_sig" ] && [ "$cur_sig" != "$last_sig" ]; then
+            pdp_miss=0
             [ -n "$UDHCPC_PID" ] && kill -USR1 "$UDHCPC_PID" 2>/dev/null || true
             [ "$want_v6" = "1" ] && command -v rdisc6 >/dev/null 2>&1 && { rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true; }
             last_sig="$cur_sig"
         else
+            pdp_miss=0
             last_sig="$cur_sig"
         fi
     done
@@ -1101,6 +1195,7 @@ while [ "$STOP_REQ" = "0" ]; do
         esac
         set -- "$@" -f "$LOG_FILE"
 
+        detach_bridge_master
         ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
         ip link set dev "$IFNAME" up 2>/dev/null || true
         touch "$DIALING_FLAG"
