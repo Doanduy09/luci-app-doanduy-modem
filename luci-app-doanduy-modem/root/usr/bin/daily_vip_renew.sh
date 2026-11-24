@@ -34,9 +34,9 @@ port=$(cat /tmp/master_sms_port 2>/dev/null)
 [ -z "$port" ] || [ ! -c "$port" ] && port="/dev/ttyUSB0"
 [ ! -c "$port" ] && [ -c "/dev/ttyUSB2" ] && port="/dev/ttyUSB2"
 
-# 1. Xac dinh SIM hien tai (Tu file tam, cau hinh mac dinh hoac modem PCIe)
+# 1. Xac dinh SIM hien tai (Tu file tam, quectel-cm log hoac modem thuc te; TUYET DOI KHONG gia mao VIP)
 cur_iccid=""
-for p in /tmp/sms_current_iccid /tmp/current_sim_iccid /etc/config/last_known_iccid /etc/config/default_sim_iccid; do
+for p in /tmp/sms_current_iccid /tmp/current_sim_iccid; do
     if [ -f "$p" ]; then
         match=$(grep -oE '[0-9]{18,22}' "$p" | head -1)
         if [ -n "$match" ]; then
@@ -46,23 +46,40 @@ for p in /tmp/sms_current_iccid /tmp/current_sim_iccid /etc/config/last_known_ic
     fi
 done
 
-if [ -z "$cur_iccid" ] && [ -f "/etc/config/allowed_iccids.dat" ]; then
-    cur_iccid=$(grep -oE '[0-9]{18,22}' /etc/config/allowed_iccids.dat | head -1)
+if [ -z "$cur_iccid" ] && [ -s /tmp/quectel_cm/quectel-cm.log ]; then
+    cur_iccid=$(grep -oE 'SimIccId:[[:space:]]*[0-9]{18,22}' /tmp/quectel_cm/quectel-cm.log 2>/dev/null | tail -n 1 | grep -oE '[0-9]{18,22}')
 fi
 
-if [ -z "$cur_iccid" ] && [ -c "$port" ] && command -v atinout >/dev/null 2>&1; then
-    cur_iccid=$(printf 'AT+ICCID\r\n' | atinout - "$port" - 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
+if [ -z "$cur_iccid" ] && { [ -c "/dev/wwan0at0" ] || [ -c "/dev/mhi_DUN" ]; } && [ -x /usr/bin/read_pcie_sms.lua ]; then
+    cur_iccid=$(/usr/bin/read_pcie_sms.lua --at 'AT+ICCID' 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
+    [ -z "$cur_iccid" ] && cur_iccid=$(/usr/bin/read_pcie_sms.lua --at 'AT+QCCID' 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
 fi
 
-if [ -z "$cur_iccid" ]; then
-    cur_iccid="89840480009484443869"
+if [ -z "$cur_iccid" ] && [ -c "$port" ]; then
+    case "$port" in /dev/tty*)
+        if command -v sms_tool >/dev/null 2>&1; then
+            cur_iccid=$(modem_lock_run sms_tool -d "$port" -D at 'AT+QCCID' 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
+            [ -z "$cur_iccid" ] && cur_iccid=$(modem_lock_run sms_tool -d "$port" -D at 'AT+ICCID' 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
+        fi
+        if [ -z "$cur_iccid" ] && command -v atinout >/dev/null 2>&1; then
+            cur_iccid=$(printf 'AT+ICCID\r\n' | modem_lock_run atinout - "$port" - 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
+        fi
+    ;; esac
 fi
 
-echo "$cur_iccid" > /tmp/sms_current_iccid
-echo "$cur_iccid" > /tmp/current_sim_iccid
+if [ -z "$cur_iccid" ] && [ -f /etc/config/last_known_iccid ]; then
+    cur_iccid=$(grep -oE '[0-9]{18,22}' /etc/config/last_known_iccid 2>/dev/null | head -1)
+fi
 
-# 2. Kiem tra Whitelist: CHI DUY NHAT 3 SIM VIP MAC DINH MOI DUOC PHEP GIA HAN GOI CUOC
-STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074"
+if [ -n "$cur_iccid" ]; then
+    echo "$cur_iccid" > /tmp/sms_current_iccid
+    echo "$cur_iccid" > /tmp/current_sim_iccid
+else
+    rm -f /tmp/sms_current_iccid /tmp/current_sim_iccid 2>/dev/null
+fi
+
+# 2. Kiem tra Whitelist: CHI CAC SIM VIP MAC DINH MOI DUOC PHEP GIA HAN GOI CUOC
+STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074 89840480009647493181"
 ALLOWED_ICCIDS=$(cat /etc/config/allowed_iccids.dat 2>/dev/null | tr '\r\n' ' ')
 [ -z "$ALLOWED_ICCIDS" ] && ALLOWED_ICCIDS="$STRICT_DEFAULT_ICCIDS"
 
@@ -177,6 +194,14 @@ run_send_sms() {
         killall -CONT quectel-CM-M quectel-CM 2>/dev/null
         return 0
     fi
+    case "$port" in
+        /dev/wwan*|/dev/mhi*)
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                /usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" >/dev/null 2>&1
+                return $?
+            fi
+            ;;
+    esac
     if command -v modem_lock_run >/dev/null 2>&1; then
         modem_lock_run sms_tool -d "$port" send "$dest" "$text" >/dev/null 2>&1
     else

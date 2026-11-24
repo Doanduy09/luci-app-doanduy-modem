@@ -36,6 +36,15 @@ safe_at() {
     local timeout="${3:-3}"
     [ -c "$port" ] || return 1
 
+    case "$port" in
+        /dev/wwan*|/dev/mhi*)
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                timeout 5 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null
+                return $?
+            fi
+            ;;
+    esac
+
     (
         timeout 4 flock -x 200 || exit 1
         if command -v sms_tool >/dev/null 2>&1; then

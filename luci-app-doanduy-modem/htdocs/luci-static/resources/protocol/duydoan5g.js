@@ -4,6 +4,7 @@
 'require network';
 
 network.registerPatternVirtual(/^duydoan5g-.+$/);
+network.registerErrorCode('NO_DEVICE', _('Không tìm thấy thiết bị modem 5G/LTE'));
 network.registerErrorCode('NO_IP', _('Không nhận được địa chỉ IP từ mạng di động'));
 network.registerErrorCode('CALL_FAILED', _('Quay số mạng di động thất bại'));
 
@@ -50,6 +51,19 @@ return network.registerProtocol('duydoan5g', {
 
 		o = s.taboption('general', form.Value, 'pincode', _('Mã PIN SIM'));
 		o.password = true;
+		o.rmempty = true;
+
+		o = s.taboption('advanced', form.ListValue, 'pdptype', _('Giao thức PDP'));
+		o.value('ipv4v6', _('IPv4/IPv6 Dual-Stack'));
+		o.value('ip', _('IPv4 Only'));
+		o.value('ipv6', _('IPv6 Only'));
+		o.default = 'ipv4v6';
+		o.rmempty = true;
+
+		o = s.taboption('advanced', form.Value, 'mtu', _('MTU'));
+		o.datatype = 'range(1280,1500)';
+		o.placeholder = '1460';
+		o.default = '1460';
 		o.rmempty = true;
 
 		o = s.taboption('advanced', form.Value, 'metric', _('Độ ưu tiên Gateway (Metric)'));

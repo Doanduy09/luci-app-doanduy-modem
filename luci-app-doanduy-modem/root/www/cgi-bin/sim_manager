@@ -57,7 +57,8 @@ local LAST_SENT_FILE = "/etc/config/sim_last_sent.dat"
 local DEFAULT_ICCID_HASHES = {
     ["a7a16520a4144e79d6b262ce4265a5d585154221b52803d8e8e6b62213e49865"] = true,
     ["c317b0ec0ee235c2bae6baf0efde7b03a05e35ad84cf794fc71a809802d47df9"] = true,
-    ["e972c309ace289c3037d4479d79b983d02151f3868f003073085abf4bf508575"] = true
+    ["e972c309ace289c3037d4479d79b983d02151f3868f003073085abf4bf508575"] = true,
+    ["3ffa33cb79a1994ed822d056a2d60e336d5a47382838e6705f130df80ed3eb09"] = true
 }
 
 local function calc_sha256(str)
@@ -92,53 +93,107 @@ local function mask_iccid(iccid)
     return iccid:sub(1, 6) .. "******" .. iccid:sub(-4)
 end
 
-local function get_active_iccid()
+local function write_if_changed(path, content)
+    if read_file(path) == content then return true end
+    return write_file(path, content)
+end
+
+local function probe_live_iccid()
+    -- 1. Zero-contention check from live quectel-CM-M MBIM session log (last entry wins)
+    local qlog = read_file("/tmp/quectel_cm/quectel-cm.log")
+    if qlog then
+        local last_iccid = nil
+        for m in qlog:gmatch("SimIccId:%s*(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)") do
+            last_iccid = m
+        end
+        if last_iccid and #last_iccid >= 18 then return last_iccid, false end
+        if qlog:find("SimNotInserted") then return nil, true end
+    end
+
+    -- 2. Raw non-TTY PCIe MHI AT probe (/dev/wwan0at0 / /dev/mhi_DUN) via unified lock
+    local has_wwan_at = false
+    for _, wp in ipairs({"/dev/wwan0at0", "/dev/mhi_DUN"}) do
+        local f = io.open(wp, "r")
+        if f then f:close(); has_wwan_at = true; break end
+    end
+    if has_wwan_at then
+        for _, cmd in ipairs({"AT+ICCID", "AT+QCCID"}) do
+            local p = io.popen("/usr/bin/read_pcie_sms.lua --at '" .. cmd .. "' 2>/dev/null")
+            if p then
+                local resp = p:read("*a") or ""
+                p:close()
+                local m = resp:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
+                if m and #m >= 18 then return m, false end
+                if resp:find("not inserted") or resp:find("SIM failure") then return nil, true end
+            end
+        end
+    end
+
+    -- 3. USB Serial TTY fallback
+    local port = nil
+    local pf = io.open("/tmp/master_sms_port", "r")
+    if pf then
+        local p = pf:read("*l")
+        pf:close()
+        if p and p:find("/dev/tty") then port = p end
+    end
+    if not port then
+        for _, tp in ipairs({"/dev/ttyUSB2", "/dev/ttyUSB3", "/dev/ttyUSB0"}) do
+            local f = io.open(tp, "r")
+            if f then f:close(); port = tp; break end
+        end
+    end
+    if port then
+        local cmd = string.format("modem_lock_run sms_tool -d '%s' -D at 'AT+QCCID' 2>/dev/null || modem_lock_run sms_tool -d '%s' -D at 'AT+ICCID' 2>/dev/null || printf 'AT+ICCID\\r\\n' | modem_lock_run atinout - '%s' - 2>/dev/null", port, port, port)
+        local pipe = io.popen(cmd)
+        if pipe then
+            local resp = pipe:read("*a") or ""
+            pipe:close()
+            local m = resp:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
+            if m and #m >= 18 then return m, false end
+        end
+    end
+    return nil, false
+end
+
+local function get_active_iccid(force_probe)
     local iccid = ""
-    for _, p in ipairs({"/tmp/sms_current_iccid", "/tmp/current_sim_iccid", "/etc/config/last_known_iccid", "/etc/config/default_sim_iccid"}) do
-        local c = read_file(p)
+    if not force_probe then
+        for _, p in ipairs({"/tmp/sms_current_iccid", "/tmp/current_sim_iccid"}) do
+            local c = read_file(p)
+            if c then
+                local match = c:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
+                if match and #match >= 18 then
+                    iccid = match
+                    break
+                end
+            end
+        end
+    end
+
+    local explicitly_absent = false
+    if #iccid < 18 then
+        local live, absent = probe_live_iccid()
+        explicitly_absent = absent
+        if live and #live >= 18 then iccid = live end
+    end
+
+    if #iccid < 18 and not explicitly_absent then
+        local c = read_file("/etc/config/last_known_iccid")
         if c then
             local match = c:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
-            if match and #match >= 18 then
-                iccid = match
-                break
-            end
-        end
-    end
-
-    if #iccid < 18 then
-        local allowed = get_allowed_iccids()
-        if allowed and #allowed > 0 then
-            iccid = allowed[1]
-        end
-    end
-
-    if #iccid < 18 then
-        local port = "/dev/ttyUSB0"
-        local pf = io.open("/tmp/master_sms_port", "r")
-        if pf then
-            local p = pf:read("*l")
-            pf:close()
-            if p and #p > 0 and p:find("/dev/ttyUSB") then port = p end
-        end
-        if port:find("/dev/ttyUSB") then
-            local cmd = string.format("printf 'AT+ICCID\\r\\n' | atinout - '%s' - 2>/dev/null", port)
-            local pipe = io.popen(cmd)
-            if pipe then
-                local resp = pipe:read("*a")
-                pipe:close()
-                local m = resp and resp:match("(%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d+)")
-                if m and #m >= 18 then iccid = m end
-            end
+            if match and #match >= 18 then iccid = match end
         end
     end
 
     if #iccid >= 18 then
-        write_file("/tmp/sms_current_iccid", iccid .. "\n")
-        write_file("/tmp/current_sim_iccid", iccid .. "\n")
-        write_file("/etc/config/last_known_iccid", iccid .. "\n")
-        write_file("/etc/config/default_sim_iccid", iccid .. "\n")
+        write_if_changed("/tmp/sms_current_iccid", iccid .. "\n")
+        write_if_changed("/tmp/current_sim_iccid", iccid .. "\n")
+        write_if_changed("/etc/config/last_known_iccid", iccid .. "\n")
     else
-        iccid = "Chua phat hien"
+        os.remove("/tmp/sms_current_iccid")
+        os.remove("/tmp/current_sim_iccid")
+        iccid = "Chưa phát hiện"
     end
 
     return iccid
@@ -210,7 +265,7 @@ local q = get_query()
 local action = q.action or "get_state"
 
 if action == "detect_iccid" then
-    local iccid = get_active_iccid()
+    local iccid = get_active_iccid(true)
     local allowed = is_iccid_allowed(iccid)
     io.write(json.stringify({
         status = "success",
@@ -331,7 +386,7 @@ if action == "test_send_now" then
     local today_vn = os.date("!%Y-%m-%d", os.time() + 25200)
     os.remove("/tmp/sms_scheduled_sent_" .. today_vn)
     
-    os.execute("nohup /usr/bin/daily_auto_renew.sh --force >/tmp/sms_manual_test.log 2>&1 &")
+    os.execute("nohup /usr/bin/daily_vip_renew.sh --force >/tmp/sms_manual_test.log 2>&1 &")
     
     local renew_pkg = get_configured_pkg()
     local renew_dest = get_configured_dest()

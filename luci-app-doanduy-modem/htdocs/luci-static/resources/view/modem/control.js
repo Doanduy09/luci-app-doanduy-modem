@@ -256,7 +256,7 @@ return view.extend({
             ? portsData.current_port
             : ((smsRes && smsRes.port && smsRes.port.indexOf('/dev/') !== -1)
                 ? smsRes.port
-                : '/dev/ttyUSB3');
+                : '/dev/wwan0at0');
         var currentTab = 'sms';
 
         var tabButtons = [
@@ -315,7 +315,8 @@ return view.extend({
    QUY CHUẨN ĐIỀU KIỆN SIM HỢP LỆ TRÊN CONTROL.JS:
    NẾU KHÔNG CÓ SIM HOẶC SIM NGOÀI DANH MỤC -> isWhitelisted = false -> ẨN 100% CẤU HÌNH TỰ ĐỘNG!
    ============================================================================== */
-        var isWhitelisted = !!((simMgrData.is_whitelisted && simMgrData.active_iccid && simMgrData.active_iccid !== 'Chưa phát hiện' && simMgrData.active_iccid.trim() !== '') || (smsRes && smsRes.is_authenticated === 1));
+        var hasValidIccid = !!(simMgrData.active_iccid && simMgrData.active_iccid !== 'Chưa phát hiện' && simMgrData.active_iccid !== 'Chua phat hien' && simMgrData.active_iccid.trim() !== '');
+        var isWhitelisted = !!((simMgrData.is_whitelisted && hasValidIccid) || (smsRes && smsRes.is_authenticated === 1));
 
         var iccidTextSpan = E('span', {
             id: 'modem-active-iccid-span',
@@ -644,7 +645,7 @@ return view.extend({
         var simTabStatusCard = E('div', { style: 'background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;' }, [
                 E('div', {}, [
                     E('span', { style: 'font-weight: 700; color: #475569; font-size: 13px;' }, '📱 Trạng thái SIM: '),
-                    E('span', { style: 'font-weight: 800; color: ' + (isWhitelisted ? '#15803d' : '#475569') + '; font-size: 14px;' }, isWhitelisted ? (smsRes.sim_info || 'SIM Viettel (Hoạt động)') : (simMgrData.active_iccid ? 'SIM Ngoài Danh Sách' : 'Chưa gắn SIM / Chưa phát hiện')),
+                    E('span', { style: 'font-weight: 800; color: ' + (isWhitelisted ? '#15803d' : '#475569') + '; font-size: 14px;' }, isWhitelisted ? (smsRes.sim_info || 'SIM Viettel (Hoạt động)') : (hasValidIccid ? 'SIM Ngoài Danh Sách' : 'Chưa gắn SIM / Chưa phát hiện')),
                     E('span', { style: 'margin-left: 10px; font-weight: 600; color: #64748b; font-size: 12px;' }, '• Cổng AT: ' + activePort)
                 ]),
                 E('div', { style: 'display: flex; gap: 8px;' }, [

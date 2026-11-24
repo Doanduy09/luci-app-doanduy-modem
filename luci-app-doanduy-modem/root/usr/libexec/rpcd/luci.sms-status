@@ -86,7 +86,15 @@ get_active_modem_port() {
 
     for p in $found_ports; do
         if [ -c "$p" ]; then
-            local resp=$(printf "AT\r\n" | timeout 1 atinout - "$p" - 2>/dev/null)
+            local resp=""
+            case "$p" in
+                /dev/wwan*|/dev/mhi*)
+                    [ -x /usr/bin/read_pcie_sms.lua ] && resp=$(/usr/bin/read_pcie_sms.lua -p "$p" --at "AT" 2>/dev/null)
+                    ;;
+                *)
+                    resp=$(sms_tool -d "$p" -D at "AT" 2>/dev/null || printf "AT\r\n" | timeout 1 atinout - "$p" - 2>/dev/null)
+                    ;;
+            esac
             if echo "$resp" | grep -q "OK"; then
                 echo "$p" > /tmp/master_sms_port
                 echo "$p"
@@ -111,13 +119,21 @@ send_at_direct() {
     local cmd="$2"
     local out=""
 
-    # Ưu tiên atinout cho character devices PCIe (/dev/wwan0at0)
-    if command -v atinout >/dev/null 2>&1; then
-        out=$(timeout 3 sh -c "printf '%s\r\n' \"$cmd\" | atinout - '$p' -" 2>/dev/null)
-    fi
-    if [ -z "$out" ] && command -v sms_tool >/dev/null 2>&1 && [ "${p#/dev/wwan}" = "$p" ]; then
-        out=$(timeout 4 sms_tool -d "$p" at "$cmd" 2>/dev/null)
-    fi
+    case "$p" in
+        /dev/wwan*|/dev/mhi*)
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                out=$(/usr/bin/read_pcie_sms.lua -p "$p" --at "$cmd" 2>/dev/null)
+            fi
+            ;;
+        *)
+            if command -v sms_tool >/dev/null 2>&1; then
+                out=$(modem_lock_run sms_tool -d "$p" -D at "$cmd" 2>/dev/null)
+            fi
+            if [ -z "$out" ] && command -v atinout >/dev/null 2>&1; then
+                out=$(modem_lock_run sh -c "printf '%s\r\n' \"$cmd\" | atinout - '$p' -" 2>/dev/null)
+            fi
+            ;;
+    esac
 
     echo "$out"
 }
@@ -209,8 +225,8 @@ case "$1" in
                 fi
                 ;;
             fetchSMSNow)
-                if [ -c "/dev/wwan0qmi0" ] && [ -f "/usr/bin/read_pcie_sms.lua" ]; then
-                    /usr/bin/read_pcie_sms.lua
+                if { [ -c "/dev/wwan0qmi0" ] || [ -c "/dev/wwan0at0" ] || [ -c "/dev/mhi_DUN" ]; } && [ -x "/usr/bin/read_pcie_sms.lua" ]; then
+                    /usr/bin/read_pcie_sms.lua >/dev/null 2>&1
                     inbox="\"Hộp thư trống hoặc chưa nhận được tin nhắn mới.\""
                     [ -f /tmp/sms_inbox.json ] && inbox=$(cat /tmp/sms_inbox.json)
                     printf '{"success":true,"inbox":%s}\n' "$inbox"
@@ -272,8 +288,27 @@ case "$1" in
                 [ -f /tmp/sms_inbox.json ] && inbox=$(cat /tmp/sms_inbox.json)
                 printf '{"success":true,"inbox":%s}\n' "$inbox"
                 ;;
+            deleteSingleSMS)
+                indices=$(echo "$input" | jsonfilter -e '$.indices' 2>/dev/null)
+                storage=$(echo "$input" | jsonfilter -e '$.storage' 2>/dev/null)
+                [ -z "$storage" ] && storage="ME"
+                port=$(get_active_modem_port)
+                if { [ -c "/dev/wwan0at0" ] || [ -c "/dev/mhi_DUN" ]; } && [ -x /usr/bin/read_pcie_sms.lua ]; then
+                    /usr/bin/read_pcie_sms.lua -p "$port" --delete "$indices" "$storage" >/dev/null 2>&1
+                elif [ -n "$port" ] && [ -c "$port" ] && command -v sms_tool >/dev/null 2>&1; then
+                    st_flag="ME"
+                    [ "$storage" = "SM" ] || [ "$storage" = "sim" ] && st_flag="SM"
+                    modem_lock_run sms_tool -s "$st_flag" -d "$port" delete "$indices" >/dev/null 2>&1
+                fi
+                echo '{"success":true,"message":"Đã xóa tin nhắn đã chọn!"}'
+                ;;
             deleteAllSMS)
                 port=$(get_active_modem_port)
+                if { [ -c "/dev/wwan0at0" ] || [ -c "/dev/mhi_DUN" ]; } && [ -x /usr/bin/read_pcie_sms.lua ]; then
+                    /usr/bin/read_pcie_sms.lua -p "$port" --delete-all >/dev/null 2>&1
+                    echo '{"success":true,"message":"Đã xóa toàn bộ tin nhắn thành công!"}'
+                    exit 0
+                fi
                 touch /tmp/sms_sending.lock
                 acquire_lock_safe
                 trap 'safe_at_cleanup' EXIT INT TERM
@@ -296,15 +331,21 @@ case "$1" in
                 ;;
             getSMSInfo)
                 port=$(get_active_modem_port)
+                if [ ! -s /tmp/master_sim_status ] && [ -x /www/cgi-bin/sim_manager ]; then
+                    QUERY_STRING="action=get_state" /www/cgi-bin/sim_manager >/dev/null 2>&1
+                fi
                 sim_info=$(cat /tmp/master_sim_info_luci 2>/dev/null || echo "SIM Viettel")
-                sim_status=$(cat /tmp/master_sim_status 2>/dev/null || echo "READY")
-                epoch=$(cat /etc/sms_custom_send_epoch 2>/dev/null || cat /tmp/sms_custom_send_epoch 2>/dev/null || cat /tmp/sms_next_send_epoch 2>/dev/null || echo "0")
+                sim_status=$(cat /tmp/master_sim_status 2>/dev/null || echo "LOCKED")
                 cur_band=$(cat /etc/config/band_lock_mode 2>/dev/null || cat /tmp/band_lock_mode 2>/dev/null || echo "auto_carrier")
                 
                 # Xác thực bảo mật: Không gửi dãy số ICCID ra ngoài, chỉ trả cờ is_authenticated (1 hoặc 0)
-                # Bảo mật SIM mặc định: Chỉ cấp quyền cho SIM có trạng thái VALID (thuộc 3 SIM VIP)
-                cur_sim_status=$(cat /tmp/master_sim_status 2>/dev/null || echo "VALID")
-                is_auth=1
+                is_auth=0
+                [ "$sim_status" = "VALID" ] && is_auth=1
+                if [ "$is_auth" -eq 1 ]; then
+                    epoch=$(cat /etc/sms_custom_send_epoch 2>/dev/null || cat /tmp/sms_custom_send_epoch 2>/dev/null || cat /tmp/sms_next_send_epoch 2>/dev/null || echo "0")
+                else
+                    epoch="0"
+                fi
 
                 inbox="\"Hộp thư trống hoặc nhấn Làm Mới SMS để đọc tin nhắn.\""
                 [ -f /tmp/sms_inbox.json ] && [ -s /tmp/sms_inbox.json ] && inbox=$(cat /tmp/sms_inbox.json 2>/dev/null)
@@ -318,21 +359,28 @@ case "$1" in
                 target=$(echo "$input" | jsonfilter -e '$.target' 2>/dev/null)
                 msg=$(echo "$input" | jsonfilter -e '$.msg' 2>/dev/null)
                 port=$(get_active_modem_port)
-                touch /tmp/sms_sending.lock
-                acquire_lock_safe
-                trap 'safe_at_cleanup' EXIT INT TERM
-                release_ports
                 if [ -c "/dev/wwan0qmi0" ]; then
                     killall -STOP quectel-CM-M quectel-CM 2>/dev/null
                     uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$msg" --send-message-target "$target" >/dev/null 2>&1
                     killall -CONT quectel-CM-M quectel-CM 2>/dev/null
                 else
-                    modem_lock_run sms_tool -d "$port" send "$target" "$msg" >/dev/null 2>&1
+                    case "$port" in
+                        /dev/wwan*|/dev/mhi*)
+                            [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --send "$target" "$msg" >/dev/null 2>&1
+                            ;;
+                        *)
+                            touch /tmp/sms_sending.lock
+                            acquire_lock_safe
+                            trap 'safe_at_cleanup' EXIT INT TERM
+                            release_ports
+                            modem_lock_run sms_tool -d "$port" send "$target" "$msg" >/dev/null 2>&1
+                            restore_ports
+                            rm -f /tmp/sms_sending.lock
+                            release_lock_safe
+                            trap - EXIT INT TERM
+                            ;;
+                    esac
                 fi
-                restore_ports
-                rm -f /tmp/sms_sending.lock
-                release_lock_safe
-                trap - EXIT INT TERM
                 echo '{"success":true,"message":"Gửi SMS thành công!"}'
                 ;;
             setCustomSchedule)
@@ -384,26 +432,33 @@ case "$1" in
 EOF
                 echo "$s_dst|$s_body|$carrier_display" > /tmp/carrier_data_preset.txt
 
-                touch /tmp/sms_sending.lock
-                acquire_lock_safe
-                trap 'safe_at_cleanup' EXIT INT TERM
-                release_ports
+                case "$port" in
+                    /dev/wwan*|/dev/mhi*)
+                        [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --send "$s_dst" "$s_body" >/dev/null 2>&1
+                        sleep 5
+                        [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --read >/dev/null 2>&1
+                        ;;
+                    *)
+                        touch /tmp/sms_sending.lock
+                        acquire_lock_safe
+                        trap 'safe_at_cleanup' EXIT INT TERM
+                        release_ports
 
-                modem_lock_run sms_tool -d "$port" send "$s_dst" "$s_body" >/dev/null 2>&1
-                sleep 6
+                        modem_lock_run sms_tool -d "$port" send "$s_dst" "$s_body" >/dev/null 2>&1
+                        sleep 6
 
-                restore_ports
-                rm -f /tmp/sms_sending.lock
-                release_lock_safe
-                trap - EXIT INT TERM
+                        restore_ports
+                        rm -f /tmp/sms_sending.lock
+                        release_lock_safe
+                        trap - EXIT INT TERM
+                        ;;
+                esac
 
                 printf '{"success":true,"carrier":"%s","dst":"%s"}\n' "$carrier" "$s_dst"
                 ;;
             setBandLock)
                 mode=$(echo "$input" | jsonfilter -e '$.mode' 2>/dev/null)
-                port=$(cat /tmp/master_sms_port 2>/dev/null)
-                [ -z "$port" ] || [ ! -c "$port" ] && port="/dev/ttyUSB2"
-                [ ! -c "$port" ] && [ -c "/dev/ttyUSB0" ] && port="/dev/ttyUSB0"
+                port=$(get_active_modem_port)
 
                 carrier=$(cat /tmp/master_carrier_name 2>/dev/null || echo "Viettel")
                 m_type=$(cat /tmp/master_m_type 2>/dev/null || echo "")
@@ -420,21 +475,26 @@ EOF
                     eff_mode="$mode"
                 fi
 
-                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:"; then
+                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:" || [ -c "/dev/wwan0at0" ]; then
                     # Sierra Wireless EM9190 / EM9191 Band Selection
-                    echo 'AT!ENTERCND="A710"' | atinout - "$port" - >/dev/null 2>&1
+                    send_at_direct "$port" 'AT!ENTERCND="A710"' >/dev/null 2>&1
                     if [ "$eff_mode" = "viettel_5g" ] || [ "$eff_mode" = "vina_5g" ] || [ "$eff_mode" = "mobi_5g" ]; then
-                        echo -e 'AT!SELRAT=0F\nAT!SELACQ=NR5G,LTE\nAT!BAND=00' | atinout - "$port" - >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!SELRAT=0F' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!SELACQ=NR5G,LTE' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!BAND=00' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Sierra EM9190: Đã khóa 5G NSA/SA (LTE + NR5G Band n41/n78/n28 + LTE B1/B3/B7/B8)!"
                     elif [ "$eff_mode" = "4g_ca" ]; then
-                        echo -e 'AT!SELRAT=04\nAT!BAND=09' | atinout - "$port" - >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!SELRAT=04' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!BAND=09' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Sierra EM9190: Đã khóa 4G LTE ALL (B1+B3+B7+B8+B28+B40+B41 CA) gộp sóng ổn định!"
                     else
-                        echo -e 'AT!SELRAT=00\nAT!SELACQ=LTE,NR5G,WCDMA\nAT!BAND=00' | atinout - "$port" - >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!SELRAT=00' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!SELACQ=LTE,NR5G,WCDMA' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT!BAND=00' >/dev/null 2>&1
                         echo "auto" > /etc/config/band_lock_mode
                         rm -f /tmp/band_lock_mode 2>/dev/null
                         msg="Sierra EM9190: Đã khôi phục chế độ Băng Tần Tự Động (Auto RAT + Toàn bộ băng tần)!"
@@ -476,18 +536,10 @@ EOF
                 printf '{"success":true,"message":"%s","mode":"%s"}\n' "$msg" "$save_mode"
                 ;;
             getCellInfo)
-                port=$(cat /tmp/master_sms_port 2>/dev/null)
-                [ -z "$port" ] || [ ! -c "$port" ] && port=$(cat /tmp/custom_at_port 2>/dev/null)
+                port=$(get_active_modem_port)
                 m_type=$(cat /tmp/master_m_type 2>/dev/null || echo "")
-                if [ -z "$port" ] || [ ! -c "$port" ]; then
-                    if echo "$m_type" | grep -iqE "fibocom|fm350|0e8d:7127"; then
-                        [ -c "/dev/ttyUSB3" ] && port="/dev/ttyUSB3"
-                    fi
-                    [ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/ttyUSB0" ] && port="/dev/ttyUSB0"
-                    [ -z "$port" ] || [ ! -c "$port" ] && port="/dev/ttyUSB2"
-                fi
 
-                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:"; then
+                if echo "$m_type" | grep -iqE "sierra|em919|em75|1199:" || [ -c "/dev/wwan0at0" ]; then
                     # Sierra Wireless EM9190 / EM9191 / EM7565 Parser
                     gstatus=$(send_at_direct "$port" "AT!GSTATUS?")
                     lteinfo=$(send_at_direct "$port" "AT!LTEINFO?")

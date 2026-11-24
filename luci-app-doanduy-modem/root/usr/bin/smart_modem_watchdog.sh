@@ -102,12 +102,21 @@ get_smart_iface() {
 }
 
 get_smart_device() {
-    local dev=$(cat /tmp/wd_device 2>/dev/null)
+    local act_iface dev cand
+    act_iface=$(get_smart_iface)
+    if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+        dev=$(ubus call network.interface."$act_iface" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+        if [ -n "$dev" ] && [ -d "/sys/class/net/$dev" ]; then
+            echo "$dev"
+            return
+        fi
+    fi
+    dev=$(cat /tmp/wd_device 2>/dev/null)
     if [ -n "$dev" ] && [ "$dev" != "wan" ] && [ "$dev" != "lan" ] && [ -d "/sys/class/net/$dev" ]; then
         echo "$dev"
         return
     fi
-    for cand in wwan0 mhi_hwip0 rmnet_mhi0.1 usb0; do
+    for cand in mhi_hwip0 wwan0 rmnet_mhi0.1 eth2 usb0; do
         if [ -d "/sys/class/net/$cand" ]; then
             echo "$cand"
             return
@@ -183,7 +192,7 @@ check_dns_status() {
 apply_mss_clamping() {
     if command -v nft >/dev/null 2>&1; then
         if ! nft list table inet fw4 2>/dev/null | grep -q "maxseg size set rt mtu"; then
-            nft add rule inet fw4 forward oifname { "wwan0", "wan" } tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
+            nft add rule inet fw4 forward oifname { "mhi_hwip0", "wwan0", "eth2", "usb0", "wan" } tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
         fi
     fi
     if command -v iptables >/dev/null 2>&1; then
@@ -242,23 +251,27 @@ warm_reset_wwan_baseband() {
 
     # 2. Khóa cổng AT và phát lệnh Warm Reset tương thích mọi module
     if [ -c "$port" ]; then
-        local m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
-        (
-            flock -x -w 5 200 || exit 0
-            if echo "$m_type" | grep -iqE "sierra|1199:" || lspci 2>/dev/null | grep -iqE "17cb:0306|sdx55"; then
-                timeout 3 sh -c "printf 'AT!RESET\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
-            elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
-                timeout 3 sh -c "printf 'AT+CFUN=15\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
-            else
-                timeout 3 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
-            fi
-        ) 200>/var/lock/modem_at.lock
+        if [ -x /usr/bin/read_pcie_sms.lua ] && [ "${port#/dev/tty}" = "$port" ]; then
+            /usr/bin/read_pcie_sms.lua -p "$port" --at "AT!RESET" >/dev/null 2>&1 || /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=1,1" >/dev/null 2>&1 || true
+        else
+            local m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
+            (
+                flock -x -w 5 200 || exit 0
+                if echo "$m_type" | grep -iqE "sierra|1199:"; then
+                    timeout 3 sh -c "printf 'AT!RESET\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
+                elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
+                    timeout 3 sh -c "printf 'AT+CFUN=15\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
+                else
+                    timeout 3 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
+                fi
+            ) 200>/var/lock/modem_at.lock
+        fi
     fi
 
     # 3. Chờ chip Baseband modem reboot sạch phần cứng (12-14s)
     sleep 12
     for w in $(seq 1 12); do
-        [ -e "/dev/cdc-wdm0" ] || [ -e "/dev/wwan0qmi0" ] || [ -e "/dev/ttyUSB0" ] && break
+        [ -e "/dev/cdc-wdm0" ] || [ -e "/dev/wwan0mbim0" ] || [ -e "/dev/wwan0qmi0" ] || [ -e "/dev/mhi_QMI0" ] || [ -e "/dev/mhi_MBIM" ] || [ -e "/dev/ttyUSB0" ] && break
         sleep 1
     done
 
@@ -301,16 +314,8 @@ heal_tier2_wwan_session() {
     local is_mbim=0
     [ "$proto" = "mbim" ] || [ "$proto" = "duydoan5g" ] || [ -c "/dev/wwan0mbim0" ] && is_mbim=1
 
-    if [ "$is_mbim" -eq 1 ] && [ -c "$port" ]; then
-        local apn=$(uci -q get network."$iface".apn || echo "v-internet")
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
-            modem_lock_run sh -c "echo 'AT+CGDCONT=3,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
-        elif command -v atinout >/dev/null 2>&1; then
-            echo "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" | atinout - "$port" - >/dev/null 2>&1
-            echo "AT+CGDCONT=3,\"IPV4V6\",\"$apn\"" | atinout - "$port" - >/dev/null 2>&1
-        fi
-    elif [ "$is_mbim" -eq 0 ] && [ -c "$port" ]; then
+    # Với MBIM / PCIe MHI đang chạy: KHÔNG gửi AT+CGDCONT vì sẽ đá bearer vào trạng thái Deactivating (4)!
+    if [ "$is_mbim" -eq 0 ] && [ -c "$port" ]; then
         local apn=$(uci -q get network."$iface".apn || echo "v-internet")
         if command -v modem_lock_run >/dev/null 2>&1; then
             modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
@@ -330,23 +335,23 @@ heal_tier2_wwan_session() {
         fi
     fi
 
-    # 2. Làm mới interface qua ubus netifd (Dọn dẹp tiến trình umbim cũ trước)
+    # 2. Làm mới interface qua ubus netifd (Chờ duydoan5g_dialer đóng phiên MBIM sạch)
     for p in $(pgrep -f "umbim.*cdc-wdm" 2>/dev/null); do
         [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
     done
     if command -v ubus >/dev/null 2>&1; then
         ubus call network.interface."$iface" down 2>/dev/null
-        sleep 2
+        sleep 4
         ubus call network.interface."$iface" up 2>/dev/null
     elif command -v ifdown >/dev/null 2>&1; then
-        ifdown "$iface" 2>/dev/null; sleep 2; ifup "$iface" 2>/dev/null
+        ifdown "$iface" 2>/dev/null; sleep 4; ifup "$iface" 2>/dev/null
     fi
 
     clean_stale_lock "/tmp/modem_healing.lock" 60
     echo "$$" > /tmp/modem_healing.lock
-    # 3. Vòng lặp thăm dò thông minh chờ WWAN nhận lại IP (tối đa 15s)
+    # 3. Vòng lặp thăm dò thông minh chờ WWAN nhận lại IP (tối đa 25s)
     local w_count=0
-    while [ "$w_count" -lt 15 ]; do
+    while [ "$w_count" -lt 25 ]; do
         sleep 1
         w_count=$((w_count + 1))
         if check_internet_status; then
@@ -356,10 +361,7 @@ heal_tier2_wwan_session() {
         fi
     done
     rm -f /tmp/modem_healing.lock
-    echo "$(date): [Tầng 2] Làm mới session không thành công (Nhà mạng có thể đã thu hồi IP). Tự động kích hoạt Warm Reset card WWAN..." >> "$LOG_FILE"
-    if warm_reset_wwan_baseband "Nhà mạng thu hồi IP / Lỗi đàm phán PDP Context" "$iface"; then
-        return 0
-    fi
+    echo "$(date): [Tầng 2] Làm mới session chưa nhận IP sau 25s; nhường Tầng 3 xử lý nếu còn mất mạng." >> "$LOG_FILE"
     return 1
 }
 
@@ -368,10 +370,10 @@ heal_tier3_cfun_cell_failover() {
     local port=$(get_at_port)
     local proto=$(uci -q get network."$iface".proto || echo "mbim")
 
-    # 1. Bỏ qua nếu router vừa boot (< 30s)
+    # 1. Bỏ qua nếu router vừa boot (< 90s)
     local up_sec=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999)
-    if [ "$up_sec" -lt 30 ]; then
-        echo "$(date): [Tầng 3] Router vừa boot (${up_sec}s < 30s) - Bỏ qua reset để modem tự do kết nối BTS."
+    if [ "$up_sec" -lt 90 ]; then
+        echo "$(date): [Tầng 3] Router vừa boot (${up_sec}s < 90s) - Bỏ qua reset để modem tự do kết nối BTS."
         ubus call network.interface."$iface" up 2>/dev/null || ifup "$iface" 2>/dev/null
         return 1
     fi
@@ -401,30 +403,23 @@ heal_tier3_cfun_cell_failover() {
     [ "$proto" = "mbim" ] || [ "$proto" = "duydoan5g" ] || [ -c "/dev/wwan0mbim0" ] && is_mbim=1
 
     if [ "$is_mbim" -eq 1 ]; then
-        echo "$(date): [Tầng 3] MBIM Safe RF Reset: Kích hoạt Airplane mode (CFUN 4/1) để tái kết nối BTS sạch..."
-        local dev=$(uci -q get network."$iface".device || echo "/dev/cdc-wdm0")
-        killall -9 umbim 2>/dev/null
-        [ -e "$dev" ] && umbim -n -t 99 -d "$dev" disconnect 2>/dev/null
-        sleep 1
-        ubus call network.interface."$iface" down 2>/dev/null
-        sleep 1
+        echo "$(date): [Tầng 3] MBIM Safe RF Reset: Hạ session, gửi CFUN 4/1 an toàn..."
+        ubus call network.interface."$iface" down 2>/dev/null || ifdown "$iface" 2>/dev/null
+        killall -INT quectel-CM-M quectel-CM quectel-cm umbim 2>/dev/null || true
+        sleep 2
         if [ -c "$port" ]; then
-            if command -v modem_lock_run >/dev/null 2>&1; then
+            if [ -x /usr/bin/read_pcie_sms.lua ] && [ "${port#/dev/tty}" = "$port" ]; then
+                /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=4" >/dev/null 2>&1
+                sleep 3
+                /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=1" >/dev/null 2>&1
+            elif command -v modem_lock_run >/dev/null 2>&1; then
                 modem_lock_run sh -c "echo 'AT+CFUN=4' | atinout - '$port' -" >/dev/null 2>&1
                 sleep 2
                 modem_lock_run sh -c "echo 'AT+CFUN=1' | atinout - '$port' -" >/dev/null 2>&1
-            elif command -v atinout >/dev/null 2>&1; then
-                echo "AT+CFUN=4" | atinout - "$port" - 2>/dev/null
-                sleep 2
-                echo "AT+CFUN=1" | atinout - "$port" - 2>/dev/null
-            elif [ -x /usr/bin/at_mux ]; then
-                /usr/bin/at_mux send 1 'AT+CFUN=4' 3 >/dev/null 2>&1
-                sleep 2
-                /usr/bin/at_mux send 1 'AT+CFUN=1' 3 >/dev/null 2>&1
             fi
-            sleep 2
+            sleep 4
         fi
-        ubus call network.interface."$iface" up 2>/dev/null
+        ubus call network.interface."$iface" up 2>/dev/null || ifup "$iface" 2>/dev/null
     else
         # Với Quectel / Fibocom QMI/ECM: Dùng Airplane mode CFUN 4/1 an toàn thay vì CFUN 0
         ubus call network.interface."$iface" down 2>/dev/null || ifdown "$iface" 2>/dev/null
@@ -469,35 +464,20 @@ heal_tier3_cfun_cell_failover() {
         fi
     done
 
-    # NẾU TẦNG 3 SOFT RF RESET KHÔNG PHỤC HỒI ĐƯỢC (MBIM/USB endpoint bị đơ):
-    # KÍCH HOẠT HARD RESET CHIP MODEM (AT!RESET đối với Sierra EM9190, AT+CFUN=1,1 cho Quectel/khác):
-    echo "$(date): [Tầng 3 Cấp Cứu] Soft RF Reset không đủ (MBIM stack treo). Kích hoạt Hard Modem Reset qua AT port..."
-    local m_type=""
-    [ -f /tmp/master_m_type ] && m_type=$(cat /tmp/master_m_type 2>/dev/null)
-    if [ -z "$m_type" ] && command -v lsusb >/dev/null 2>&1; then
-        m_type=$(lsusb 2>/dev/null)
-    fi
-
-    if [ -c "$port" ]; then
-        if echo "$m_type" | grep -iqE "sierra|1199:" || lspci 2>/dev/null | grep -iqE "17cb:0306|sdx55"; then
-            echo -e "AT!RESET\r" | atinout - "$port" - >/dev/null 2>&1 || echo -e "AT+CFUN=1,1\r" | atinout - "$port" - >/dev/null 2>&1
-        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
-            echo -e "AT+CFUN=15\r" | atinout - "$port" - >/dev/null 2>&1
-            sleep 1
-            echo -e "AT+CFUN=1,1\r" | atinout - "$port" - >/dev/null 2>&1
+    # Chỉ cho phép AT!RESET trên PCIe MHI khi thất bại nghiêm trọng (FAIL_STREAK >= 15)
+    if [ "${FAIL_STREAK:-0}" -ge 15 ] && [ -c "$port" ]; then
+        echo "$(date): [Tầng 3 Cấp Cứu] Soft RF Reset không đủ (MBIM stack treo). Kích hoạt Hard Modem Reset qua AT port..."
+        local m_type=""
+        [ -f /tmp/master_m_type ] && m_type=$(cat /tmp/master_m_type 2>/dev/null)
+        if [ -x /usr/bin/read_pcie_sms.lua ] && [ "${port#/dev/tty}" = "$port" ]; then
+            /usr/bin/read_pcie_sms.lua -p "$port" --at "AT!RESET" >/dev/null 2>&1 || /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=1,1" >/dev/null 2>&1
+        elif echo "$m_type" | grep -iqE "sierra|1199:"; then
+            modem_lock_run sh -c "echo -e 'AT!RESET\r' | atinout - '$port' -" >/dev/null 2>&1 || modem_lock_run sh -c "echo -e 'AT+CFUN=1,1\r' | atinout - '$port' -" >/dev/null 2>&1
         else
-            echo -e "AT+CFUN=1,1\r" | atinout - "$port" - >/dev/null 2>&1
+            modem_lock_run sh -c "echo -e 'AT+CFUN=1,1\r' | atinout - '$port' -" >/dev/null 2>&1
         fi
+        sleep 15
     fi
-
-    # Chờ 15s cho modem reboot sạch phần cứng và re-enumerate USB:
-    sleep 12
-    for w_dev in $(seq 1 15); do
-        if [ -e "/dev/cdc-wdm0" ] || [ -e "/dev/cdc-wdm1" ] || [ -e "/dev/ttyUSB0" ]; then
-            break
-        fi
-        sleep 1
-    done
 
     ubus call network.interface."$iface" up 2>/dev/null || ifup "$iface" 2>/dev/null
     sleep 3
@@ -514,10 +494,6 @@ heal_tier3_cfun_cell_failover() {
     done
 
     rm -f /tmp/modem_healing.lock
-    echo "$(date): [Tầng 2] Làm mới session không thành công (Nhà mạng có thể đã thu hồi IP). Tự động kích hoạt Warm Reset card WWAN..." >> "$LOG_FILE"
-    if warm_reset_wwan_baseband "Nhà mạng thu hồi IP / Lỗi đàm phán PDP Context" "$iface"; then
-        return 0
-    fi
     return 1
 }
 
@@ -776,9 +752,9 @@ proactive_rf_health_guard() {
         nr_sinr=$(echo "$raw" | jsonfilter -e '$.nr5g.sinr' 2>/dev/null)
     fi
 
-    # 2. Dự phòng đọc AT+QRSRP cho Quectel
+    # 2. Dự phòng đọc AT+QRSRP cho Quectel (Bỏ qua trên PCIe Sierra để tránh spam AT)
     local at_port=$(get_at_port)
-    if [ -z "$nr_rsrp" ] && [ -c "$at_port" ]; then
+    if [ -z "$nr_rsrp" ] && [ -c "$at_port" ] && [ "${at_port#/dev/tty}" != "$at_port" ]; then
         if command -v modem_lock_run >/dev/null 2>&1; then
             local rf_out=$(modem_lock_run sh -c "echo -e 'AT+QRSRP\r' | atinout - '$at_port' -" 2>/dev/null)
             nr_rsrp=$(echo "$rf_out" | grep -i "\+QRSRP:" | cut -d':' -f2 | cut -d',' -f1 | tr -d ' ')
@@ -810,8 +786,8 @@ proactive_rf_health_guard() {
 
 check_silent_pdp_freeze() {
     local iface="${1:-$(get_smart_iface)}"
-    local dev=$(cat /tmp/wd_device 2>/dev/null)
-    [ -z "$dev" ] || [ ! -d "/sys/class/net/$dev" ] && dev="$iface"
+    local dev
+    dev=$(get_smart_device)
     [ ! -d "/sys/class/net/$dev" ] && return 0
     
     local tx_before=$(cat "/sys/class/net/$dev/statistics/tx_packets" 2>/dev/null || echo 0)
@@ -926,8 +902,8 @@ while true; do
     fi
 
     up_sec=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999)
-    if [ "$up_sec" -lt 45 ]; then
-        echo "$(date): Router vừa boot (${up_sec}s < 45s) - Đang chờ modem quét trạm BTS và đàm phán IP..." >> "$LOG_FILE"
+    if [ "$up_sec" -lt 90 ]; then
+        echo "$(date): Router vừa boot (${up_sec}s < 90s) - Đang chờ modem quét trạm BTS và đàm phán IP..." >> "$LOG_FILE"
         rotate_log_if_needed
         sleep 10
         continue
@@ -986,9 +962,8 @@ while true; do
         fi
     fi
 
-    # TẦNG 3: TÁI SINH SÓNG MODEM & CELL FAILOVER (PHỤC HỒI IP NHÀ MẠNG THU HỒI TỨC THÌ)
-    # KÍCH HOẠT KHI MẤT MẠNG LIÊN TỤC >= 3 LẦN (~15-20 GIÂY)
-    if [ "$FAIL_STREAK" -ge 3 ]; then
+    # TẦNG 3: TÁI SINH SÓNG MODEM & CELL FAILOVER (CHỈ KÍCH HOẠT KHI TẦNG 1 & 2 CHƯA PHỤC HỒI)
+    if [ "$FAIL_STREAK" -ge 10 ]; then
         LAST_RECOVER_TS=$CUR_TS
         if heal_tier3_cfun_cell_failover "$ACT_IFACE"; then
             DUR=$(( $(date +%s) - START_HEAL_S ))

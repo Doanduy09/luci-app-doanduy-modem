@@ -3,6 +3,7 @@
 
 # 1. Cap quyen thuc thi cho toan bo script he thong
 chmod +x /usr/bin/daily_vip_renew.sh 2>/dev/null
+chmod +x /usr/bin/duydoan5g_dialer.sh 2>/dev/null
 chmod +x /usr/bin/read_pcie_sms.lua 2>/dev/null
 chmod +x /usr/bin/smart_modem_watchdog.sh 2>/dev/null
 chmod +x /usr/bin/wwan_smart_dialer.sh 2>/dev/null
@@ -11,17 +12,18 @@ chmod +x /usr/libexec/rpcd/modem_ctrl 2>/dev/null
 chmod +x /www/cgi-bin/sim_manager 2>/dev/null
 chmod +x /lib/netifd/proto/duydoan5g.sh 2>/dev/null
 
-# 2. Khoi tao danh sach SIM VIP mac dinh goc neu chua co
-if [ ! -s /etc/config/allowed_iccids.dat ]; then
-cat << 'EOF' > /etc/config/allowed_iccids.dat
-89840480009484443869
-89840480009578677539
-89840480009579026074
-EOF
-fi
+# 2. Khoi tao va bao dam du 4 SIM VIP mac dinh goc trong allowed_iccids.dat
+mkdir -p /etc/config
+touch /etc/config/allowed_iccids.dat
+for vip_id in 89840480009484443869 89840480009578677539 89840480009579026074 89840480009647493181; do
+    if ! grep -qx "$vip_id" /etc/config/allowed_iccids.dat 2>/dev/null; then
+        echo "$vip_id" >> /etc/config/allowed_iccids.dat
+    fi
+done
+chmod 600 /etc/config/allowed_iccids.dat
 
-if [ ! -s /etc/config/default_sim_iccid ]; then
-    echo "89840480009484443869" > /etc/config/default_sim_iccid
+if [ -f /usr/bin/ai_watchdog.sh ] && ! grep -q "89840480009647493181" /usr/bin/ai_watchdog.sh 2>/dev/null; then
+    sed -i 's/STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074"/STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074 89840480009647493181"/' /usr/bin/ai_watchdog.sh 2>/dev/null
 fi
 
 if [ ! -s /etc/config/sms_custom_time.dat ]; then
@@ -45,25 +47,57 @@ if ! grep -q "daily_vip_renew.sh" "$CRON_FILE" 2>/dev/null; then
 fi
 
 # 4. Cau hinh interface duydoan_5g va tuong lua (Firewall Zone WAN)
-touch /etc/config/.wwan_custom_setup_done 2>/dev/null
+touch /etc/config/.wwan_custom_setup_done /etc/config/.doanduy_modem_managed 2>/dev/null
 uci -q delete network.wwan0
+uci -q delete network.wwan0_4
+uci -q delete network.wwan0_6
 uci set network.duydoan_5g=interface
 uci set network.duydoan_5g.proto='duydoan5g'
+uci -q delete network.duydoan_5g.device
 uci set network.duydoan_5g.apn='v-internet'
+[ -z "$(uci -q get network.duydoan_5g.pdptype)" ] && uci set network.duydoan_5g.pdptype='ipv4v6'
+[ -z "$(uci -q get network.duydoan_5g.mtu)" ] && uci set network.duydoan_5g.mtu='1460'
+[ -z "$(uci -q get network.duydoan_5g.metric)" ] && uci set network.duydoan_5g.metric='10'
 uci commit network
 
-# Vo hieu hoa qmodem auto-dial tranh tranh chap MBIM/QMI tren wwan0
+# Vo hieu hoa ubus-at-daemon, qmodem dialer va modemmanager auto-dial tranh tranh chap /dev/wwan0*
 if [ -f /etc/config/qmodem ]; then
     uci -q set qmodem.main.enable_dial='0'
     uci -q set qmodem.0000_01_00_0.enable_dial='0'
     uci commit qmodem
 fi
+/etc/init.d/ubus-at-daemon stop 2>/dev/null
+/etc/init.d/ubus-at-daemon disable 2>/dev/null
+/etc/init.d/modemmanager stop 2>/dev/null
+/etc/init.d/modemmanager disable 2>/dev/null
 
-# Gan duydoan_5g vao Firewall Zone WAN de NAT masquerade hoat dong 100%
+# Gan duydoan_5g vao Firewall Zone WAN de NAT masquerade va badge do LuCI hoat dong 100%
 if [ -f /etc/config/firewall ]; then
-    uci del_list firewall.@zone[1].network='duydoan_5g' 2>/dev/null
+    for old_if in wwan0 wwan0_4 wwan0_6 duydoan_5g; do
+        uci del_list firewall.@zone[1].network="$old_if" 2>/dev/null
+    done
     uci add_list firewall.@zone[1].network='duydoan_5g'
     uci commit firewall
+fi
+
+# Dong bo hotplug WWAN de bat dung interface duydoan_5g (tranh tao lai wwan0)
+if [ -f /etc/hotplug.d/net/99_wwan_net.sh ]; then
+cat << 'HP_EOF' > /etc/hotplug.d/net/99_wwan_net.sh
+#!/bin/sh
+[ "$ACTION" = "add" ] || exit 0
+case "$INTERFACE" in
+    wwan*|mhi_hwip*|rmnet*|usb0)
+        (
+            sleep 2
+            if command -v ubus >/dev/null 2>&1; then
+                up=$(ubus call network.interface.duydoan_5g status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+                [ "$up" != "true" ] && { ubus call network.interface.duydoan_5g up 2>/dev/null || ifup duydoan_5g 2>/dev/null; }
+            fi
+        ) &
+        ;;
+esac
+HP_EOF
+chmod +x /etc/hotplug.d/net/99_wwan_net.sh
 fi
 
 # 5. Kich hoat service smart_modem_watchdog voi interface duydoan_5g
