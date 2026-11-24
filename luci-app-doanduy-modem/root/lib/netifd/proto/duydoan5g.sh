@@ -18,21 +18,42 @@ proto_duydoan5g_setup() {
 	json_get_vars apn pincode metric
 
 	[ -z "$apn" ] && apn="v-internet"
-	local ifname="mhi_hwip0"
-	[ ! -d "/sys/class/net/$ifname" ] && ifname="wwan0"
+	local ifname="wwan0"
+	[ -d "/sys/class/net/mhi_hwip0" ] && ifname="mhi_hwip0"
 
 	logger -t duydoan5g "Starting 5G dialing on $ifname (APN: $apn)..."
+
+	# Chờ thiết bị wwan0 và cổng mbim xuất hiện tối đa 30 giây khi router vừa boot
+	local dev_ready=0
+	for i in $(seq 1 30); do
+		if [ -d "/sys/class/net/$ifname" ] && { [ -c "/dev/wwan0mbim0" ] || [ -c "/dev/cdc-wdm0" ]; }; then
+			dev_ready=1
+			break
+		fi
+		sleep 1
+	done
+
+	if [ "$dev_ready" -ne 1 ]; then
+		logger -t duydoan5g "Error: Device $ifname or control port not ready after 30s!"
+		proto_notify_error "$interface" NO_DEVICE
+		return 1
+	fi
+
+	# Kích hoạt link interface UP trước khi chạy công cụ quay số
+	ip link set dev "$ifname" up 2>/dev/null || true
+	sleep 1
 
 	killall -9 quectel-CM-M quectel-CM 2>/dev/null || true
 	sleep 1
 
 	mkdir -p /tmp/quectel_cm
-	nohup /usr/bin/quectel-CM-M -i "$ifname" -s "$apn" -4 -6 -d > /tmp/quectel_cm/quectel-cm.log 2>&1 &
+	# Chạy quectel-CM-M chế độ MBIM (-s apn -4 -6). Không dùng -d (QMI) vì Sierra EM9190 là MBIM
+	nohup /usr/bin/quectel-CM-M -i "$ifname" -s "$apn" -4 -6 > /tmp/quectel_cm/quectel-cm.log 2>&1 &
 	echo $! > /var/run/duydoan5g.pid
 
 	local count=0
 	local cur_ip=""
-	while [ $count -lt 15 ]; do
+	while [ $count -lt 25 ]; do
 		sleep 1
 		cur_ip=$(ip -4 addr show dev "$ifname" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
 		[ -n "$cur_ip" ] && break

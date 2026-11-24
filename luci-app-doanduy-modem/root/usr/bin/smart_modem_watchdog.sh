@@ -86,12 +86,12 @@ LUAPOST
 
 get_smart_iface() {
     local iface=$(cat /tmp/wd_interface 2>/dev/null)
-    if [ -n "$iface" ]; then
+    if [ -n "$iface" ] && [ "$iface" != "wan" ] && [ "$iface" != "lan" ]; then
         echo "$iface"
         return
     fi
     if command -v ubus >/dev/null 2>&1; then
-        for cand in duydoan_5g modem wwan0 wwan; do
+        for cand in duydoan_5g modem; do
             if ubus list | grep -q "^network\.interface\.${cand}$"; then
                 echo "$cand"
                 return
@@ -103,17 +103,17 @@ get_smart_iface() {
 
 get_smart_device() {
     local dev=$(cat /tmp/wd_device 2>/dev/null)
-    if [ -n "$dev" ] && [ -d "/sys/class/net/$dev" ]; then
+    if [ -n "$dev" ] && [ "$dev" != "wan" ] && [ "$dev" != "lan" ] && [ -d "/sys/class/net/$dev" ]; then
         echo "$dev"
         return
     fi
-    for cand in mhi_hwip0 rmnet_mhi0.1 wwan0 usb0; do
+    for cand in wwan0 mhi_hwip0 rmnet_mhi0.1 usb0; do
         if [ -d "/sys/class/net/$cand" ]; then
             echo "$cand"
             return
         fi
     done
-    get_smart_iface
+    echo "wwan0"
 }
 
 check_internet_status() {
@@ -287,18 +287,30 @@ warm_reset_wwan_baseband() {
 }
 
 heal_tier2_wwan_session() {
-    local iface="${1:-wwan0}"
+    local iface="${1:-$(get_smart_iface)}"
     local port=$(get_at_port)
     local proto=$(uci -q get network."$iface".proto || echo "mbim")
     echo "$(date): [Tầng 2] Làm mới phiên mạng WWAN (${iface}, proto=${proto}), Tái gắn kết PDP Context & Lấy lại IP..."
     ip route flush cache 2>/dev/null
 
     # 1. Fast PDP Re-attach qua AT port:
-    # LƯU Ý CHO MBIM (Sierra EM9190/EM9191):
+    # LƯU Ý CHO MBIM (Sierra EM9190/EM9191 / duydoan5g):
     # Tuyệt đối KHÔNG gửi AT+CGACT=0,1 khi chạy MBIM vì sẽ làm sập ngầm ngăn xếp netifd/umbim!
     # Với MBIM: Đồng bộ APN chuẩn và khởi động lại qua ubus netifd.
     # Với Quectel/Fibocom (qmi/quectel/xmm/dhcp): Tái gắn kết PDP Context thô qua AT.
-    if [ "$proto" != "mbim" ] && [ -c "$port" ]; then
+    local is_mbim=0
+    [ "$proto" = "mbim" ] || [ "$proto" = "duydoan5g" ] || [ -c "/dev/wwan0mbim0" ] && is_mbim=1
+
+    if [ "$is_mbim" -eq 1 ] && [ -c "$port" ]; then
+        local apn=$(uci -q get network."$iface".apn || echo "v-internet")
+        if command -v modem_lock_run >/dev/null 2>&1; then
+            modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
+            modem_lock_run sh -c "echo 'AT+CGDCONT=3,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
+        elif command -v atinout >/dev/null 2>&1; then
+            echo "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" | atinout - "$port" - >/dev/null 2>&1
+            echo "AT+CGDCONT=3,\"IPV4V6\",\"$apn\"" | atinout - "$port" - >/dev/null 2>&1
+        fi
+    elif [ "$is_mbim" -eq 0 ] && [ -c "$port" ]; then
         local apn=$(uci -q get network."$iface".apn || echo "v-internet")
         if command -v modem_lock_run >/dev/null 2>&1; then
             modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
@@ -315,15 +327,6 @@ heal_tier2_wwan_session() {
             sms_tool -d "$port" at "AT+CGACT=0,1" >/dev/null 2>&1
             sleep 1
             sms_tool -d "$port" at "AT+CGACT=1,1" >/dev/null 2>&1
-        fi
-    elif [ "$proto" = "mbim" ] && [ -c "$port" ]; then
-        local apn=$(uci -q get network."$iface".apn || echo "v-internet")
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
-            modem_lock_run sh -c "echo 'AT+CGDCONT=3,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
-        elif command -v atinout >/dev/null 2>&1; then
-            echo "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" | atinout - "$port" - >/dev/null 2>&1
-            echo "AT+CGDCONT=3,\"IPV4V6\",\"$apn\"" | atinout - "$port" - >/dev/null 2>&1
         fi
     fi
 
@@ -361,7 +364,7 @@ heal_tier2_wwan_session() {
 }
 
 heal_tier3_cfun_cell_failover() {
-    local iface="${1:-wwan0}"
+    local iface="${1:-$(get_smart_iface)}"
     local port=$(get_at_port)
     local proto=$(uci -q get network."$iface".proto || echo "mbim")
 
@@ -391,14 +394,17 @@ heal_tier3_cfun_cell_failover() {
         rm -f /tmp/cell_lock_active 2>/dev/null
     fi
 
-    # VỚI MBIM (Sierra EM9190/EM9191):
-    # Tuyệt đối không gửi CFUN=0 làm sập USB descriptor, nhưng sử dụng chuẩn 3GPP AT+CFUN=4 (Airplane mode / Tắt RF)
-    # sau đó AT+CFUN=1 (Bật RF) để ngắt hoàn toàn liên kết vô tuyến với trạm BTS và đàm phán lại từ đầu!
-    if [ "$proto" = "mbim" ]; then
+    # VỚI MBIM (Sierra EM9190/EM9191 / duydoan5g):
+    # Tuyệt đối không gửi CFUN=0 làm sập kênh PCIe MHI / USB descriptors!
+    # Sử dụng chuẩn 3GPP AT+CFUN=4 (Airplane mode / Tắt RF) sau đó AT+CFUN=1 (Bật RF)
+    local is_mbim=0
+    [ "$proto" = "mbim" ] || [ "$proto" = "duydoan5g" ] || [ -c "/dev/wwan0mbim0" ] && is_mbim=1
+
+    if [ "$is_mbim" -eq 1 ]; then
         echo "$(date): [Tầng 3] MBIM Safe RF Reset: Kích hoạt Airplane mode (CFUN 4/1) để tái kết nối BTS sạch..."
         local dev=$(uci -q get network."$iface".device || echo "/dev/cdc-wdm0")
         killall -9 umbim 2>/dev/null
-        umbim -n -t 99 -d "$dev" disconnect 2>/dev/null
+        [ -e "$dev" ] && umbim -n -t 99 -d "$dev" disconnect 2>/dev/null
         sleep 1
         ubus call network.interface."$iface" down 2>/dev/null
         sleep 1
@@ -420,19 +426,19 @@ heal_tier3_cfun_cell_failover() {
         fi
         ubus call network.interface."$iface" up 2>/dev/null
     else
-        # Với Quectel / Fibocom QMI/ECM: Cho phép chu kỳ CFUN 0/1
+        # Với Quectel / Fibocom QMI/ECM: Dùng Airplane mode CFUN 4/1 an toàn thay vì CFUN 0
         ubus call network.interface."$iface" down 2>/dev/null || ifdown "$iface" 2>/dev/null
         sleep 2
         if [ -c "$port" ]; then
             local apn=$(uci -q get network."$iface".apn || echo "v-internet")
             if command -v modem_lock_run >/dev/null 2>&1; then
-                modem_lock_run sh -c "echo 'AT+CFUN=0' | atinout - '$port' -" 2>/dev/null
+                modem_lock_run sh -c "echo 'AT+CFUN=4' | atinout - '$port' -" 2>/dev/null
                 sleep 2
                 modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" 2>/dev/null
                 modem_lock_run sh -c "echo 'AT+CGDCONT=3,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" 2>/dev/null
                 modem_lock_run sh -c "echo 'AT+CFUN=1' | atinout - '$port' -" 2>/dev/null
             elif command -v atinout >/dev/null 2>&1; then
-                echo "AT+CFUN=0" | atinout - "$port" - 2>/dev/null
+                echo "AT+CFUN=4" | atinout - "$port" - 2>/dev/null
                 sleep 2
                 echo "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" | atinout - "$port" - 2>/dev/null
                 echo "AT+CGDCONT=3,\"IPV4V6\",\"$apn\"" | atinout - "$port" - 2>/dev/null
@@ -803,7 +809,7 @@ proactive_rf_health_guard() {
 }
 
 check_silent_pdp_freeze() {
-    local iface="${1:-wwan0}"
+    local iface="${1:-$(get_smart_iface)}"
     local dev=$(cat /tmp/wd_device 2>/dev/null)
     [ -z "$dev" ] || [ ! -d "/sys/class/net/$dev" ] && dev="$iface"
     [ ! -d "/sys/class/net/$dev" ] && return 0

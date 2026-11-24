@@ -489,8 +489,8 @@ check_health_and_heal() {
 
     # Cấp 3 (Lần 3+): Tái khởi động sóng Baseband (CFUN Toggle) chuyển trạm phát mới
     if [ "$fails" -ge 3 ]; then
-        log "🚨 [Cấp 3] Tái tạo kết nối sóng RF (AT+CFUN=0 -> CFUN=1) & Quay số lại toàn diện..."
-        safe_at "$at_port" "AT+CFUN=0" 2 >/dev/null
+        log "🚨 [Cấp 3] Tái tạo kết nối sóng RF (AT+CFUN=4 -> CFUN=1) & Quay số lại toàn diện..."
+        safe_at "$at_port" "AT+CFUN=4" 2 >/dev/null
         sleep 2
         safe_at "$at_port" "AT+CFUN=1" 2 >/dev/null
         sleep 3

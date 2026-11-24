@@ -13,7 +13,7 @@ return network.registerProtocol('duydoan5g', {
 	},
 
 	getIfname: function() {
-		return this._ubus('l3_device') || 'mhi_hwip0';
+		return this._ubus('l3_device') || 'wwan0';
 	},
 
 	getDevice: function() {
