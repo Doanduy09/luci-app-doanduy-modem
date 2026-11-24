@@ -630,22 +630,12 @@ return view.extend({
         if (isWhitelisted) {
             if (simIccidSection) simTabChildren.push(simIccidSection);
             if (scheduleSectionNode) simTabChildren.push(scheduleSectionNode);
-        } else {
-            simTabChildren.push(E('div', {
-                style: 'background: #f8fafc; border: 1.5px dashed #cbd5e1; border-radius: 8px; padding: 14px 18px; margin-bottom: 16px; display: flex; align-items: center; gap: 12px; color: #475569;'
-            }, [
-                E('span', { style: 'font-size: 22px;' }, '🔒'),
-                E('div', {}, [
-                    E('div', { style: 'font-weight: 750; font-size: 13.5px; color: #1e293b; margin-bottom: 3px;' }, 'Chế Độ Bảo Mật Tuyệt Đối (Stealth Mode Active):'),
-                    E('div', { style: 'font-size: 12px; color: #64748b; line-height: 1.5;' }, 'Thẻ SIM đang sử dụng không thuộc danh mục mặc định. Toàn bộ cấu hình quản trị và lịch hẹn giờ gia hạn tự động đã được ẩn hoàn toàn để bảo vệ thiết bị.')
-                ])
-            ]));
         }
 
         var simTabStatusCard = E('div', { style: 'background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;' }, [
                 E('div', {}, [
                     E('span', { style: 'font-weight: 700; color: #475569; font-size: 13px;' }, '📱 Trạng thái SIM: '),
-                    E('span', { style: 'font-weight: 800; color: ' + (isWhitelisted ? '#15803d' : '#475569') + '; font-size: 14px;' }, isWhitelisted ? (smsRes.sim_info || 'SIM Viettel (Hoạt động)') : (hasValidIccid ? 'SIM Ngoài Danh Sách' : 'Chưa gắn SIM / Chưa phát hiện')),
+                    E('span', { style: 'font-weight: 800; color: ' + (hasValidIccid ? '#15803d' : '#475569') + '; font-size: 14px;' }, isWhitelisted ? (smsRes.sim_info || 'SIM Viettel (Hoạt động)') : (hasValidIccid ? (smsRes.sim_info || 'SIM Di Động (Đang hoạt động)') : 'Chưa gắn SIM / Chưa phát hiện')),
                     E('span', { style: 'margin-left: 10px; font-weight: 600; color: #64748b; font-size: 12px;' }, '• Cổng AT: ' + activePort)
                 ]),
                 E('div', { style: 'display: flex; gap: 8px;' }, [

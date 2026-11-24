@@ -382,22 +382,9 @@ append_modem_entry() {
 	local sim_str=""
 	if [ "$mode" = "phone_dhcp" ] || [ "$drv" = "ipheth" ]; then
 		sim_str="USB Tethering (Chia sẻ mạng từ điện thoại)"
-	else
-		local iccid sim_st
-		iccid=$(cat /tmp/sms_current_iccid /tmp/current_sim_iccid /etc/config/active_iccid 2>/dev/null | grep -oE '[0-9]{10,22}' | head -n 1)
-		sim_st=$(cat /tmp/master_sim_status 2>/dev/null)
-		if [ -n "$iccid" ] && [ "${#iccid}" -ge 10 ]; then
-			iccid=$(echo "$iccid" | awk '{print substr($0,1,6) "******" substr($0,length($0)-3)}')
-			case "$sim_st" in
-				VALID) sim_str="$iccid (Hợp lệ / Đang hoạt động)" ;;
-				LOCKED) sim_str="$iccid (Khóa / Ngoài Whitelist)" ;;
-				*) sim_str="$iccid (Đang hoạt động)" ;;
-			esac
-		else
-			sim_str="Đang kiểm tra / Chưa đọc ICCID"
-		fi
 	fi
 
+	[ -n "$C_OP" ] && C_OP=$(printf '%s' "$C_OP" | awk '{out=""; prev=""; for(i=1;i<=NF;i++){if(tolower($i)!=tolower(prev)){out=(out?out" ":"")$i; prev=$i}} print out}')
 	local net_str=""
 	[ -n "$C_OP" ] && net_str="$C_OP"
 	[ -n "$C_RAT" ] && net_str="${net_str:+${net_str} • }${C_RAT}"
@@ -420,7 +407,7 @@ append_modem_entry() {
 			[ -n "$C_TEMP" ] && add_item "Base Information" "Nhiệt độ Modem" "${C_TEMP}°C"
 			[ -n "$traffic_str" ] && add_item "Base Information" "Lưu lượng phiên" "$traffic_str"
 			[ -n "$net_str" ] && add_item "SIM Information" "Nhà mạng & Sóng" "$net_str"
-			add_item "SIM Information" "Thẻ SIM / Chế độ" "$sim_str"
+			add_item "SIM Information" "Chế độ kết nối" "$sim_str"
 			[ -n "$v4" ] && add_item "SIM Information" "Địa chỉ IPv4 WAN" "${v4}/${m4:-30}"
 			[ -n "$v6" ] && add_item "SIM Information" "Địa chỉ IPv6 WAN" "${v6}/${m6:-64}"
 			if [ -n "$C_PCT" ]; then
