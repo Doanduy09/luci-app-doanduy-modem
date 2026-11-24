@@ -44,7 +44,31 @@ if ! grep -q "daily_vip_renew.sh" "$CRON_FILE" 2>/dev/null; then
     /etc/init.d/cron restart 2>/dev/null
 fi
 
-# 4. Tai lai ubus rpcd de LuCI nhan dien toan bo method moi
+# 4. Cau hinh interface duydoan_5g va tuong lua (Firewall Zone WAN)
+uci -q delete network.wwan0
+uci set network.duydoan_5g=interface
+uci set network.duydoan_5g.proto='duydoan5g'
+uci set network.duydoan_5g.apn='v-internet'
+uci commit network
+
+# Vo hieu hoa qmodem auto-dial tranh tranh chap MBIM/QMI tren wwan0
+if [ -f /etc/config/qmodem ]; then
+    uci -q set qmodem.main.enable_dial='0'
+    uci -q set qmodem.0000_01_00_0.enable_dial='0'
+    uci commit qmodem
+fi
+
+# Gan duydoan_5g vao Firewall Zone WAN de NAT masquerade hoat dong 100%
+if [ -f /etc/config/firewall ]; then
+    uci del_list firewall.@zone[1].network='duydoan_5g' 2>/dev/null
+    uci add_list firewall.@zone[1].network='duydoan_5g'
+    uci commit firewall
+fi
+
+# 5. Kich hoat service smart_modem_watchdog voi interface duydoan_5g
+/etc/init.d/smart_modem_watchdog enable 2>/dev/null
+
+# 6. Tai lai ubus rpcd de LuCI nhan dien toan bo method moi
 /etc/init.d/rpcd restart 2>/dev/null
 
 exit 0
