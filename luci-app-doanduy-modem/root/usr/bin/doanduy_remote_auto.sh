@@ -53,22 +53,34 @@ ensure_tailscale_binary() {
 	[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null
 
 	if [ ! -x /usr/sbin/tailscaled ] && [ ! -x /usr/bin/tailscaled ]; then
-		local pkg_f=""
+		local pkg_f="" fetched_tmp=0 avail_kb=0
 		pkg_f=$(ls /tmp/tailscale*.apk /rom/tailscale*.apk /etc/tailscale/tailscale*.apk 2>/dev/null | head -n 1)
 		if [ -z "$pkg_f" ] && command -v apk >/dev/null 2>&1; then
-			apk update >/dev/null 2>&1
-			apk fetch -o /tmp tailscale >/dev/null 2>&1
+			apk update --allow-untrusted >/dev/null 2>&1 || apk update >/dev/null 2>&1
+			apk fetch --allow-untrusted -o /tmp tailscale >/dev/null 2>&1 || apk fetch -o /tmp tailscale >/dev/null 2>&1
 			pkg_f=$(ls /tmp/tailscale*.apk 2>/dev/null | head -n 1)
+			[ -n "$pkg_f" ] && fetched_tmp=1
 		fi
 		if [ -n "$pkg_f" ] && command -v apk >/dev/null 2>&1; then
 			mkdir -p /tmp/ts_ext_tmp
 			apk extract --allow-untrusted --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1
-			[ -f /tmp/ts_ext_tmp/usr/sbin/tailscaled ] && cp -f /tmp/ts_ext_tmp/usr/sbin/tailscaled /usr/sbin/tailscaled
+			avail_kb=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print $4}')
+			if [ -f /tmp/ts_ext_tmp/usr/sbin/tailscaled ]; then
+				if [ "${avail_kb:-0}" -gt 35000 ]; then
+					cp -f /tmp/ts_ext_tmp/usr/sbin/tailscaled /usr/sbin/tailscaled
+				else
+					mkdir -p /tmp/tailscaled_ram
+					cp -f /tmp/ts_ext_tmp/usr/sbin/tailscaled /tmp/tailscaled_ram/tailscaled
+					chmod +x /tmp/tailscaled_ram/tailscaled
+					ln -sf /tmp/tailscaled_ram/tailscaled /usr/sbin/tailscaled
+				fi
+			fi
 			if [ -f /tmp/ts_ext_tmp/usr/sbin/tailscale ] && [ ! -L /tmp/ts_ext_tmp/usr/sbin/tailscale ]; then
-				cp -f /tmp/ts_ext_tmp/usr/sbin/tailscale /usr/sbin/tailscale
+				[ "${avail_kb:-0}" -gt 35000 ] && cp -f /tmp/ts_ext_tmp/usr/sbin/tailscale /usr/sbin/tailscale
 			fi
 			[ -f /tmp/ts_ext_tmp/etc/init.d/tailscale ] && [ ! -f /etc/init.d/tailscale ] && cp -f /tmp/ts_ext_tmp/etc/init.d/tailscale /etc/init.d/tailscale
 			rm -rf /tmp/ts_ext_tmp
+			[ "$fetched_tmp" = "1" ] && rm -f /tmp/tailscale*.apk 2>/dev/null
 		elif command -v opkg >/dev/null 2>&1; then
 			opkg update >/dev/null 2>&1
 			opkg install --nodeps tailscale >/dev/null 2>&1
@@ -80,6 +92,10 @@ ensure_tailscale_binary() {
 	[ -e /usr/sbin/tailscale ] || ln -sf /usr/sbin/tailscaled /usr/sbin/tailscale 2>/dev/null
 	[ -e /usr/bin/tailscale ] || ln -sf /usr/sbin/tailscale /usr/bin/tailscale 2>/dev/null
 	chmod +x /usr/sbin/tailscaled /usr/sbin/tailscale 2>/dev/null
+
+	if [ -f /etc/init.d/tailscale ] && ! grep -q 'userspace-networking' /etc/init.d/tailscale 2>/dev/null; then
+		sed -i '/procd_append_param command --state/a \	if ! [ -d /sys/devices/virtual/misc/tun ] && ! lsmod 2>/dev/null | grep -q '\''^tun '\''; then procd_append_param command --tun=userspace-networking; fi' /etc/init.d/tailscale 2>/dev/null
+	fi
 
 	if [ ! -f /etc/init.d/tailscale ]; then
 		cat << 'TS_INIT_EOF' > /etc/init.d/tailscale
