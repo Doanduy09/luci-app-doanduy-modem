@@ -1,0 +1,15 @@
+#!/bin/sh
+# DOANDUY 5G Universal Modem & Dialer Status CLI
+if command -v ubus >/dev/null 2>&1 && ubus list modem_ctrl >/dev/null 2>&1; then
+	echo "=== THONG TIN MODEM (LIVE) ==="
+	ubus call modem_ctrl info '{}'
+fi
+echo ""
+echo "=== GIAO DIEN QUAY SO ==="
+for iface in $(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p"); do
+	echo "--- Interface: $iface ---"
+	ifstatus "$iface" 2>/dev/null
+done
+echo ""
+echo "=== LOG GAN NHAT ==="
+logread | grep -i duydoan5g | tail -n 15

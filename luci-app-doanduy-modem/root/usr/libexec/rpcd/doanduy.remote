@@ -1,0 +1,173 @@
+#!/bin/sh
+# DOANDUY 5G Universal Remote Access (Tailscale, Safe WAN Port, Tunnel) RPCD Backend
+. /usr/share/libubox/jshn.sh
+
+VAULT_FILE="/etc/config/doanduy_vault"
+SECRETS_FILE="/etc/config/router_secrets.conf"
+PERS_VAULT="/etc/config/personal_vault.conf"
+
+read_tailscale_key() {
+	local val="" f
+	for f in "$VAULT_FILE" "$SECRETS_FILE" "$PERS_VAULT"; do
+		[ -f "$f" ] || continue
+		val=$(awk 'BEGIN{FS="="} {k0=$1; gsub(/^[ \t]+|[ \t]+$/,"",k0); if(k0=="TAILSCALE_AUTH_KEY"){v=substr($0,index($0,"=")+1); gsub(/\r/,"",v)}} END{printf "%s", v}' "$f" 2>/dev/null)
+		case "$val" in \"*\") val="${val#\"}"; val="${val%\"}" ;; \'*\') val="${val#\'}"; val="${val%\'}" ;; esac
+		[ -n "$val" ] && { printf '%s' "$val"; return 0; }
+	done
+}
+
+wan_rule_info() {
+	local rname="$1" def_port="$2" en=0 target="" proto="" port=""
+	target=$(uci -q get "firewall.${rname}.target")
+	en=$(uci -q get "firewall.${rname}.enabled")
+	port=$(uci -q get "firewall.${rname}.dest_port")
+	if [ -n "$target" ] && [ "$target" = "ACCEPT" ] && [ "$en" != "0" ]; then
+		echo "1|${port:-$def_port}"
+	else
+		echo "0|${port:-$def_port}"
+	fi
+}
+
+case "$1" in
+	list)
+		echo '{"status":{},"tailscaleUp":{"authkey":"string","enable_funnel":"boolean"},"tailscaleDown":{},"toggleWanPort":{"service":"string","enable":"boolean","port":"number"},"startTunnel":{"duration":"number"},"stopTunnel":{}}'
+		;;
+	call)
+		read -r input
+		case "$2" in
+			status)
+				ts_inst=0; ts_up=0; ts_ip=""; ts_dns=""; ts_funnel=0
+				if command -v tailscale >/dev/null 2>&1; then
+					ts_inst=1
+					if pidof tailscaled >/dev/null 2>&1; then
+						ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 | tr -d ' \r\n')
+						ts_dns=$(tailscale status --json 2>/dev/null | jsonfilter -e '$.Self.DNSName' 2>/dev/null | sed 's/\.$//')
+						[ -n "$ts_ip" ] && ts_up=1
+						tailscale serve status 2>/dev/null | grep -qi "Funnel on" && ts_funnel=1
+					fi
+				fi
+				cf_inst=0
+				command -v cloudflared >/dev/null 2>&1 && cf_inst=1
+				tun_json=$(/usr/bin/remote_web_tunnel.sh status 2>/dev/null || echo '{"status":"STOPPED"}')
+				tun_st=$(echo "$tun_json" | jsonfilter -e '@.status' 2>/dev/null || echo "STOPPED")
+				tun_url=$(echo "$tun_json" | jsonfilter -e '@.url' 2>/dev/null || echo "")
+				tun_type=$(echo "$tun_json" | jsonfilter -e '@.type' 2>/dev/null || echo "")
+				tun_rem=$(echo "$tun_json" | jsonfilter -e '@.remaining' 2>/dev/null || echo "0")
+
+				luci_r=$(wan_rule_info "doanduy_wan_luci" "80")
+				ssh_r=$(wan_rule_info "doanduy_wan_ssh" "22")
+				ts_key=$(read_tailscale_key)
+
+				json_init
+				json_add_boolean "success" 1
+				json_add_boolean "tailscale_installed" "$ts_inst"
+				json_add_boolean "tailscale_up" "$ts_up"
+				json_add_string "tailscale_ip" "${ts_ip:-}"
+				json_add_string "tailscale_dns" "${ts_dns:-}"
+				json_add_boolean "tailscale_funnel" "$ts_funnel"
+				json_add_boolean "has_tailscale_key" "$([ -n "$ts_key" ] && echo 1 || echo 0)"
+				json_add_boolean "cloudflared_installed" "$cf_inst"
+				json_add_string "tunnel_status" "$tun_st"
+				json_add_string "tunnel_url" "$tun_url"
+				json_add_string "tunnel_type" "$tun_type"
+				json_add_int "tunnel_remaining" "${tun_rem:-0}"
+				json_add_boolean "wan_luci_open" "${luci_r%%|*}"
+				json_add_int "wan_luci_port" "${luci_r#*|}"
+				json_add_boolean "wan_ssh_open" "${ssh_r%%|*}"
+				json_add_int "wan_ssh_port" "${ssh_r#*|}"
+				json_dump
+				;;
+			tailscaleUp)
+				key=$(echo "$input" | jsonfilter -e '$.authkey' 2>/dev/null | tr -d '\r\n"'\'' ')
+				funnel=$(echo "$input" | jsonfilter -e '$.enable_funnel' 2>/dev/null)
+				[ -z "$key" ] && key=$(read_tailscale_key)
+				if ! command -v tailscale >/dev/null 2>&1; then
+					echo '{"success":false,"message":"Router chưa cài đặt gói tailscale! Cài tailscale trước khi bật."}'
+					exit 0
+				fi
+				if [ -n "$key" ]; then
+					mkdir -p /etc/config
+					touch "$VAULT_FILE"
+					sed -i '/^TAILSCALE_AUTH_KEY=/d' "$VAULT_FILE" 2>/dev/null
+					echo "TAILSCALE_AUTH_KEY='$key'" >> "$VAULT_FILE"
+					chmod 600 "$VAULT_FILE"
+				fi
+				/etc/init.d/tailscale enable >/dev/null 2>&1 || true
+				/etc/init.d/tailscale start >/dev/null 2>&1 || true
+				sleep 2
+				set -- up --accept-routes --accept-dns=false
+				[ -n "$key" ] && set -- "$@" "--authkey=$key"
+				timeout 15 tailscale "$@" >/tmp/.ts_up.log 2>&1
+				if [ "$funnel" = "1" ] || [ "$funnel" = "true" ]; then
+					tailscale serve --bg 80 >/dev/null 2>&1 || true
+					tailscale funnel --bg 80 >/dev/null 2>&1 || true
+				fi
+				ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 | tr -d ' \r\n')
+				json_init
+				if [ -n "$ts_ip" ]; then
+					json_add_boolean "success" 1
+					json_add_string "tailscale_ip" "$ts_ip"
+					json_add_string "message" "Đã kết nối Tailscale thành công! IP: $ts_ip"
+				else
+					json_add_boolean "success" 0
+					json_add_string "message" "Chưa lấy được IP Tailscale. Kiểm tra Auth Key hoặc chạy tailscale login trên SSH."
+				fi
+				json_dump
+				;;
+			tailscaleDown)
+				if command -v tailscale >/dev/null 2>&1; then
+					tailscale serve reset >/dev/null 2>&1 || true
+					tailscale down >/dev/null 2>&1 || true
+					/etc/init.d/tailscale stop >/dev/null 2>&1 || true
+				fi
+				echo '{"success":true,"message":"Đã tắt Tailscale an toàn."}'
+				;;
+			toggleWanPort)
+				svc=$(echo "$input" | jsonfilter -e '$.service' 2>/dev/null)
+				en=$(echo "$input" | jsonfilter -e '$.enable' 2>/dev/null)
+				port=$(echo "$input" | jsonfilter -e '$.port' 2>/dev/null | tr -cd '0-9')
+				case "$svc" in
+					luci) rname="doanduy_wan_luci"; label="LuCI Web"; def_p=80 ;;
+					ssh)  rname="doanduy_wan_ssh";  label="SSH";      def_p=22 ;;
+					*) echo '{"success":false,"message":"Dịch vụ không hợp lệ!"}'; exit 0 ;;
+				esac
+				[ -n "$port" ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || port="$def_p"
+				if [ "$en" = "1" ] || [ "$en" = "true" ]; then
+					uci -q set "firewall.${rname}=rule"
+					uci -q set "firewall.${rname}.name=DOANDUY-Allow-${label}-WAN"
+					uci -q set "firewall.${rname}.src=wan"
+					uci -q set "firewall.${rname}.proto=tcp"
+					uci -q set "firewall.${rname}.dest_port=${port}"
+					uci -q set "firewall.${rname}.target=ACCEPT"
+					uci -q set "firewall.${rname}.enabled=1"
+					uci commit firewall
+					/etc/init.d/firewall reload >/dev/null 2>&1
+					json_init
+					json_add_boolean "success" 1
+					json_add_string "message" "Đã MỞ cổng $port ($label) từ WAN."
+					json_dump
+				else
+					uci -q delete "firewall.${rname}"
+					uci commit firewall
+					/etc/init.d/firewall reload >/dev/null 2>&1
+					json_init
+					json_add_boolean "success" 1
+					json_add_string "message" "Đã ĐÓNG cổng $label từ WAN."
+					json_dump
+				fi
+				;;
+			startTunnel)
+				dur=$(echo "$input" | jsonfilter -e '$.duration' 2>/dev/null | tr -cd '0-9')
+				[ -n "$dur" ] || dur=15
+				/usr/bin/remote_web_tunnel.sh start "$dur" 2>/dev/null
+				;;
+			stopTunnel)
+				/usr/bin/remote_web_tunnel.sh stop >/dev/null 2>&1
+				echo '{"success":true,"status":"STOPPED","message":"Đã đóng Remote Tunnel an toàn."}'
+				;;
+			*)
+				echo '{"success":false,"message":"Unknown method"}'
+				;;
+		esac
+		;;
+esac

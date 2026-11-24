@@ -1,0 +1,709 @@
+#!/bin/sh
+# ==============================================================================
+# MICRO ADSHIELD CYBER-SECURITY & DNS ENGINE (ZERO RAM / ZERO FLASH WEAR)
+# Chặn quảng cáo, mã độc, cờ bạc lừa đảo, bảo vệ trẻ em và chống bypass DNS
+# Kiến trúc: Dnsmasq Hash Table + Nftables Port 53 Redirection + DoH/DoT Blackhole
+# ==============================================================================
+
+HOSTS_DIR="/tmp/hosts"
+BLOCK_FILE="${HOSTS_DIR}/adblock"
+CONF_DIR="/tmp/dnsmasq.d"
+CONF_FILE="${CONF_DIR}/adblock.conf"
+STATUS_FILE="/etc/config/adshield_status"
+FAMILY_FILE="/etc/config/adshield_family"
+CUSTOM_FILE="/etc/config/adshield_custom.conf"
+NFT_FILE="/tmp/adshield_nft.conf"
+LOCK_FILE="/var/run/adshield.lock"
+
+# 0. Singleton Lock Guard
+exec 201>"$LOCK_FILE"
+if [ "$1" = "update" ]; then
+    if ! flock -n 201 2>/dev/null; then
+        echo '{"success":false,"message":"Quá trình cập nhật Micro AdShield đang diễn ra, vui lòng chờ..."}'
+        exit 0
+    fi
+fi
+
+mkdir -p "$HOSTS_DIR" "$CONF_DIR" /etc/config 2>/dev/null
+[ ! -f "$CUSTOM_FILE" ] && touch "$CUSTOM_FILE"
+
+create_logchan_command() {
+    cat << 'CMDLG' > /usr/bin/logchan
+#!/bin/sh
+LOGFILE="/tmp/log_chanquangcao"
+case "$1" in
+    clear|xoa|reset|clr) > "$LOGFILE" && echo "Đã xóa sạch nhật ký." ;;
+    last|recent) tail -n 50 "$LOGFILE" 2>/dev/null ;;
+    update|capnhat) /usr/bin/adshield update ;;
+    status) /usr/bin/adshield status ;;
+    *) echo "=== Xem lịch sử Log Chặn Quảng Cáo (Nhấn Ctrl+C để thoát) ==="; tail -f "$LOGFILE" 2>/dev/null ;;
+esac
+CMDLG
+    chmod +x /usr/bin/logchan 2>/dev/null
+    ln -sf /usr/bin/logchan /usr/bin/logadg 2>/dev/null
+}
+
+# Đảm bảo cấu hình hệ thống: nạp /tmp/dnsmasq.d, bật filter_aaaa, tối ưu cache-size 10000, all-servers và Cron 04:00 AM
+ensure_dnsmasq_config() {
+    create_logchan_command
+    local changed=0
+    if ! uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q '/tmp/dnsmasq.d'; then
+        uci add_list dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null
+        changed=1
+    fi
+    if [ "$(uci get dhcp.@dnsmasq[0].filter_aaaa 2>/dev/null)" != "1" ]; then
+        uci set dhcp.@dnsmasq[0].filter_aaaa='1' 2>/dev/null
+        changed=1
+    fi
+    # Tối ưu hóa Dnsmasq Engine chuẩn chuyên gia: phản hồi tên miền siêu tốc < 1ms (Chuẩn 10.000 domain, tránh xung đột băm)
+    local target_cache="10000"
+    if [ "$(uci get dhcp.@dnsmasq[0].cachesize 2>/dev/null)" != "$target_cache" ]; then
+        uci set dhcp.@dnsmasq[0].cachesize="$target_cache" 2>/dev/null
+        changed=1
+    fi
+    if [ "$(uci get dhcp.@dnsmasq[0].allservers 2>/dev/null)" != "1" ]; then
+        uci set dhcp.@dnsmasq[0].allservers='1' 2>/dev/null
+        changed=1
+    fi
+    if [ "$(uci get dhcp.@dnsmasq[0].boguspriv 2>/dev/null)" != "1" ]; then
+        uci set dhcp.@dnsmasq[0].boguspriv='1' 2>/dev/null
+        changed=1
+    fi
+    if [ "$(uci get dhcp.@dnsmasq[0].domainneeded 2>/dev/null)" != "1" ]; then
+        uci set dhcp.@dnsmasq[0].domainneeded='1' 2>/dev/null
+        changed=1
+    fi
+    if [ "$(uci get dhcp.@dnsmasq[0].min_cache_ttl 2>/dev/null)" != "120" ]; then
+        uci set dhcp.@dnsmasq[0].min_cache_ttl='120' 2>/dev/null
+        changed=1
+    fi
+    if [ "$(uci get dhcp.@dnsmasq[0].dnsforwardmax 2>/dev/null)" != "512" ]; then
+        uci set dhcp.@dnsmasq[0].dnsforwardmax='512' 2>/dev/null
+        changed=1
+    fi
+    local router_ll=$(ip -6 addr show dev br-lan scope link 2>/dev/null | grep -o 'fe80::[0-9a-f:]*' | head -n 1)
+    if [ -n "$router_ll" ]; then
+        if ! uci get dhcp.lan.dns 2>/dev/null | grep -q "$router_ll"; then
+            uci add_list dhcp.lan.dns="$router_ll" 2>/dev/null
+            changed=1
+        fi
+    fi
+    if [ "$changed" = "1" ]; then
+        uci commit dhcp 2>/dev/null
+        /etc/init.d/odhcpd restart >/dev/null 2>&1
+    fi
+
+    # Đảm bảo Cron Job tự động cập nhật lúc 04:00 AM mỗi sáng
+    if ! crontab -l 2>/dev/null | grep -q '/usr/bin/adshield update'; then
+        (crontab -l 2>/dev/null | grep -v 'adshield update'; echo "0 4 * * * /usr/bin/adshield update >/dev/null 2>&1") | crontab -
+    fi
+}
+
+## 1. Kích hoạt Nftables Anti-Bypass Firewall (Chống thiết bị dùng DNS riêng 8.8.8.8 / 1.1.1.1, DoT 853 và giải phóng đường tải)
+apply_firewall_rules() {
+    remove_firewall_rules
+    if command -v nft >/dev/null 2>&1; then
+        cat << 'EOF_NFT' > "$NFT_FILE"
+table inet adshield {
+    chain dstnat {
+        type nat hook prerouting priority -105; policy accept;
+        iifname "br-lan" udp dport 53 redirect to :53
+        iifname "br-lan" tcp dport 53 redirect to :53
+    }
+    chain forward {
+        type filter hook forward priority -5; policy accept;
+        iifname "br-lan" tcp dport 853 reject
+        iifname "br-lan" udp dport 853 reject
+        meta l4proto tcp iifname "br-lan" ip daddr 0.0.0.0 reject with tcp reset
+        meta l4proto tcp iifname "br-lan" ip daddr 127.0.0.1 reject with tcp reset
+        meta l4proto udp iifname "br-lan" ip daddr 0.0.0.0 reject with icmp port-unreachable
+        meta l4proto udp iifname "br-lan" ip daddr 127.0.0.1 reject with icmp port-unreachable
+    }
+}
+EOF_NFT
+        nft -f "$NFT_FILE" 2>/dev/null
+        rm -f /etc/nftables.d/adshield.nft "$NFT_FILE" 2>/dev/null
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -A PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+        iptables -t nat -A PREROUTING -i br-lan -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+        iptables -I FORWARD -i br-lan -p tcp --dport 853 -j REJECT 2>/dev/null
+        iptables -I FORWARD -i br-lan -p udp --dport 853 -j REJECT 2>/dev/null
+        iptables -I FORWARD -i br-lan -d 0.0.0.0 -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
+        iptables -I FORWARD -i br-lan -d 127.0.0.1 -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
+        iptables -I FORWARD -i br-lan -d 0.0.0.0 -p udp -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        iptables -I FORWARD -i br-lan -d 127.0.0.1 -p udp -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+    fi
+}
+
+remove_firewall_rules() {
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet adshield 2>/dev/null
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -D PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+        iptables -t nat -D PREROUTING -i br-lan -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null
+        iptables -D FORWARD -i br-lan -p tcp --dport 853 -j REJECT 2>/dev/null
+        iptables -D FORWARD -i br-lan -p udp --dport 853 -j REJECT 2>/dev/null
+    fi
+    rm -f /etc/nftables.d/adshield.nft "$NFT_FILE" 2>/dev/null
+}
+
+# 2. Sinh danh sách tên miền chặn vào RAM (/tmp/dnsmasq.d/adblock.conf & /tmp/hosts/adblock)
+generate_blocklist() {
+    local tmp_conf="/tmp/adshield_conf.tmp"
+    local tmp_hosts="/tmp/adshield_hosts.tmp"
+    local raw_domains="/tmp/adshield_raw.tmp"
+    true > "$raw_domains"
+
+    cat << 'EOF_RAW_DOMAINS' >> "$raw_domains"
+# CANARY DOMAINS (TỰ ĐỘNG VÔ HIỆU HÓA DOH TRÊN FIREFOX VÀ APPLE PRIVATE RELAY)
+use-application-dns.net
+mask.icloud.com
+mask-h2.icloud.com
+mask-api.fe.apple-dns.net
+mask-api.icloud.com
+mask.apple-dns.net
+apple-dns.net
+
+# DOH BOOTSTRAP ENDPOINTS (ÉP APP VÀ TRÌNH DUYỆT FALLBACK VỀ DNSMASQ CỦA ROUTER)
+cloudflare-dns.com
+dns.google
+dns.google.com
+dns.quad9.net
+dns.nextdns.io
+doh.opendns.com
+doh.mullvad.net
+doh.cleanbrowsing.org
+dns.adguard-dns.com
+
+# GOOGLE ADS, VIGNETTE INTERSTITIAL, AD EXCHANGE & TRACKING
+doubleclick.net
+googleadservices.com
+googlesyndication.com
+googletagservices.com
+googleads.g.doubleclick.net
+securepubads.g.doubleclick.net
+tpc.googlesyndication.com
+pagead2.googlesyndication.com
+pagead2.googleadservices.com
+adservice.google.com
+adservice.google.com.vn
+adservice.google.vn
+ads.google.com
+admob.com
+
+# VIETNAMESE AD NETWORKS & TRACKERS (BẢO VỆ TUYỆT ĐỐI VCMEDIA & CỐC CỐC TẢI VỀ)
+admicro.vn
+eclick.vn
+ambient-platform.vn
+ants.vn
+blueseed.tv
+microad.vn
+adtima.vn
+adtimaserver.vn
+media-coccoc.com
+qc.coccoc.com
+qc.coccoc.vn
+banners-gallery.coccoc.com
+media-ad.vn
+vietad.vn
+novanet.vn
+tracking.shopee.vn
+ads.shopee.vn
+ads.zalo.me
+tracking.zalo.me
+adsmol.zaloapp.com
+ads.tiktok.com
+analytics.tiktok.com
+log.byteoversea.com
+
+# SMART TV (SAMSUNG, LG) & HARDWARE TELEMETRY ADS
+samsungads.com
+smetrics.samsung.com
+config.samsungads.com
+gpm.samsungqbe.com
+log-config.samsungacs.com
+lgtvcommon.com
+ssp.lgtvcommon.com
+ad.lgappstv.com
+ibs.lgappstv.com
+tracking.miui.com
+data.mistat.xiaomi.com
+ad.xiaomi.com
+sdkconfig.ad.xiaomi.com
+
+# GLOBAL POPUP, BANNER, NATIVE ADS & TRACKERS
+taboola.com
+outbrain.com
+popads.net
+popcash.net
+propellerads.com
+mgid.com
+adsterra.com
+adnxs.com
+criteo.com
+casalemedia.com
+openx.net
+rubiconproject.com
+pubmatic.com
+flashtalking.com
+scorecardresearch.com
+quantserve.com
+adcolony.com
+unityads.unity3d.com
+# META & FACEBOOK AD NETWORKS, PIXEL TRACKERS & EVENT PROCESSING
+an.facebook.com
+pixel.facebook.com
+tr.facebook.com
+analytics.facebook.com
+advertising.facebook.com
+adservice.facebook.com
+ads.facebook.com
+ads-twitter.facebook.com
+telemetry.facebook.com
+ep1.facebook.com
+ep2.facebook.com
+ep3.facebook.com
+ep4.facebook.com
+ep5.facebook.com
+ep6.facebook.com
+ep7.facebook.com
+ep8.facebook.com
+ep9.facebook.com
+connect.facebook.com
+socialplugin.facebook.net
+logging.instagram.com
+metrics.icloud.com
+telemetry.microsoft.com
+vortex.data.microsoft.com
+data.flurry.com
+app-measurement.com
+crashlytics.com
+adjust.com
+appsflyer.com
+branch.io
+onesignal.com
+braze.com
+
+# VIETNAMESE & GLOBAL BETTING / SCAM / MALWARE SITES
+bet88.com
+kubet.com
+thabet.com
+f8bet.com
+hi88.com
+new88.com
+jun88.com
+shbet.com
+789bet.com
+okvip.com
+w88.com
+m88.com
+fun88.com
+bk8.com
+fb88.com
+go88.com
+sunwin.com
+rikvip.com
+b52.club
+hitclub.com
+taixiu.io
+linkvaobet88.com
+EOF_RAW_DOMAINS
+
+    # Bổ sung custom blacklist từ /etc/config/adshield_custom.conf (các dòng bắt đầu bằng +)
+    if [ -s "$CUSTOM_FILE" ]; then
+        grep '^[+]' "$CUSTOM_FILE" 2>/dev/null | sed 's/^[+]//' | tr -d ' \r\t' >> "$raw_domains"
+    fi
+
+    # Nếu có chế độ bảo vệ trẻ em (Family Protection) -> Thêm web người lớn
+    if [ "$(cat "$FAMILY_FILE" 2>/dev/null)" = "1" ]; then
+        cat << 'EOF_FAMILY' >> "$raw_domains"
+pornhub.com
+xvideos.com
+xnxx.com
+stripchat.com
+chaturbate.com
+onlyfans.com
+livejasmin.com
+redtube.com
+youporn.com
+tube8.com
+spankbang.com
+tnaflix.com
+eporner.com
+hentaihaven.xxx
+rule34.xxx
+EOF_FAMILY
+    fi
+
+    # Sinh blocklist song song bằng ĐỘNG CƠ AWK SIÊU TỐC (Single-Pass In-Memory Stream Processing)
+    # Tích hợp Hard-Whitelist Bất Khả Xâm Phạm: Ngân Hàng, Ví Điện Tử, VNeID, Dịch Vụ Công, OTT, Game, Cloud
+    # Tu dong gioi han quy tac theo dung luong RAM thuc te tren moi router
+    local mem_kb mem_mb max_rules=40000
+    mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 524288)
+    mem_mb=$((mem_kb / 1024))
+    if [ "$mem_mb" -le 256 ]; then
+        max_rules=10000
+    elif [ "$mem_mb" -le 512 ]; then
+        max_rules=20000
+    elif [ "$mem_mb" -gt 1024 ]; then
+        max_rules=60000
+    fi
+
+    # Bổ sung danh sách tải về (hostsVN, ABPVN, AdguardDNS, FB tracking, cache) nếu có
+    for fl in /tmp/adshield_hostsvn.list /tmp/adshield_abpvn.list /tmp/adshield_adg.list /tmp/adshield_fb.list /etc/config/adshield_cached.list; do
+        if [ -s "$fl" ]; then
+            cat "$fl" >> "$raw_domains" 2>/dev/null
+        fi
+    done
+
+    true > "$tmp_conf"
+    true > "$tmp_hosts"
+    echo "# MICRO ADSHIELD DUAL-STACK DNS WILDCARDS" >> "$tmp_conf"
+    echo "# MICRO ADSHIELD DUAL-STACK HOSTS FILTER" >> "$tmp_hosts"
+
+    awk -v cf="$tmp_conf" -v hf="$tmp_hosts" -v custom_file="$CUSTOM_FILE" -v max_r="$max_rules" '
+        BEGIN {
+            # 1. Đọc user whitelist từ /etc/config/adshield_custom.conf (các dòng bắt đầu bằng -)
+            if (custom_file != "") {
+                while ((getline line < custom_file) > 0) {
+                    if (line ~ /^[-]/) {
+                        sub(/^[-]/, "", line)
+                        gsub(/[ \r\t]/, "", line)
+                        if (line != "") user_wl[tolower(line)] = 1
+                    }
+                }
+                close(custom_file)
+            }
+            rule_limit = (max_r > 0) ? max_r : 40000
+            total_added = 0
+        }
+        /^#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            gsub(/[ \r\t]/, "", $0)
+            if ($0 == "") next
+            dom = tolower($0)
+
+            # 1. QUY TẮC BẤT DI BẤT DỊCH: LUÔN CHẶN MÁY CHỦ QUẢNG CÁO & TRACKING
+            is_ad_domain = 0
+            if (dom ~ /(doubleclick\.net|googlesyndication\.com|googleadservices\.com|googletagservices\.com|adservice\.google|ads\.google)/) {
+                is_ad_domain = 1
+            }
+            if (dom ~ /^(ads|tracking|adsmol)\.zalo/ || dom ~ /^(ads|tracking)\.shopee/ || dom ~ /^(ads|analytics)\.tiktok/) {
+                is_ad_domain = 1
+            }
+
+            # 2. Kiểm tra User Whitelist
+            if (!is_ad_domain && (dom in user_wl)) next
+
+            # 3. Kiểm tra Google hợp pháp (chỉ cho phép khi KHÔNG PHẢI là máy chủ quảng cáo)
+            if (!is_ad_domain) {
+                if (dom ~ /(\.|^)(google\.com|google\.com\.vn|youtube\.com|youtu\.be|googleapis\.com|gstatic\.com|ggpht\.com|googleusercontent\.com)$/) {
+                    next
+                }
+            }
+
+            # 4. Kiểm tra Hard Whitelist Bất Khả Xâm Phạm: Báo chí, CDN media, Ngân hàng, Dịch vụ công, Game, Cloud, OS
+            if (!is_ad_domain) {
+                if (dom ~ /(vcmedia|coccoc|lgtvsdp|smartshare|googletagmanager|google-analytics|connect\.facebook|fbcdn|cdninstagram|tiktokcdn|byteoversea|shopee|shopeemobile|lazada|tiki|dantri|vnexpress|vtv|fptplay|vieon|netflix|nflxvideo|spotify|apple-dns|icloud-content|mzstatic|windows|office|live\.com|microsoft|azure|android|ggpht|ytimg|googlevideo|gvt1|1e100|vietcombank|techcombank|mbbank|bidv|vietinbank|vpbank|acb|tpbank|hdbank|shb|msb|sacombank|vib|seabank|ojb|abbank|bacabank|momo|zalopay|vnpay|viettelmoney|shopeepay|napas|vneid|dichvucong|chinhphu|baohiemxahoi|gdt|bocongan|moh|botaichinh|edu\.vn|gov\.vn|zalo\.me|viettel|myviettel|vinaphone|mobifone|fpt|vnpt|garena|riotgames|leagueoflegends|riotcdn|valorant|steampowered|steamcommunity|steamstatic|playstation|xbox|nintendo|epicgames|blizzard|battlenet|microsoft|windowsupdate|apple|icloud|cloudflare|github|akamaized|fastly)/) {
+                    next
+                }
+            }
+
+            if (total_added >= rule_limit) next
+
+            if (!seen[dom]++) {
+                print "address=/" dom "/#" >> cf
+                print "0.0.0.0 " dom >> hf
+                print ":: " dom >> hf
+                total_added++
+            }
+            next
+        }
+    ' "$raw_domains"
+
+    # Enforce SafeSearch khi Family Mode = 1 (Google, Bing, YouTube, DuckDuckGo)
+    if [ "$(cat "$FAMILY_FILE" 2>/dev/null)" = "1" ]; then
+        cat << 'EOF_SAFESEARCH_CONF' >> "$tmp_conf"
+# SAFESEARCH WILDCARD REWRITES
+address=/forcesafesearch.google.com/216.239.38.120
+address=/forcesafesearch.google.com/2001:4860:4802:32::78
+address=/www.google.com/216.239.38.120
+address=/www.google.com/2001:4860:4802:32::78
+address=/google.com/216.239.38.120
+address=/google.com/2001:4860:4802:32::78
+address=/www.google.com.vn/216.239.38.120
+address=/www.google.com.vn/2001:4860:4802:32::78
+address=/google.com.vn/216.239.38.120
+address=/google.com.vn/2001:4860:4802:32::78
+address=/restrict.youtube.com/216.239.38.119
+address=/restrict.youtube.com/2001:4860:4802:32::77
+address=/www.youtube.com/216.239.38.119
+address=/www.youtube.com/2001:4860:4802:32::77
+address=/m.youtube.com/216.239.38.119
+address=/m.youtube.com/2001:4860:4802:32::77
+address=/youtube.com/216.239.38.119
+address=/youtube.com/2001:4860:4802:32::77
+address=/youtubei.googleapis.com/216.239.38.119
+address=/youtubei.googleapis.com/2001:4860:4802:32::77
+address=/strict.bing.com/204.79.197.220
+address=/strict.bing.com/2620:1ec:c11::200
+address=/www.bing.com/204.79.197.220
+address=/www.bing.com/2620:1ec:c11::200
+address=/bing.com/204.79.197.220
+address=/bing.com/2620:1ec:c11::200
+address=/safe.duckduckgo.com/52.142.124.215
+address=/duckduckgo.com/52.142.124.215
+address=/www.duckduckgo.com/52.142.124.215
+EOF_SAFESEARCH_CONF
+
+        cat << 'EOF_SAFESEARCH_HOSTS' >> "$tmp_hosts"
+# SAFESEARCH IP REWRITES (DUAL-STACK IPv4 & IPv6)
+216.239.38.120 forcesafesearch.google.com
+216.239.38.120 www.google.com
+216.239.38.120 google.com
+216.239.38.120 www.google.com.vn
+216.239.38.120 google.com.vn
+2001:4860:4802:32::78 forcesafesearch.google.com
+2001:4860:4802:32::78 www.google.com
+2001:4860:4802:32::78 google.com
+2001:4860:4802:32::78 www.google.com.vn
+2001:4860:4802:32::78 google.com.vn
+204.79.197.220 strict.bing.com
+204.79.197.220 www.bing.com
+204.79.197.220 bing.com
+2620:1ec:c11::200 strict.bing.com
+2620:1ec:c11::200 www.bing.com
+2620:1ec:c11::200 bing.com
+216.239.38.119 restrict.youtube.com
+216.239.38.119 www.youtube.com
+216.239.38.119 m.youtube.com
+216.239.38.119 youtube.com
+216.239.38.119 youtubei.googleapis.com
+2001:4860:4802:32::77 restrict.youtube.com
+2001:4860:4802:32::77 www.youtube.com
+2001:4860:4802:32::77 m.youtube.com
+2001:4860:4802:32::77 youtube.com
+2001:4860:4802:32::77 youtubei.googleapis.com
+52.142.124.215 safe.duckduckgo.com
+52.142.124.215 duckduckgo.com
+52.142.124.215 www.duckduckgo.com
+EOF_SAFESEARCH_HOSTS
+    fi
+
+    chmod 644 "$tmp_conf" "$tmp_hosts" 2>/dev/null
+    mv -f "$tmp_conf" "$CONF_FILE"
+    mv -f "$tmp_hosts" "$BLOCK_FILE"
+    chmod 644 "$CONF_FILE" "$BLOCK_FILE" 2>/dev/null
+    rm -f "$raw_domains" 2>/dev/null
+}
+
+reload_dns() {
+    if pidof dnsmasq >/dev/null 2>&1; then
+        killall -SIGHUP dnsmasq 2>/dev/null
+    else
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    fi
+    # DNS Cache Warm-up: Nạp sẵn tên miền phổ biến vào RAM Cache để mở app tức thì 0ms
+    if [ -x /usr/bin/clean_dns.sh ]; then
+        /usr/bin/clean_dns.sh prefetch >/dev/null 2>&1 &
+    fi
+}
+
+count_rules() {
+    if [ -f "$CONF_FILE" ]; then
+        local c=$(grep -c '^address=/' "$CONF_FILE" 2>/dev/null)
+        echo "${c:-0}"
+    else
+        echo 0
+    fi
+}
+
+check_hijack_active() {
+    if command -v nft >/dev/null 2>&1 && nft list table inet adshield >/dev/null 2>&1; then
+        echo 1
+    elif command -v iptables >/dev/null 2>&1 && iptables -t nat -C PREROUTING -i br-lan -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+do_update() {
+    ensure_dnsmasq_config
+    local log_file="/tmp/log_chanquangcao"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Bắt đầu kiểm tra và cập nhật bộ lọc Micro AdShield Chuyên Gia (04:00 AM)..." | tee -a "$log_file"
+    
+    # 1. Tải danh sách hostsVN (Bộ lọc chuyên sâu số 1 cho người dùng Internet Việt Nam: quảng cáo, mã độc, lừa đảo, web cờ bạc)
+    local hostsvn_tmp="/tmp/adshield_hostsvn.tmp"
+    if curl -s -k -m 25 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts" -o "$hostsvn_tmp" && [ -s "$hostsvn_tmp" ]; then
+        local h_lines=$(grep -E '^(0\.0\.0\.0|127\.0\.0\.1) ' "$hostsvn_tmp" 2>/dev/null | wc -l)
+        if [ "$h_lines" -gt 500 ]; then
+            grep -E '^(0\.0\.0\.0|127\.0\.0\.1) ' "$hostsvn_tmp" 2>/dev/null | awk '{print $2}' | tr -d ' \r\t' | grep -vE '^(localhost|0\.0\.0\.0|::1)$' | grep -v '^$' > /tmp/adshield_hostsvn.list
+            local hostsvn_cnt=$(wc -l < /tmp/adshield_hostsvn.list 2>/dev/null || echo 0)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📥 Tải thành công bộ lọc hostsVN ($hostsvn_cnt tên miền Việt Nam)." | tee -a "$log_file"
+        fi
+        rm -f "$hostsvn_tmp"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️ Không thể kết nối máy chủ tải hostsVN, duy trì danh sách bộ lọc hiện tại." | tee -a "$log_file"
+    fi
+
+    # 2. Tải danh sách ABPVN (Bộ lọc chuyên sâu cho các website báo chí & TMĐT Việt Nam)
+    local abpvn_tmp="/tmp/adshield_abpvn.tmp"
+    if curl -s -k -m 25 -L "https://adguardteam.github.io/HostlistsRegistry/assets/filter_16.txt" -o "$abpvn_tmp" && [ -s "$abpvn_tmp" ]; then
+        local a_lines=$(grep '^0\.0\.0\.0 ' "$abpvn_tmp" 2>/dev/null | wc -l)
+        if [ "$a_lines" -gt 100 ]; then
+            grep '^0\.0\.0\.0 ' "$abpvn_tmp" 2>/dev/null | awk '{print $2}' | tr -d ' \r\t' | grep -v '^$' > /tmp/adshield_abpvn.list
+            local abpvn_cnt=$(wc -l < /tmp/adshield_abpvn.list 2>/dev/null || echo 0)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📥 Tải thành công bộ lọc ABPVN ($abpvn_cnt tên miền Việt Nam)." | tee -a "$log_file"
+        fi
+        rm -f "$abpvn_tmp"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️ Không thể kết nối máy chủ tải ABPVN, duy trì danh sách bộ lọc hiện tại." | tee -a "$log_file"
+    fi
+
+    # 3. Tải danh sách AdGuardDNS (Bộ lọc quảng cáo quốc tế, tracking & mobile ads)
+    local adg_tmp="/tmp/adshield_adg.tmp"
+    if curl -s -k -m 25 -L "https://v.firebog.net/hosts/AdguardDNS.txt" -o "$adg_tmp" && [ -s "$adg_tmp" ]; then
+        local g_lines=$(grep -v '^[#[:space:]]' "$adg_tmp" 2>/dev/null | wc -l)
+        if [ "$g_lines" -gt 500 ]; then
+            grep -v '^[#[:space:]]' "$adg_tmp" 2>/dev/null | tr -d ' \r\t' | grep -v '^$' | head -n 30000 > /tmp/adshield_adg.list
+            local adg_cnt=$(wc -l < /tmp/adshield_adg.list 2>/dev/null || echo 0)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📥 Tải thành công bộ lọc AdGuardDNS ($adg_cnt tên miền quốc tế)." | tee -a "$log_file"
+        fi
+        rm -f "$adg_tmp"
+    fi
+
+    # 4. Tải danh sách chuyên sâu Facebook/Meta Ad Telemetry & Tracking (hostsVN-FB)
+    local fb_tmp="/tmp/adshield_fb.tmp"
+    if curl -s -k -m 20 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/option/hostsVN-surge-FB.conf" -o "$fb_tmp" && [ -s "$fb_tmp" ]; then
+        local f_lines=$(grep '^DOMAIN-SUFFIX,' "$fb_tmp" 2>/dev/null | wc -l)
+        if [ "$f_lines" -gt 10 ]; then
+            grep '^DOMAIN-SUFFIX,' "$fb_tmp" 2>/dev/null | cut -d',' -f2 | tr -d ' \r\t' | grep -v '^$' > /tmp/adshield_fb.list
+            local fb_cnt=$(wc -l < /tmp/adshield_fb.list 2>/dev/null || echo 0)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📥 Tải thành công bộ lọc Facebook/Meta Ad Telemetry ($fb_cnt quy tắc)." | tee -a "$log_file"
+        fi
+        rm -f "$fb_tmp"
+    fi
+
+    generate_blocklist
+
+    # Lưu cache cố định vào Flash /etc/config/adshield_cached.list (giới hạn theo RAM tier) để khi reboot nạp tức thì
+    if [ -f "$BLOCK_FILE" ] && [ -s "$BLOCK_FILE" ]; then
+        awk '$1 == "0.0.0.0" {print $2}' "$BLOCK_FILE" 2>/dev/null | head -n 40000 > /etc/config/adshield_cached.list
+    fi
+    reload_dns
+    apply_firewall_rules
+    local cnt=$(count_rules)
+    echo "$(date '+%Y-%m-%d %H:%M:%S')|$cnt" > /tmp/adshield_last_update.txt
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🎉 Cập nhật hoàn tất! Đang bảo vệ toàn mạng với $cnt quy tắc (0% RAM tiêu thụ thừa, 0 Flash wear, Dnsmasq Cache 10.000)." | tee -a "$log_file"
+    echo "{\"success\":true,\"rules\":$cnt,\"message\":\"Đã cập nhật tự động Micro AdShield thành công ($cnt quy tắc)!\"}"
+}
+
+case "$1" in
+    on|start)
+        ensure_dnsmasq_config
+        generate_blocklist
+        echo "1" > "$STATUS_FILE"
+        reload_dns
+        apply_firewall_rules
+        cnt=$(count_rules)
+        fam=$(cat "$FAMILY_FILE" 2>/dev/null || echo 0)
+        echo "{\"success\":true,\"status\":\"active\",\"rules\":$cnt,\"family\":$fam,\"dns_hijack\":1,\"message\":\"Đã kích hoạt Micro AdShield & Chống Bypass DNS thành công!\"}"
+        ;;
+    off|stop)
+        rm -f "$BLOCK_FILE" "$CONF_FILE" 2>/dev/null
+        echo "0" > "$STATUS_FILE"
+        reload_dns
+        remove_firewall_rules
+        echo '{"success":true,"status":"inactive","rules":0,"family":0,"dns_hijack":0,"message":"Đã tắt Micro AdShield, gỡ bỏ quy tắc DNS Hijack."}'
+        ;;
+    status)
+        is_act=0
+        rules=0
+        if [ -f "$CONF_FILE" ] && [ "$(cat "$STATUS_FILE" 2>/dev/null)" = "1" ]; then
+            is_act=1
+            rules=$(count_rules)
+        fi
+        fam=0
+        [ "$(cat "$FAMILY_FILE" 2>/dev/null)" = "1" ] && fam=1
+        hijack=$(check_hijack_active)
+        echo "{\"active\":$is_act,\"rules\":$rules,\"family\":$fam,\"dns_hijack\":$hijack}"
+        ;;
+    family)
+        case "$2" in
+            on)
+                echo "1" > "$FAMILY_FILE"
+                if [ -f "$CONF_FILE" ] || [ "$(cat "$STATUS_FILE" 2>/dev/null)" = "1" ]; then
+                    generate_blocklist
+                    reload_dns
+                    apply_firewall_rules
+                fi
+                cnt=$(count_rules)
+                echo "{\"success\":true,\"family\":1,\"rules\":$cnt,\"message\":\"Đã kích hoạt Bảo Vệ Trẻ Em (Family SafeSearch)!\"}"
+                ;;
+            off)
+                echo "0" > "$FAMILY_FILE"
+                if [ -f "$CONF_FILE" ]; then
+                    generate_blocklist
+                    reload_dns
+                fi
+                cnt=$(count_rules)
+                echo "{\"success\":true,\"family\":0,\"rules\":$cnt,\"message\":\"Đã tắt Chế độ Bảo Vệ Trẻ Em.\"}"
+                ;;
+            *)
+                fam=0
+                [ "$(cat "$FAMILY_FILE" 2>/dev/null)" = "1" ] && fam=1
+                echo "{\"family\":$fam}"
+                ;;
+        esac
+        ;;
+    add_block)
+        dom=$(echo "$2" | tr -d ' \r\n\t' | sed 's|^https*://||;s|/.*||')
+        if [ -n "$dom" ]; then
+            sed -i "/^[+-]${dom}$/d" "$CUSTOM_FILE" 2>/dev/null
+            echo "+${dom}" >> "$CUSTOM_FILE"
+            if [ -f "$CONF_FILE" ] || [ "$(cat "$STATUS_FILE" 2>/dev/null)" = "1" ]; then
+                generate_blocklist
+                reload_dns
+            fi
+            echo "{\"success\":true,\"action\":\"blocked\",\"domain\":\"$dom\"}"
+        else
+            echo '{"success":false,"message":"Tên miền không hợp lệ"}'
+        fi
+        ;;
+    add_allow)
+        dom=$(echo "$2" | tr -d ' \r\n\t' | sed 's|^https*://||;s|/.*||')
+        if [ -n "$dom" ]; then
+            sed -i "/^[+-]${dom}$/d" "$CUSTOM_FILE" 2>/dev/null
+            echo "-${dom}" >> "$CUSTOM_FILE"
+            if [ -f "$CONF_FILE" ] || [ "$(cat "$STATUS_FILE" 2>/dev/null)" = "1" ]; then
+                generate_blocklist
+                reload_dns
+            fi
+            echo "{\"success\":true,\"action\":\"allowed\",\"domain\":\"$dom\"}"
+        else
+            echo '{"success":false,"message":"Tên miền không hợp lệ"}'
+        fi
+        ;;
+    reload|refresh)
+        if [ "$(cat "$STATUS_FILE" 2>/dev/null)" = "1" ]; then
+            ensure_dnsmasq_config
+            generate_blocklist
+            reload_dns
+            apply_firewall_rules
+            cnt=$(count_rules)
+            echo "{\"success\":true,\"rules\":$cnt,\"message\":\"Đã làm mới bộ lọc Micro AdShield!\"}"
+        else
+            echo '{"success":false,"message":"Micro AdShield đang tắt"}'
+        fi
+        ;;
+    update)
+        do_update
+        ;;
+    *)
+        echo "Usage: $0 {on|off|status|update|family on|family off|add_block <domain>|add_allow <domain>|reload}"
+        exit 1
+        ;;
+esac

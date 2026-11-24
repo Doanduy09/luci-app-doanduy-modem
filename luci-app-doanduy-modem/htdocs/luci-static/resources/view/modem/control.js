@@ -20,15 +20,15 @@ var callGetCellInfo = rpc.declare({ object: 'luci.sms-status', method: 'getCellI
 var callSetCellLock = rpc.declare({ object: 'luci.sms-status', method: 'setCellLock', params: ['action'], expect: { } });
 var callSetCustomSchedule = rpc.declare({ object: 'luci.sms-status', method: 'setCustomSchedule', params: ['datetime'] });
 
-var callChangeIMEI = rpc.declare({ object: 'luci.weather-status', method: 'changeIMEI', params: ['imei', 'brand'] });
+var callChangeIMEI = rpc.declare({ object: 'doanduy.rf', method: 'changeIMEI', params: ['imei', 'brand'] });
 var callSetVipImei = rpc.declare({ object: 'luci.sms-status', method: 'setVipImei', params: ['imei'], expect: { } });
-var callSetTelegramToken = rpc.declare({ object: 'luci.weather-status', method: 'setTelegramToken', params: ['token', 'admin_id', 'owner_name'] });
+var callSetTelegramToken = rpc.declare({ object: 'doanduy.vault', method: 'save', params: ['tg_bot_token', 'tg_admin_id', 'tg_owner_name'] });
 var callGetSentinelConfig = rpc.declare({ object: 'luci.sms-status', method: 'getSentinelConfig', expect: { } });
 var callSetSentinelConfig = rpc.declare({ object: 'luci.sms-status', method: 'setSentinelConfig', params: ['tg_bot_token', 'tg_admin_id', 'tg_owner_name', 'emergency_phone', 'gemini_api_key', 'tailscale_auth_key', 'cloud_remote', 'cam1_rtsp', 'cam2_rtsp', 'cam_cong_rtsp', 'cameras', 'telegram_bots'] });
 var callLoadVaultKeys = rpc.declare({ object: 'luci.sms-status', method: 'loadVaultKeys', expect: { } });
 var callTriggerAITest = rpc.declare({ object: 'luci.device-control', method: 'triggerAITest', params: ['mode', 'cam'] });
 
-var callSetTTL = rpc.declare({ object: 'luci.weather-status', method: 'setTTL', params: ['ttl'] });
+var callSetTTL = rpc.declare({ object: 'doanduy.rf', method: 'setTTL', params: ['ttl'] });
 var callSetCard = rpc.declare({ object: 'luci.weather-status', method: 'setCardMode', params: ['mode', 'iface_name'] });
 var callRenameInterface = rpc.declare({ object: 'luci.sms-status', method: 'renameInterface', params: ['new_name'] });
 

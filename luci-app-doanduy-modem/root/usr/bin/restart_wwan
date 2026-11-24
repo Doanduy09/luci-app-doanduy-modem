@@ -1,0 +1,10 @@
+#!/bin/sh
+# DOANDUY 5G Universal Restart All WWAN Interfaces
+ifaces=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p")
+[ -n "$ifaces" ] || ifaces="duydoan_5g"
+for iface in $ifaces; do
+	echo "Restarting $iface..."
+	ifdown "$iface" 2>/dev/null || true
+	sleep 2
+	ifup "$iface"
+done

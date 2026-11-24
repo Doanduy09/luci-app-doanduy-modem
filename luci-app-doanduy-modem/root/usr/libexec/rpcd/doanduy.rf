@@ -1,0 +1,343 @@
+#!/bin/sh
+# DOANDUY 5G Universal RF, IMEI, TTL & AT Control RPCD Backend
+. /usr/share/libubox/jshn.sh
+
+AT_LOCK="/var/lock/modem_at.lock"
+ORIG_IMEI_FILE="/etc/config/original_imei.dat"
+CUSTOM_TTL_NFT="/etc/nftables.d/10-custom-ttl.nft"
+
+san() {
+	printf '%s' "$1" | tr -d '\047\042\015\012\073\134\140\044' | tr '\000-\037' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//'
+}
+
+find_at_port() {
+	local p="" iface="" dev="" base="" usb_root="" tpath="" cand=""
+	if [ -f /tmp/duydoan5g_modem_meta ]; then
+		. /tmp/duydoan5g_modem_meta 2>/dev/null
+		[ -c "$META_AT_PORT" ] && { echo "$META_AT_PORT"; return 0; }
+	fi
+	for p in "$(cat /tmp/custom_at_port 2>/dev/null)" "$(cat /etc/custom_at_port 2>/dev/null)" "$(cat /tmp/master_sms_port 2>/dev/null)"; do
+		[ -c "$p" ] && { echo "$p"; return 0; }
+	done
+	iface=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p" | head -n 1)
+	[ -n "$iface" ] && dev=$(ubus call "network.interface.${iface}" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	[ -n "$dev" ] && base=$(readlink -f "/sys/class/net/$dev/device" 2>/dev/null)
+	if [ -d "$base" ]; then
+		for rel in "" "/.." "/../.."; do
+			if [ -r "${base}${rel}/idVendor" ]; then
+				usb_root=$(readlink -f "${base}${rel}" 2>/dev/null)
+				break
+			fi
+		done
+	fi
+	if [ -n "$usb_root" ] && [ -d "$usb_root" ]; then
+		for cand in ttyUSB2 ttyUSB3 ttyUSB0 ttyUSB1 ttyACM0 ttyACM1; do
+			tpath=$(find "$usb_root" -maxdepth 4 -name "$cand" 2>/dev/null | head -n 1)
+			[ -n "$tpath" ] && [ -c "/dev/$cand" ] && { echo "/dev/$cand"; return 0; }
+		done
+	fi
+	for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyFMI0 /dev/ttyUSB2 /dev/ttyUSB3 /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyACM0; do
+		[ -c "$p" ] && { echo "$p"; return 0; }
+	done
+	return 1
+}
+
+run_at() {
+	local port="$1" cmd="$2"
+	[ -c "$port" ] && [ -n "$cmd" ] || return 1
+	case "$port" in
+		/dev/wwan*|/dev/mhi*)
+			if [ -x /usr/bin/read_pcie_sms.lua ]; then
+				timeout 4 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && return 0
+			fi
+			if command -v tom_modem >/dev/null 2>&1; then
+				timeout 4 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
+			fi
+			if command -v sms_tool >/dev/null 2>&1; then
+				timeout 4 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
+			fi
+			;;
+		*)
+			if command -v atinout >/dev/null 2>&1; then
+				printf '%s\r\n' "$cmd" | timeout 3 atinout - "$port" - 2>/dev/null && return 0
+			fi
+			if command -v tom_modem >/dev/null 2>&1; then
+				timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
+			fi
+			if command -v sms_tool >/dev/null 2>&1; then
+				timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
+			fi
+			;;
+	esac
+	return 1
+}
+
+get_modem_imei() {
+	local port="$1" out=""
+	out=$(run_at "$port" "AT+CGSN")
+	[ -n "$out" ] || out=$(run_at "$port" "ATI")
+	printf '%s\n' "$out" | grep -oE '[0-9]{15}' | head -n 1
+}
+
+detect_vendor() {
+	local port="$1" hint="$2" ati="$3" vid=""
+	[ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+	vid="$META_USB_VID"
+	if [ -n "$hint" ] && [ "$hint" != "auto" ]; then
+		echo "$hint"
+		return 0
+	fi
+	case "${ati}|${META_VENDOR}|${vid}" in
+		*Sierra*|*EM91*|*EM75*|*sierra*|*1199*) echo "sierra" ;;
+		*Quectel*|*quectel*|*2c7c*) echo "quectel" ;;
+		*Fibocom*|*FIBOCOM*|*FM350*|*FM150*|*fibocom*|*2cb7*|*0e8d*) echo "fibocom" ;;
+		*SIMCOM*|*Simcom*|*simcom*|*1e0e*|*1a0e*) echo "simcom" ;;
+		*MeiG*|*Meig*|*MEIG*|*meig*|*2dee*) echo "meig" ;;
+		*Huawei*|*HUAWEI*|*huawei*|*12d1*|*3466*) echo "huawei" ;;
+		*Telit*|*telit*|*1bc7*) echo "telit" ;;
+		*Neoway*|*neoway*|*3763*) echo "neoway" ;;
+		*Gosuncn*|*gosuncn*|*305a*) echo "gosuncn" ;;
+		*Thales*|*Cinterion*|*thales*|*1e2d*) echo "thales" ;;
+		*) echo "generic" ;;
+	esac
+}
+
+encode_sierra_imei() {
+	local imei="${1}0" c
+	local out="0$(printf '%s' "$imei" | cut -c1)"
+	local i=2
+	while [ "$i" -le 15 ]; do
+		local b=$(printf '%s' "$imei" | cut -c"$i")
+		local a=$(printf '%s' "$imei" | cut -c$((i + 1)))
+		out="${out},${a}${b}"
+		i=$((i + 2))
+	done
+	echo "$out"
+}
+
+get_current_ttl() {
+	if [ -f "$CUSTOM_TTL_NFT" ]; then
+		sed -n 's/.*ip ttl set \([0-9]*\).*/\1/p' "$CUSTOM_TTL_NFT" 2>/dev/null | head -n 1
+		return 0
+	fi
+	sysctl -n net.ipv4.ip_default_ttl 2>/dev/null || echo "64"
+}
+
+case "$1" in
+	list)
+		echo '{"getStatus":{},"changeIMEI":{"imei":"string","brand":"string"},"restoreIMEI":{},"setTTL":{"ttl":"number"},"sendAT":{"cmd":"string","port":"string"}}'
+		;;
+	call)
+		read -r input
+		case "$2" in
+			getStatus)
+				port=$(find_at_port 2>/dev/null || true)
+				[ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+				model="${META_MODEL:-}"
+				vendor="${META_VENDOR:-}"
+				imei="${META_IMEI:-}"
+				if [ -c "$port" ]; then
+					(
+						flock -x -w 4 9 2>/dev/null || exit 1
+						ati=$(run_at "$port" "ATI")
+						[ -z "$imei" ] && imei=$(get_modem_imei "$port")
+						vendor=$(detect_vendor "$port" "auto" "$ati")
+						[ -z "$model" ] && model=$(printf '%s\n' "$ati" | tr -d '\r' | grep -vE '^(ATI|OK|ERROR|Revision:|Manufacturer:|$)' | grep -viE '^(Quectel|Fibocom|Sierra|Simcom|Huawei)$' | head -n 1)
+						cat <<EOF > /tmp/duydoan5g_rf_status.cache
+RF_IMEI='$(san "$imei")'
+RF_VENDOR='$(san "$vendor")'
+RF_MODEL='$(san "$model")'
+EOF
+					) 9>"$AT_LOCK" 2>/dev/null
+					[ -f /tmp/duydoan5g_rf_status.cache ] && . /tmp/duydoan5g_rf_status.cache 2>/dev/null
+					[ -n "$RF_IMEI" ] && imei="$RF_IMEI"
+					[ -n "$RF_VENDOR" ] && vendor="$RF_VENDOR"
+					[ -n "$RF_MODEL" ] && model="$RF_MODEL"
+				fi
+				orig_imei=$(cat "$ORIG_IMEI_FILE" 2>/dev/null | tr -cd '0-9')
+				ttl_val=$(get_current_ttl)
+				ttl_custom=0
+				[ -f "$CUSTOM_TTL_NFT" ] && ttl_custom=1
+
+				json_init
+				json_add_boolean "success" 1
+				json_add_string "imei" "${imei:-}"
+				json_add_string "original_imei" "${orig_imei:-}"
+				json_add_string "vendor" "${vendor:-unknown}"
+				json_add_string "model" "${model:-}"
+				json_add_string "at_port" "${port:-none}"
+				json_add_int "ttl" "${ttl_val:-64}"
+				json_add_boolean "ttl_custom" "$ttl_custom"
+				json_dump
+				;;
+			changeIMEI|restoreIMEI)
+				if [ "$2" = "restoreIMEI" ]; then
+					new_imei=$(cat "$ORIG_IMEI_FILE" 2>/dev/null | tr -cd '0-9')
+					brand_in="auto"
+					[ -n "$new_imei" ] || { echo '{"success":false,"message":"Chưa có bản sao lưu IMEI gốc!"}'; exit 0; }
+				else
+					new_imei=$(echo "$input" | jsonfilter -e '$.imei' 2>/dev/null | tr -cd '0-9')
+					brand_in=$(echo "$input" | jsonfilter -e '$.brand' 2>/dev/null)
+				fi
+				if ! echo "$new_imei" | grep -qE '^[0-9]{15}$'; then
+					echo '{"success":false,"message":"IMEI không hợp lệ! Bắt buộc đúng 15 chữ số."}'
+					exit 0
+				fi
+				port=$(find_at_port 2>/dev/null || true)
+				if [ ! -c "$port" ]; then
+					echo '{"success":false,"message":"Không tìm thấy cổng AT của Modem!"}'
+					exit 0
+				fi
+				[ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+				if echo "${META_MODEL}|$(cat /tmp/master_m_type 2>/dev/null)" | grep -iq "em9191"; then
+					echo '{"success":false,"message":"Modem Sierra EM9191 khóa phần cứng từ nhà mạng, không hỗ trợ đổi IMEI."}'
+					exit 0
+				fi
+
+				touch /tmp/sms_sending.lock
+				res_msg=""
+				ok_flag=0
+				(
+					flock -x -w 8 9 2>/dev/null || exit 1
+					ati=$(run_at "$port" "ATI")
+					brand=$(detect_vendor "$port" "$brand_in" "$ati")
+					old_imei=$(get_modem_imei "$port")
+					if [ ! -s "$ORIG_IMEI_FILE" ] && echo "$old_imei" | grep -qE '^[0-9]{15}$'; then
+						mkdir -p /etc/config
+						echo "$old_imei" > "$ORIG_IMEI_FILE"
+						chmod 600 "$ORIG_IMEI_FILE"
+					fi
+
+					need_reboot=0
+					case "$brand" in
+						quectel)
+							run_at "$port" "AT+QPRTP=1" >/dev/null
+							sleep 1
+							run_at "$port" "AT+EGMR=1,7,\"$new_imei\"" >/dev/null
+							sleep 1
+							[ "$(get_modem_imei "$port")" = "$new_imei" ] || { need_reboot=1; run_at "$port" "AT+CFUN=1,1" >/dev/null; }
+							;;
+						fibocom)
+							run_at "$port" "AT+EGMREXT=1,7,\"$new_imei\"" >/dev/null
+							run_at "$port" "AT+EGMR=1,7,\"$new_imei\"" >/dev/null
+							sleep 1
+							[ "$(get_modem_imei "$port")" = "$new_imei" ] || { need_reboot=1; run_at "$port" "AT+CFUN=15" >/dev/null || run_at "$port" "AT!RESET" >/dev/null; }
+							;;
+						simcom)
+							run_at "$port" "AT+SIMEI=$new_imei" >/dev/null
+							sleep 1
+							[ "$(get_modem_imei "$port")" = "$new_imei" ] || { need_reboot=1; run_at "$port" "AT+CFUN=1,1" >/dev/null; }
+							;;
+						meig)
+							run_at "$port" "AT+MODIMEI=$new_imei" >/dev/null
+							sleep 1
+							[ "$(get_modem_imei "$port")" = "$new_imei" ] || { need_reboot=1; run_at "$port" "AT+CFUN=1,1" >/dev/null; }
+							;;
+						sierra)
+							need_reboot=1
+							hex_sierra=$(encode_sierra_imei "$new_imei")
+							run_at "$port" 'AT!ENTERCND="A710"' >/dev/null
+							run_at "$port" 'AT!IMAGE=0,0' >/dev/null
+							run_at "$port" 'AT!IMAGE=0,1' >/dev/null
+							run_at "$port" 'AT!IMAGE=0' >/dev/null
+							run_at "$port" 'AT!NVRESTORE=0' >/dev/null
+							sleep 1
+							run_at "$port" "AT!NVENCRYPTIMEI=$hex_sierra" >/dev/null
+							sleep 2
+							run_at "$port" 'AT!RESET' >/dev/null
+							;;
+						*)
+							run_at "$port" "AT+EGMR=1,7,\"$new_imei\"" >/dev/null
+							sleep 1
+							[ "$(get_modem_imei "$port")" = "$new_imei" ] || { need_reboot=1; run_at "$port" "AT+CFUN=1,1" >/dev/null; }
+							;;
+					esac
+					rm -f /tmp/duydoan5g_signal_cache_* /tmp/duydoan5g_rf_status.cache 2>/dev/null
+					if [ "$need_reboot" -eq 0 ]; then
+						echo "OK_LIVE|${brand}|${old_imei}" > /tmp/.imei_op_res
+					else
+						echo "OK_REBOOT|${brand}|${old_imei}" > /tmp/.imei_op_res
+					fi
+				) 9>"$AT_LOCK" 2>/dev/null
+				rm -f /tmp/sms_sending.lock
+
+				op_res=$(cat /tmp/.imei_op_res 2>/dev/null)
+				rm -f /tmp/.imei_op_res
+				case "$op_res" in
+					OK_LIVE*)
+						b_lbl=$(echo "$op_res" | cut -d'|' -f2)
+						o_im=$(echo "$op_res" | cut -d'|' -f3)
+						json_init
+						json_add_boolean "success" 1
+						json_add_string "brand" "$b_lbl"
+						json_add_string "message" "Đã đổi IMEI ($b_lbl) sang $new_imei thành công (Cũ: ${o_im:-N/A}). Không cần khởi động lại!"
+						json_dump
+						;;
+					OK_REBOOT*)
+						b_lbl=$(echo "$op_res" | cut -d'|' -f2)
+						o_im=$(echo "$op_res" | cut -d'|' -f3)
+						json_init
+						json_add_boolean "success" 1
+						json_add_string "brand" "$b_lbl"
+						json_add_string "message" "Đã nạp IMEI ($b_lbl) sang $new_imei (Cũ: ${o_im:-N/A}). Modem đang tự khởi động lại để áp dụng..."
+						json_dump
+						;;
+					*)
+						echo '{"success":false,"message":"Cổng AT đang bận hoặc không phản hồi!"}'
+						;;
+				esac
+				;;
+			setTTL)
+				val=$(echo "$input" | jsonfilter -e '$.ttl' 2>/dev/null | tr -cd '0-9')
+				if [ "$val" = "0" ]; then
+					rm -f "$CUSTOM_TTL_NFT" /tmp/custom_ttl.dat /etc/custom_ttl.dat 2>/dev/null
+					sysctl -w net.ipv4.ip_default_ttl=64 >/dev/null 2>&1
+					/etc/init.d/firewall reload >/dev/null 2>&1
+					echo '{"success":true,"ttl":64,"message":"Đã tắt ép TTL, khôi phục TTL mặc định (64)."}'
+				elif [ -n "$val" ] && [ "$val" -ge 1 ] && [ "$val" -le 255 ]; then
+					mkdir -p /etc/nftables.d
+					echo "chain set_custom_ttl { type filter hook postrouting priority 300; policy accept; ip ttl set $val; }" > "$CUSTOM_TTL_NFT"
+					sysctl -w "net.ipv4.ip_default_ttl=$val" >/dev/null 2>&1
+					/etc/init.d/firewall reload >/dev/null 2>&1
+					echo "$val" > /tmp/custom_ttl.dat
+					echo "$val" > /etc/custom_ttl.dat
+					json_init
+					json_add_boolean "success" 1
+					json_add_int "ttl" "$val"
+					json_add_string "message" "Đã ghim TTL = $val thành công!"
+					json_dump
+				else
+					echo '{"success":false,"message":"Giá trị TTL phải từ 1 đến 255 (hoặc 0 để tắt)!"}'
+				fi
+				;;
+			sendAT)
+				cmd=$(echo "$input" | jsonfilter -e '$.cmd' 2>/dev/null | tr -d '\r\n;')
+				req_port=$(echo "$input" | jsonfilter -e '$.port' 2>/dev/null | tr -cd 'a-zA-Z0-9/_-')
+				[ -n "$cmd" ] || cmd="ATI"
+				port="${req_port:-$(find_at_port 2>/dev/null || true)}"
+				if [ ! -c "$port" ]; then
+					echo '{"success":false,"message":"Không tìm thấy cổng AT Modem!"}'
+					exit 0
+				fi
+				out=$(
+					flock -x -w 5 9 2>/dev/null || exit 1
+					run_at "$port" "$cmd"
+				) 9>"$AT_LOCK" 2>/dev/null
+				json_init
+				if [ -n "$out" ]; then
+					json_add_boolean "success" 1
+					json_add_string "port" "$port"
+					json_add_string "response" "$(printf '%s' "$out" | tr -d '\r')"
+				else
+					json_add_boolean "success" 0
+					json_add_string "port" "$port"
+					json_add_string "message" "Modem không phản hồi trên $port."
+				fi
+				json_dump
+				;;
+			*)
+				echo '{"success":false,"message":"Unknown method"}'
+				;;
+		esac
+		;;
+esac

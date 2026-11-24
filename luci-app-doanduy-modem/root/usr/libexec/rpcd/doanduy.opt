@@ -1,0 +1,30 @@
+#!/bin/sh
+# DOANDUY 5G Hardware-Universal Device Optimizer RPCD Backend
+. /usr/share/libubox/jshn.sh
+
+case "$1" in
+	list)
+		echo '{"status":{},"apply":{},"toggleOffload":{"enable":"boolean"},"reset":{}}'
+		;;
+	call)
+		read -r input
+		case "$2" in
+			status)
+				/usr/bin/device_opt.sh status
+				;;
+			apply)
+				/usr/bin/device_opt.sh apply
+				;;
+			toggleOffload)
+				en=$(echo "$input" | jsonfilter -e '$.enable' 2>/dev/null)
+				[ "$en" = "1" ] || [ "$en" = "true" ] && /usr/bin/device_opt.sh offload on || /usr/bin/device_opt.sh offload off
+				;;
+			reset)
+				/usr/bin/device_opt.sh reset
+				;;
+			*)
+				echo '{"success":false,"message":"Unknown method"}'
+				;;
+		esac
+		;;
+esac

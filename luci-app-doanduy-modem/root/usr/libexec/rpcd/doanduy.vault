@@ -1,0 +1,112 @@
+#!/bin/sh
+# DOANDUY 5G Unified Secrets Vault & Telegram RPCD Backend
+. /usr/share/libubox/jshn.sh
+
+VAULT_FILE="/etc/config/doanduy_vault"
+TG_CONF="/etc/config/telegram_bot.conf"
+SECRETS_CONF="/etc/config/router_secrets.conf"
+PERS_CONF="/etc/config/personal_vault.conf"
+
+san() {
+	printf '%s' "$1" | tr -d '\047\042\015\012\073\134\140\044'
+}
+
+read_kv() {
+	[ -f "$1" ] || return 0
+	local v
+	v=$(awk -v k="$2" 'BEGIN{FS="="} {k0=$1; gsub(/^[ \t]+|[ \t]+$/,"",k0); if(k0==k){val=substr($0,index($0,"=")+1); gsub(/\r/,"",val)}} END{printf "%s", val}' "$1" 2>/dev/null)
+	case "$v" in \"*\") v="${v#\"}"; v="${v%\"}" ;; \'*\') v="${v#\'}"; v="${v%\'}" ;; esac
+	printf '%s' "$v"
+}
+
+load_vault_vars() {
+	TG_BOT_TOKEN=""; TG_ADMIN_ID=""; TG_OWNER_NAME=""
+	GEMINI_API_KEY=""; TAILSCALE_AUTH_KEY=""; EMERGENCY_PHONE=""
+	local v=""
+	for f in "$SECRETS_CONF" "$PERS_CONF" "$TG_CONF" "$VAULT_FILE"; do
+		[ -f "$f" ] || continue
+		v=$(read_kv "$f" TG_BOT_TOKEN); [ -n "$v" ] && TG_BOT_TOKEN="$v"
+		v=$(read_kv "$f" TG_ADMIN_ID); [ -n "$v" ] && TG_ADMIN_ID="$v"
+		v=$(read_kv "$f" TG_OWNER_NAME); [ -n "$v" ] && TG_OWNER_NAME="$v"
+		v=$(read_kv "$f" GEMINI_API_KEY); [ -n "$v" ] && GEMINI_API_KEY="$v"
+		v=$(read_kv "$f" TAILSCALE_AUTH_KEY); [ -n "$v" ] && TAILSCALE_AUTH_KEY="$v"
+		v=$(read_kv "$f" EMERGENCY_PHONE); [ -n "$v" ] && EMERGENCY_PHONE="$v"
+	done
+}
+
+case "$1" in
+	list)
+		echo '{"get":{},"save":{"tg_bot_token":"string","tg_admin_id":"string","tg_owner_name":"string","gemini_api_key":"string","tailscale_auth_key":"string","emergency_phone":"string"},"testTelegram":{}}'
+		;;
+	call)
+		read -r input
+		case "$2" in
+			get)
+				load_vault_vars
+				json_init
+				json_add_boolean "success" 1
+				json_add_string "tg_bot_token" "$(san "$TG_BOT_TOKEN")"
+				json_add_string "tg_admin_id" "$(san "$TG_ADMIN_ID")"
+				json_add_string "tg_owner_name" "$(san "$TG_OWNER_NAME")"
+				json_add_string "gemini_api_key" "$(san "$GEMINI_API_KEY")"
+				json_add_string "tailscale_auth_key" "$(san "$TAILSCALE_AUTH_KEY")"
+				json_add_string "emergency_phone" "$(san "$EMERGENCY_PHONE")"
+				json_dump
+				;;
+			save)
+				load_vault_vars
+				v_tok=$(echo "$input" | jsonfilter -e '$.tg_bot_token' 2>/dev/null)
+				v_id=$(echo "$input" | jsonfilter -e '$.tg_admin_id' 2>/dev/null)
+				v_own=$(echo "$input" | jsonfilter -e '$.tg_owner_name' 2>/dev/null)
+				v_gem=$(echo "$input" | jsonfilter -e '$.gemini_api_key' 2>/dev/null)
+				v_ts=$(echo "$input" | jsonfilter -e '$.tailscale_auth_key' 2>/dev/null)
+				v_ph=$(echo "$input" | jsonfilter -e '$.emergency_phone' 2>/dev/null)
+
+				[ -n "$v_tok" ] && TG_BOT_TOKEN="$v_tok"
+				[ -n "$v_id" ] && TG_ADMIN_ID="$v_id"
+				[ -n "$v_own" ] && TG_OWNER_NAME="$v_own"
+				[ -n "$v_gem" ] && GEMINI_API_KEY="$v_gem"
+				[ -n "$v_ts" ] && TAILSCALE_AUTH_KEY="$v_ts"
+				[ -n "$v_ph" ] && EMERGENCY_PHONE="$v_ph"
+
+				mkdir -p /etc/config
+				cat <<EOF > "$VAULT_FILE"
+TG_BOT_TOKEN='$(san "$TG_BOT_TOKEN")'
+TG_ADMIN_ID='$(san "$TG_ADMIN_ID")'
+TG_OWNER_NAME='$(san "$TG_OWNER_NAME")'
+GEMINI_API_KEY='$(san "$GEMINI_API_KEY")'
+TAILSCALE_AUTH_KEY='$(san "$TAILSCALE_AUTH_KEY")'
+EMERGENCY_PHONE='$(san "$EMERGENCY_PHONE")'
+EOF
+				cat <<EOF > "$TG_CONF"
+TG_BOT_TOKEN="$(san "$TG_BOT_TOKEN")"
+TG_ADMIN_ID="$(san "$TG_ADMIN_ID")"
+TG_OWNER_NAME="$(san "$TG_OWNER_NAME")"
+EOF
+				chmod 600 "$VAULT_FILE" "$TG_CONF"
+				sync
+				echo '{"success":true,"message":"Đã lưu toàn bộ Key & Token vào Vault an toàn!"}'
+				;;
+			testTelegram)
+				load_vault_vars
+				if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_ADMIN_ID" ]; then
+					echo '{"success":false,"message":"Chưa nhập Telegram Bot Token hoặc Chat ID!"}'
+					exit 0
+				fi
+				model=$(cat /tmp/sysinfo/model 2>/dev/null || uname -n)
+				nl_msg="🆘 <b>CẢNH BÁO KHẨN: KIỂM TRA KẾT NỐI ROUTER</b>
+Router: <b>${model}</b>
+Trạng thái: Vault Telegram hoạt động bình thường!"
+				res=$(/usr/bin/send_telegram "$nl_msg" 2>/dev/null)
+				if echo "$res" | grep -q '"ok":true'; then
+					echo '{"success":true,"message":"Đã gửi tin nhắn thử tới Telegram thành công!"}'
+				else
+					echo '{"success":false,"message":"Gửi Telegram thất bại! Kiểm tra lại Bot Token, Chat ID và kết nối mạng."}'
+				fi
+				;;
+			*)
+				echo '{"success":false,"message":"Unknown method"}'
+				;;
+		esac
+		;;
+esac

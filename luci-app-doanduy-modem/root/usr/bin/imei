@@ -1,0 +1,7 @@
+#!/bin/sh
+# DOANDUY 5G Universal IMEI CLI Wrapper
+if [ -n "$1" ]; then
+	ubus call doanduy.rf changeIMEI "{\"imei\":\"$1\",\"brand\":\"${2:-auto}\"}"
+else
+	ubus call doanduy.rf getStatus '{}'
+fi

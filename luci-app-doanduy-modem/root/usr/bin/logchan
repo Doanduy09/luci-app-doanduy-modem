@@ -1,0 +1,9 @@
+#!/bin/sh
+LOGFILE="/tmp/log_chanquangcao"
+case "$1" in
+	clear|xoa|reset|clr) > "$LOGFILE" && echo "Đã xóa sạch nhật ký." ;;
+	last|recent) tail -n 50 "$LOGFILE" 2>/dev/null ;;
+	update|capnhat) /usr/bin/adshield update ;;
+	status) /usr/bin/adshield status ;;
+	*) echo "=== Nhật ký Micro AdShield ==="; tail -n 30 "$LOGFILE" 2>/dev/null; /usr/bin/adshield status ;;
+esac

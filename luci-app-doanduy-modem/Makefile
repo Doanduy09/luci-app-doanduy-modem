@@ -22,6 +22,12 @@ define Package/$(PKG_NAME)/conffiles
 /etc/config/sentinel_cameras.conf
 /etc/config/allowed_iccids.dat
 /etc/config/default_sim_iccid
+/etc/config/doanduy_vault
+/etc/config/telegram_bot.conf
+/etc/config/original_imei.dat
+/etc/config/adshield_status
+/etc/config/adshield_family
+/etc/config/adshield_custom.conf
 endef
 
 include $(TOPDIR)/feeds/luci/luci.mk

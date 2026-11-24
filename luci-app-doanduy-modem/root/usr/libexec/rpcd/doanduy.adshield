@@ -1,0 +1,68 @@
+#!/bin/sh
+# DOANDUY 5G Micro AdShield & Clean DNS RPCD Backend
+. /usr/share/libubox/jshn.sh
+
+build_status() {
+	local raw active=0 rules=0 fam=0 hijack=0 cdns=0
+	if [ -x /usr/bin/adshield ]; then
+		raw=$(/usr/bin/adshield status 2>/dev/null)
+		active=$(echo "$raw" | jsonfilter -e '@.active' 2>/dev/null || echo 0)
+		rules=$(echo "$raw" | jsonfilter -e '@.rules' 2>/dev/null || echo 0)
+		fam=$(echo "$raw" | jsonfilter -e '@.family' 2>/dev/null || echo 0)
+		hijack=$(echo "$raw" | jsonfilter -e '@.dns_hijack' 2>/dev/null || echo 0)
+	fi
+	[ -x /usr/bin/clean_dns.sh ] && [ "$(/usr/bin/clean_dns.sh status 2>/dev/null)" = "ACTIVE" ] && cdns=1
+	json_init
+	json_add_boolean "success" 1
+	json_add_boolean "active" "${active:-0}"
+	json_add_int "rules" "${rules:-0}"
+	json_add_boolean "family" "${fam:-0}"
+	json_add_boolean "dns_hijack" "${hijack:-0}"
+	json_add_boolean "clean_dns" "$cdns"
+	json_dump
+}
+
+case "$1" in
+	list)
+		echo '{"status":{},"toggle":{"action":"string"},"family":{"action":"string"},"update":{},"addBlock":{"domain":"string"},"addAllow":{"domain":"string"},"cleanDns":{"action":"string"}}'
+		;;
+	call)
+		read -r input
+		case "$2" in
+			status)
+				build_status
+				;;
+			toggle)
+				act=$(echo "$input" | jsonfilter -e '$.action' 2>/dev/null)
+				[ "$act" = "off" ] || act="on"
+				/usr/bin/adshield "$act" 2>/dev/null
+				;;
+			family)
+				act=$(echo "$input" | jsonfilter -e '$.action' 2>/dev/null)
+				[ "$act" = "on" ] || act="off"
+				/usr/bin/adshield family "$act" 2>/dev/null
+				;;
+			update)
+				/usr/bin/adshield update >/dev/null 2>&1 &
+				echo '{"success":true,"message":"Đang tải và cập nhật bộ lọc hostsVN / ABPVN / AdGuardDNS trong nền... Vui lòng làm mới sau 10 giây."}'
+				;;
+			addBlock)
+				dom=$(echo "$input" | jsonfilter -e '$.domain' 2>/dev/null | tr -cd 'a-zA-Z0-9._-')
+				[ -n "$dom" ] && /usr/bin/adshield add_block "$dom" 2>/dev/null || echo '{"success":false,"message":"Tên miền không hợp lệ!"}'
+				;;
+			addAllow)
+				dom=$(echo "$input" | jsonfilter -e '$.domain' 2>/dev/null | tr -cd 'a-zA-Z0-9._-')
+				[ -n "$dom" ] && /usr/bin/adshield add_allow "$dom" 2>/dev/null || echo '{"success":false,"message":"Tên miền không hợp lệ!"}'
+				;;
+			cleanDns)
+				act=$(echo "$input" | jsonfilter -e '$.action' 2>/dev/null)
+				[ "$act" = "off" ] || act="on"
+				/usr/bin/clean_dns.sh "$act" >/dev/null 2>&1
+				build_status
+				;;
+			*)
+				echo '{"success":false,"message":"Unknown method"}'
+				;;
+		esac
+		;;
+esac

@@ -1,0 +1,78 @@
+{
+	"admin/modem": {
+		"title": "Modem 5G",
+		"order": 18,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-doanduy-modem" ]
+		}
+	},
+	"admin/modem/control": {
+		"title": "SIM, SMS & Sóng 5G",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "modem/control"
+		},
+		"depends": {
+			"acl": [ "luci-app-doanduy-modem" ]
+		}
+	},
+	"admin/modem/imei": {
+		"title": "Đổi IMEI, TTL & AT",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "modem/imei"
+		},
+		"depends": {
+			"acl": [ "luci-app-doanduy-modem" ]
+		}
+	},
+	"admin/modem/adshield": {
+		"title": "Chặn Quảng Cáo & DNS",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "modem/adshield"
+		},
+		"depends": {
+			"acl": [ "luci-app-doanduy-modem" ]
+		}
+	},
+	"admin/modem/remote": {
+		"title": "Kết Nối Từ Xa & Tailscale",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "modem/remote"
+		},
+		"depends": {
+			"acl": [ "luci-app-doanduy-modem" ]
+		}
+	},
+	"admin/modem/vault": {
+		"title": "Kho Key, Token & Telegram",
+		"order": 5,
+		"action": {
+			"type": "view",
+			"path": "modem/vault"
+		},
+		"depends": {
+			"acl": [ "luci-app-doanduy-modem" ]
+		}
+	},
+	"admin/modem/optimize": {
+		"title": "Tối Ưu Thiết Bị",
+		"order": 6,
+		"action": {
+			"type": "view",
+			"path": "modem/optimize"
+		},
+		"depends": {
+			"acl": [ "luci-app-doanduy-modem" ]
+		}
+	}
+}

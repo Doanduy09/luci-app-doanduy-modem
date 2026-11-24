@@ -1,0 +1,175 @@
+#!/bin/sh
+trap 'wait -n 2>/dev/null' CHLD
+read_kv() {
+    [ -f "$1" ] || return 0
+    local v
+    v=$(awk -v k="$2" 'BEGIN{FS="="} {k0=$1; gsub(/^[ \t]+|[ \t]+$/,"",k0); if(k0==k){val=substr($0,index($0,"=")+1); gsub(/\r/,"",val)}} END{printf "%s", val}' "$1" 2>/dev/null)
+    case "$v" in \"*\") v="${v#\"}"; v="${v%\"}" ;; \'*\') v="${v#\'}"; v="${v%\'}" ;; esac
+    printf '%s' "$v"
+}
+BOT_TOKEN=""
+ADMIN_CHAT_ID=""
+TG_BOT_TOKEN=""
+TG_ADMIN_ID=""
+TG_AUTODEL=""
+for _cf in /etc/config/router_secrets.conf /etc/config/personal_vault.conf /etc/config/telegram_bot.conf /etc/config/doanduy_vault; do
+    if [ -f "$_cf" ]; then
+        _v=$(read_kv "$_cf" TG_BOT_TOKEN); [ -n "$_v" ] && TG_BOT_TOKEN="$_v"
+        _v=$(read_kv "$_cf" TG_ADMIN_ID); [ -n "$_v" ] && TG_ADMIN_ID="$_v"
+        _v=$(read_kv "$_cf" TG_AUTODEL); [ -n "$_v" ] && TG_AUTODEL="$_v"
+    fi
+done
+[ -n "$TG_BOT_TOKEN" ] && BOT_TOKEN="$TG_BOT_TOKEN"
+[ -n "$TG_ADMIN_ID" ] && ADMIN_CHAT_ID="$TG_ADMIN_ID"
+msg="$1"
+markup="$2"
+autodel="${3:-$TG_AUTODEL}"
+[ -z "$msg" ] || [ -z "$ADMIN_CHAT_ID" ] || [ -z "$BOT_TOKEN" ] && exit 0
+
+# 🌙 CHẾ ĐỘ YÊN TĨNH BAN ĐÊM (23:00 - 06:59): Không gửi báo cáo định kỳ làm phiền giấc ngủ
+cur_hour=$(date +%H 2>/dev/null || echo 12)
+if [ "$cur_hour" -ge 23 ] || [ "$cur_hour" -lt 7 ]; then
+    if ! echo "$msg" | grep -qE '(CẢNH BÁO KHẨN|SOS|BÁO ĐỘNG|XÂM NHẬP|CHÁY NỔ|QUÁ NHIỆT|NGUY HIỂM)'; then
+        exit 0
+    fi
+fi
+
+# 🛡️ CHỐNG TRÙNG LẶP TIN NHẮN (DEDUPLICATION HASH FILTER):
+text_hash=$(echo -n "$msg" | md5sum 2>/dev/null | awk '{print $1}')
+if [ -n "$text_hash" ]; then
+    hash_file="/tmp/tg_hash_${text_hash}"
+    if [ -f "$hash_file" ]; then
+        now_s=$(date +%s)
+        file_s=$(date -r "$hash_file" +%s 2>/dev/null || stat -c %Y "$hash_file" 2>/dev/null || echo 0)
+        if [ $((now_s - file_s)) -lt 1800 ]; then
+            exit 0
+        fi
+    fi
+    touch "$hash_file" 2>/dev/null
+    find /tmp -maxdepth 1 -name "tg_hash_*" -mmin +60 -delete 2>/dev/null &
+fi
+
+check_rate_limit() {
+    local now=$(date +%s)
+    local ban_until=$(cat /tmp/tg_rate_limit_until.ts 2>/dev/null || echo 0)
+    if [ "$now" -lt "$ban_until" ] 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+record_rate_limit() {
+    local resp="$1"
+    if echo "$resp" | grep -q '"error_code":429'; then
+        local r_sec=$(echo "$resp" | jsonfilter -e '$.parameters.retry_after' 2>/dev/null || echo 15)
+        [ -z "$r_sec" ] || [ "$r_sec" -lt 2 ] 2>/dev/null && r_sec=15
+        local now=$(date +%s)
+        local until=$((now + r_sec + 2))
+        echo "$until" > /tmp/tg_rate_limit_until.ts
+        return 1
+    fi
+    return 0
+}
+
+if ! check_rate_limit; then
+    exit 0
+fi
+
+pfile="/tmp/.tg_send_$$.txt"
+lua - "$ADMIN_CHAT_ID" "$msg" "${markup:-}" "$pfile" << 'LUAPOST' 2>/dev/null
+local cid, text, markup, outpath = arg[1], arg[2], arg[3], arg[4]
+text = text or ''
+text = string.gsub(text, '\\n', '\n')
+text = string.gsub(text, '\r', '')
+
+local function sanitize_tg_html(s)
+    if not s or #s == 0 then return "" end
+    local tags, counter = {}, 0
+    local p = s:gsub("<(/?)([a-zA-Z0-9_-]+)([^>]*)>", function(slash, tag, attrs)
+        local t = tag:lower()
+        if t == "b" or t == "strong" or t == "i" or t == "em" or t == "u" or t == "ins" or
+           t == "s" or t == "strike" or t == "del" or t == "code" or t == "pre" or
+           t == "a" or t == "tg-spoiler" or t == "blockquote" then
+            counter = counter + 1
+            local ph = "\001TAG" .. counter .. "\002"
+            tags[ph] = "<" .. slash .. tag .. attrs .. ">"
+            return ph
+        end
+        return "&lt;" .. slash .. tag .. attrs .. "&gt;"
+    end)
+    p = p:gsub("&", "&amp;"):gsub("&amp;([a-zA-Z0-9]+);", "&%1;")
+    p = p:gsub("<", "&lt;"):gsub(">", "&gt;")
+    for ph, tag in pairs(tags) do p = p:gsub(ph, tag) end
+    if #p > 4000 then p = p:sub(1, 3950) .. "..." end
+    return p
+end
+
+text = sanitize_tg_html(text)
+local enc = (string.gsub(text, '([^%w_.~-])', function(c)
+    return string.format('%%%02X', string.byte(c))
+end))
+local post_data = 'chat_id=' .. cid .. '&parse_mode=HTML&text=' .. enc
+if markup and #markup > 0 and markup:match('^%s*{') then
+    local enc_markup = (string.gsub(markup, '([^%w_.~-])', function(c)
+        return string.format('%%%02X', string.byte(c))
+    end))
+    post_data = post_data .. '&reply_markup=' .. enc_markup
+end
+local f = io.open(outpath, 'w')
+if f then
+    f:write(post_data)
+    f:close()
+end
+LUAPOST
+
+res=""
+if command -v curl >/dev/null 2>&1; then
+    res=$(curl -s -m 8 -d @"$pfile" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+else
+    res=$(uclient-fetch -q -O - --no-check-certificate --timeout=8 --post-file="$pfile" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+fi
+rm -f "$pfile" 2>/dev/null
+record_rate_limit "$res"
+
+if ! echo "$res" | grep -q '"ok":true'; then
+    check_rate_limit || exit 0
+    plain_text=$(echo "$msg" | sed 's/<[^>]*>/ /g' | tr -s ' ' | cut -c 1-4000)
+    pfile_fb="/tmp/.tg_send_fb_$$.txt"
+    lua - "$ADMIN_CHAT_ID" "$plain_text" "${markup:-}" "$pfile_fb" << 'LUAFB' 2>/dev/null
+local cid, text, markup, outpath = arg[1], arg[2], arg[3], arg[4]
+text = text or ''
+local enc = (string.gsub(text, '([^%w_.~-])', function(c) return string.format('%%%02X', string.byte(c)) end))
+local post_data = 'chat_id=' .. cid .. '&text=' .. enc
+if markup and #markup > 0 and markup:match('^%s*{') then
+    local enc_markup = (string.gsub(markup, '([^%w_.~-])', function(c) return string.format('%%%02X', string.byte(c)) end))
+    post_data = post_data .. '&reply_markup=' .. enc_markup
+end
+local f = io.open(outpath, 'w')
+if f then f:write(post_data); f:close() end
+LUAFB
+    if command -v curl >/dev/null 2>&1; then
+        res=$(curl -s -m 8 -d @"$pfile_fb" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+    else
+        res=$(uclient-fetch -q -O - --no-check-certificate --timeout=8 --post-file="$pfile_fb" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+    fi
+    rm -f "$pfile_fb" 2>/dev/null
+    record_rate_limit "$res"
+fi
+
+msg_id=$(echo "$res" | jsonfilter -e '$.result.message_id' 2>/dev/null)
+[ -z "$msg_id" ] && msg_id=$(echo "$res" | sed -n 's/.*"message_id":[ ]*\([0-9]*\).*/\1/p')
+
+if [ -n "$autodel" ] && [ "$autodel" -gt 0 ] 2>/dev/null && [ -n "$msg_id" ]; then
+    (
+        sleep "$autodel"
+        if [ -x /usr/bin/delete_telegram ]; then
+            /usr/bin/delete_telegram "$msg_id" "$ADMIN_CHAT_ID" >/dev/null 2>&1
+        elif command -v curl >/dev/null 2>&1; then
+            curl -s -m 6 -d "chat_id=${ADMIN_CHAT_ID}&message_id=${msg_id}" "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" >/dev/null 2>&1
+        else
+            uclient-fetch -q -O - --no-check-certificate --timeout=6 --post-data="chat_id=${ADMIN_CHAT_ID}&message_id=${msg_id}" "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" >/dev/null 2>&1
+        fi
+    ) >/dev/null 2>&1 &
+fi
+
+echo "$res"

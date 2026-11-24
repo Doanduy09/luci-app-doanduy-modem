@@ -5,18 +5,28 @@
 			"ubus": {
 				"luci.sms-status": [ "*" ],
 				"modem_ctrl": [ "*" ],
+				"doanduy.rf": [ "*" ],
+				"doanduy.adshield": [ "*" ],
+				"doanduy.remote": [ "*" ],
+				"doanduy.vault": [ "*" ],
+				"doanduy.opt": [ "*" ],
 				"network.interface": [ "dump", "status" ],
 				"uci": [ "get", "changes" ]
 			},
-			"uci": [ "network", "system" ]
+			"uci": [ "network", "system", "firewall", "dhcp" ]
 		},
 		"write": {
 			"ubus": {
 				"luci.sms-status": [ "*" ],
 				"modem_ctrl": [ "*" ],
+				"doanduy.rf": [ "*" ],
+				"doanduy.adshield": [ "*" ],
+				"doanduy.remote": [ "*" ],
+				"doanduy.vault": [ "*" ],
+				"doanduy.opt": [ "*" ],
 				"uci": [ "set", "commit", "apply" ]
 			},
-			"uci": [ "network", "system" ]
+			"uci": [ "network", "system", "firewall", "dhcp" ]
 		}
 	}
 }
