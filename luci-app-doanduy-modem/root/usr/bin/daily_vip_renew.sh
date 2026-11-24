@@ -30,6 +30,7 @@ done
 
 port=$(cat /tmp/master_sms_port 2>/dev/null)
 [ -z "$port" ] || [ ! -c "$port" ] && port=$(cat /tmp/custom_at_port 2>/dev/null)
+[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/wwan0at0" ] && port="/dev/wwan0at0"
 [ -z "$port" ] || [ ! -c "$port" ] && port="/dev/ttyUSB0"
 [ ! -c "$port" ] && [ -c "/dev/ttyUSB2" ] && port="/dev/ttyUSB2"
 

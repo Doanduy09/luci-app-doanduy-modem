@@ -45,6 +45,7 @@ if ! grep -q "daily_vip_renew.sh" "$CRON_FILE" 2>/dev/null; then
 fi
 
 # 4. Cau hinh interface duydoan_5g va tuong lua (Firewall Zone WAN)
+touch /etc/config/.wwan_custom_setup_done 2>/dev/null
 uci -q delete network.wwan0
 uci set network.duydoan_5g=interface
 uci set network.duydoan_5g.proto='duydoan5g'
