@@ -246,11 +246,11 @@ warm_reset_wwan_baseband() {
         (
             flock -x -w 5 200 || exit 0
             if echo "$m_type" | grep -iqE "sierra|1199:" || lspci 2>/dev/null | grep -iqE "17cb:0306|sdx55"; then
-                printf 'AT!RESET\r\n' | atinout - "$port" - >/dev/null 2>&1 || printf 'AT+CFUN=1,1\r\n' | atinout - "$port" - >/dev/null 2>&1
+                timeout 3 sh -c "printf 'AT!RESET\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
             elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
-                printf 'AT+CFUN=15\r\n' | atinout - "$port" - >/dev/null 2>&1 || printf 'AT+CFUN=1,1\r\n' | atinout - "$port" - >/dev/null 2>&1
+                timeout 3 sh -c "printf 'AT+CFUN=15\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
             else
-                printf 'AT+CFUN=1,1\r\n' | atinout - "$port" - >/dev/null 2>&1
+                timeout 3 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
             fi
         ) 200>/var/lock/modem_at.lock
     fi
@@ -853,6 +853,7 @@ while true; do
             SLEEP_INTERVAL=20
         fi
         proactive_rf_health_guard
+        killall -CONT quectel-CM-M quectel-CM 2>/dev/null # Heartbeat safety to prevent orphan SIGSTOP
 
         # TRAFFIC-AWARE PROACTIVE 48H WWAN PURGE & PDP RENEWAL (03:30 - 04:30 AM)
         cur_hm=$(date +%H%M 2>/dev/null || echo "1200")
