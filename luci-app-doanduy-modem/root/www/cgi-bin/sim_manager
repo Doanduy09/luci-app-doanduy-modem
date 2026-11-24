@@ -1,7 +1,7 @@
 #!/usr/bin/lua
 -- ==============================================================================
 -- [QUY CHUAN AN TOAN BAT BIEN CHO ANH DUY - BAO MAT SMS 100%]
--- 1. MAC DINH DUY NHAT 3 ICCID VIP DUOC PHEP LEN LICH GUI SMS VA GIA HAN GOI CUOC.
+-- 1. MAC DINH DUY NHAT 3 ICCID HOP LE DUOC PHEP LEN LICH GUI SMS VA GIA HAN GOI CUOC.
 -- 2. SIM NGOAI DANH SACH: TUYET DOI KHONG LEN LICH, AN HOAN TOAN MUC HIEU CHINH SMS!
 -- 3. KHUNG GIO VANG GIA HAN: 00h20 DEN 05h40 SANG HANG NGAY (GIO VIET NAM UTC+7).
 -- 4. CO CHE THICH UNG THONG MINH: CHI GUI Y KHI TONG DAI 191 YEU CAU XAC NHAN.
@@ -311,12 +311,13 @@ if action == "test_send_now" then
         }))
         return
     end
+    os.remove("/tmp/daily_auto_renew.lock")
     os.remove("/tmp/daily_vip_renew.lock")
     os.remove("/tmp/sms_sending.lock")
     local today_vn = os.date("!%Y-%m-%d", os.time() + 25200)
     os.remove("/tmp/sms_scheduled_sent_" .. today_vn)
     
-    os.execute("nohup /usr/bin/daily_vip_renew.sh --force >/tmp/sms_manual_test.log 2>&1 &")
+    os.execute("nohup /usr/bin/daily_auto_renew.sh --force >/tmp/sms_manual_test.log 2>&1 &")
     
     local renew_pkg = get_configured_pkg()
     local renew_dest = get_configured_dest()
@@ -373,9 +374,9 @@ last_resp = last_resp:gsub("[\r\n]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
 local is_low_balance = (read_file("/tmp/sms_insufficient_funds") or ""):find("1") ~= nil
 local is_renew_success = (read_file("/tmp/sms_renew_success") or ""):find("1") ~= nil
 
--- Lay 5 dong log moi nhat tu daily_vip_renew.log
+-- Lay 5 dong log moi nhat tu daily_auto_renew.log
 local log_tail = ""
-local plog = io.popen("tail -n 5 /tmp/daily_vip_renew.log 2>/dev/null")
+local plog = io.popen("tail -n 5 /tmp/daily_auto_renew.log 2>/dev/null || tail -n 5 /tmp/daily_vip_renew.log 2>/dev/null")
 if plog then
     log_tail = plog:read("*a") or ""
     plog:close()

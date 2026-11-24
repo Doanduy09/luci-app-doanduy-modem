@@ -16,7 +16,7 @@ case "$1" in
 				dev_name=$(ubus call network.interface.duydoan_5g status 2>/dev/null | jq -r '.l3_device // empty' 2>/dev/null)
 				[ -z "$dev_name" ] && dev_name="mhi_hwip0"
 				
-				imei_val=$(cat /etc/config/default_vip_imei 2>/dev/null)
+				imei_val=$(cat /etc/config/default_device_imei /etc/config/default_vip_imei 2>/dev/null | head -1)
 				[ -z "$imei_val" ] && imei_val=$(cat /tmp/master_imei 2>/dev/null)
 				[ -z "$imei_val" ] && imei_val="030537611972346"
 

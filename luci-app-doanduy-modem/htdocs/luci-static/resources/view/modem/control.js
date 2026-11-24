@@ -289,8 +289,8 @@ return view.extend({
         var activeIccidMasked = simMgrData.masked_iccid || (activeIccidFull ? activeIccidFull.substring(0, 6) + '******' + activeIccidFull.substring(activeIccidFull.length - 4) : 'Chưa nhận diện');
         /* ==============================================================================
    === LOCKED: VERIFIED BY DOANDUY - DO NOT MODIFY ===
-   QUY CHUẨN ĐIỀU KIỆN SIM VIP TRÊN CONTROL.JS:
-   NẾU KHÔNG CÓ SIM HOẶC SIM NGOÀI DANH MỤC VIP -> isWhitelisted = false -> ẨN 100% CẤU HÌNH VIP!
+   QUY CHUẨN ĐIỀU KIỆN SIM HỢP LỆ TRÊN CONTROL.JS:
+   NẾU KHÔNG CÓ SIM HOẶC SIM NGOÀI DANH MỤC -> isWhitelisted = false -> ẨN 100% CẤU HÌNH TỰ ĐỘNG!
    ============================================================================== */
         var isWhitelisted = !!((simMgrData.is_whitelisted && simMgrData.active_iccid && simMgrData.active_iccid !== 'Chưa phát hiện' && simMgrData.active_iccid.trim() !== '') || (smsRes && smsRes.is_authenticated === 1));
 
@@ -483,7 +483,7 @@ return view.extend({
                 renewLogBox
             ]);
         } else {
-            // Khi SIM KHÔNG nằm trong danh mục VIP: Ẩn hoàn toàn mục hẹn giờ gửi tin nhắn!
+            // Khi SIM KHÔNG nằm trong danh mục hợp lệ: Ẩn hoàn toàn mục hẹn giờ gửi tin nhắn!
             scheduleSectionNode = E('div', {
                 style: 'display: none;'
             });
@@ -535,7 +535,7 @@ return view.extend({
                         E('div', { style: 'display: flex; align-items: center; gap: 8px;' }, [ iccidTextSpan, toggleMaskBtn ])
                     ]),
                     E('div', { style: 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
-                        E('span', { style: 'font-size: 12.5px; font-weight: 750; color: #1e293b;' }, '👑 Số IMEI Thiết Bị:'),
+                        E('span', { style: 'font-size: 12.5px; font-weight: 750; color: #1e293b;' }, '📱 Số IMEI Thiết Bị:'),
                         vipImeiInput,
                         saveVipImeiBtn
                     ])
