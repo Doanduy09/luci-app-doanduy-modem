@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+# DOANDUY 5G Auto Background Optimizer & Nightly AdShield Daemon
+
+START=96
+STOP=10
+
+start() {
+	# 1. Tu dong nhan dien phan cung (RAM tier + SoC) va toi uu he thong
+	if [ -x /usr/bin/device_opt.sh ]; then
+		/usr/bin/device_opt.sh apply >/dev/null 2>&1
+	fi
+
+	# 2. Bao dam lich cron tu dong cap nhat Micro AdShield luc 04:00 sang moi ngay
+	mkdir -p /etc/crontabs 2>/dev/null
+	if [ -x /usr/bin/adshield ] && ! grep -q '/usr/bin/adshield update' /etc/crontabs/root 2>/dev/null; then
+		echo "0 4 * * * /usr/bin/adshield update >/dev/null 2>&1" >> /etc/crontabs/root
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+
+	# 3. Tu dong bat Micro AdShield + Clean DNS trong RAM neu khong bi tat thu cong
+	local ad_st=""
+	[ -f /etc/config/adshield_status ] && ad_st=$(cat /etc/config/adshield_status 2>/dev/null | tr -d ' \r\n')
+	if [ "$ad_st" != "0" ] && [ -x /usr/bin/adshield ]; then
+		if [ ! -s /tmp/dnsmasq.d/adblock.conf ]; then
+			( sleep 5; /usr/bin/adshield on >/dev/null 2>&1 ) &
+		fi
+	fi
+
+	# 4. Tu dong cai & noi Tailscale P2P + Subnet Routing Debian VM neu Vault da co Auth Key
+	if [ -x /usr/bin/doanduy_remote_auto.sh ] && [ ! -f /etc/config/tailscale_disabled ]; then
+		( sleep 15; /usr/bin/doanduy_remote_auto.sh ensure >/dev/null 2>&1 ) &
+	fi
+}
+
+stop() {
+	return 0
+}

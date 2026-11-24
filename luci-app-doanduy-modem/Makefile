@@ -23,6 +23,7 @@ define Package/$(PKG_NAME)/conffiles
 /etc/config/allowed_iccids.dat
 /etc/config/default_sim_iccid
 /etc/config/doanduy_vault
+/etc/config/doanduy_vault_multi.json
 /etc/config/telegram_bot.conf
 /etc/config/original_imei.dat
 /etc/config/adshield_status

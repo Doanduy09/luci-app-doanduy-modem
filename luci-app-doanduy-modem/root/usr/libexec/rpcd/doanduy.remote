@@ -37,7 +37,7 @@ case "$1" in
 		case "$2" in
 			status)
 				ts_inst=0; ts_up=0; ts_ip=""; ts_dns=""; ts_funnel=0
-				if command -v tailscale >/dev/null 2>&1; then
+				if [ -x /usr/sbin/tailscaled ] || command -v tailscale >/dev/null 2>&1; then
 					ts_inst=1
 					if pidof tailscaled >/dev/null 2>&1; then
 						ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 | tr -d ' \r\n')
@@ -80,47 +80,18 @@ case "$1" in
 			tailscaleUp)
 				key=$(echo "$input" | jsonfilter -e '$.authkey' 2>/dev/null | tr -d '\r\n"'\'' ')
 				funnel=$(echo "$input" | jsonfilter -e '$.enable_funnel' 2>/dev/null)
-				[ -z "$key" ] && key=$(read_tailscale_key)
-				if ! command -v tailscale >/dev/null 2>&1; then
-					echo '{"success":false,"message":"Router chưa cài đặt gói tailscale! Cài tailscale trước khi bật."}'
-					exit 0
-				fi
-				if [ -n "$key" ]; then
-					mkdir -p /etc/config
-					touch "$VAULT_FILE"
-					sed -i '/^TAILSCALE_AUTH_KEY=/d' "$VAULT_FILE" 2>/dev/null
-					echo "TAILSCALE_AUTH_KEY='$key'" >> "$VAULT_FILE"
-					chmod 600 "$VAULT_FILE"
-				fi
-				/etc/init.d/tailscale enable >/dev/null 2>&1 || true
-				/etc/init.d/tailscale start >/dev/null 2>&1 || true
-				sleep 2
-				set -- up --accept-routes --accept-dns=false
-				[ -n "$key" ] && set -- "$@" "--authkey=$key"
-				timeout 15 tailscale "$@" >/tmp/.ts_up.log 2>&1
-				if [ "$funnel" = "1" ] || [ "$funnel" = "true" ]; then
-					tailscale serve --bg 80 >/dev/null 2>&1 || true
-					tailscale funnel --bg 80 >/dev/null 2>&1 || true
-				fi
-				ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 | tr -d ' \r\n')
-				json_init
-				if [ -n "$ts_ip" ]; then
-					json_add_boolean "success" 1
-					json_add_string "tailscale_ip" "$ts_ip"
-					json_add_string "message" "Đã kết nối Tailscale thành công! IP: $ts_ip"
+				if [ -x /usr/bin/doanduy_remote_auto.sh ]; then
+					/usr/bin/doanduy_remote_auto.sh up "$key" "$funnel"
 				else
-					json_add_boolean "success" 0
-					json_add_string "message" "Chưa lấy được IP Tailscale. Kiểm tra Auth Key hoặc chạy tailscale login trên SSH."
+					echo '{"success":false,"message":"Thiếu /usr/bin/doanduy_remote_auto.sh"}'
 				fi
-				json_dump
 				;;
 			tailscaleDown)
-				if command -v tailscale >/dev/null 2>&1; then
-					tailscale serve reset >/dev/null 2>&1 || true
-					tailscale down >/dev/null 2>&1 || true
-					/etc/init.d/tailscale stop >/dev/null 2>&1 || true
+				if [ -x /usr/bin/doanduy_remote_auto.sh ]; then
+					/usr/bin/doanduy_remote_auto.sh down
+				else
+					echo '{"success":true,"message":"Đã tắt Tailscale an toàn."}'
 				fi
-				echo '{"success":true,"message":"Đã tắt Tailscale an toàn."}'
 				;;
 			toggleWanPort)
 				svc=$(echo "$input" | jsonfilter -e '$.service' 2>/dev/null)

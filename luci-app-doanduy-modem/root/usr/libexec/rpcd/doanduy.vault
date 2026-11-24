@@ -1,11 +1,15 @@
 #!/bin/sh
-# DOANDUY 5G Unified Secrets Vault & Telegram RPCD Backend
+# DOANDUY 5G Unified Multi-Account Secrets Vault & Telegram RPCD Backend
 . /usr/share/libubox/jshn.sh
 
 VAULT_FILE="/etc/config/doanduy_vault"
+MULTI_FILE="/etc/config/doanduy_vault_multi.json"
 TG_CONF="/etc/config/telegram_bot.conf"
 SECRETS_CONF="/etc/config/router_secrets.conf"
 PERS_CONF="/etc/config/personal_vault.conf"
+LEGACY_VAULT="/etc/config/vault.conf"
+BOTS_JSON="/etc/config/sentinel_bots.json"
+CAMS_CONF="/etc/config/sentinel_cameras.conf"
 
 san() {
 	printf '%s' "$1" | tr -d '\047\042\015\012\073\134\140\044'
@@ -21,9 +25,9 @@ read_kv() {
 
 load_vault_vars() {
 	TG_BOT_TOKEN=""; TG_ADMIN_ID=""; TG_OWNER_NAME=""
-	GEMINI_API_KEY=""; TAILSCALE_AUTH_KEY=""; EMERGENCY_PHONE=""
+	GEMINI_API_KEY=""; TAILSCALE_AUTH_KEY=""; EMERGENCY_PHONE=""; CLOUD_REMOTE=""
 	local v=""
-	for f in "$SECRETS_CONF" "$PERS_CONF" "$TG_CONF" "$VAULT_FILE"; do
+	for f in "$LEGACY_VAULT" "$SECRETS_CONF" "$PERS_CONF" "$TG_CONF" "$VAULT_FILE"; do
 		[ -f "$f" ] || continue
 		v=$(read_kv "$f" TG_BOT_TOKEN); [ -n "$v" ] && TG_BOT_TOKEN="$v"
 		v=$(read_kv "$f" TG_ADMIN_ID); [ -n "$v" ] && TG_ADMIN_ID="$v"
@@ -31,73 +35,332 @@ load_vault_vars() {
 		v=$(read_kv "$f" GEMINI_API_KEY); [ -n "$v" ] && GEMINI_API_KEY="$v"
 		v=$(read_kv "$f" TAILSCALE_AUTH_KEY); [ -n "$v" ] && TAILSCALE_AUTH_KEY="$v"
 		v=$(read_kv "$f" EMERGENCY_PHONE); [ -n "$v" ] && EMERGENCY_PHONE="$v"
+		v=$(read_kv "$f" CLOUD_REMOTE); [ -n "$v" ] && CLOUD_REMOTE="$v"
 	done
+	[ -z "$GEMINI_API_KEY" ] && [ -f /etc/config/gemini_api.key ] && GEMINI_API_KEY=$(head -n1 /etc/config/gemini_api.key 2>/dev/null | tr -d ' \r\n')
+	[ -z "$TAILSCALE_AUTH_KEY" ] && [ -f /etc/config/tailscale_authkey ] && TAILSCALE_AUTH_KEY=$(head -n1 /etc/config/tailscale_authkey 2>/dev/null | tr -d ' \r\n')
+	[ -z "$EMERGENCY_PHONE" ] && [ -f /etc/config/emergency_phone.txt ] && EMERGENCY_PHONE=$(head -n1 /etc/config/emergency_phone.txt 2>/dev/null | tr -d ' \r\n')
 }
 
-case "$1" in
-	list)
-		echo '{"get":{},"save":{"tg_bot_token":"string","tg_admin_id":"string","tg_owner_name":"string","gemini_api_key":"string","tailscale_auth_key":"string","emergency_phone":"string"},"testTelegram":{}}'
-		;;
-	call)
-		read -r input
-		case "$2" in
-			get)
-				load_vault_vars
-				json_init
-				json_add_boolean "success" 1
-				json_add_string "tg_bot_token" "$(san "$TG_BOT_TOKEN")"
-				json_add_string "tg_admin_id" "$(san "$TG_ADMIN_ID")"
-				json_add_string "tg_owner_name" "$(san "$TG_OWNER_NAME")"
-				json_add_string "gemini_api_key" "$(san "$GEMINI_API_KEY")"
-				json_add_string "tailscale_auth_key" "$(san "$TAILSCALE_AUTH_KEY")"
-				json_add_string "emergency_phone" "$(san "$EMERGENCY_PHONE")"
-				json_dump
-				;;
-			save)
-				load_vault_vars
-				v_tok=$(echo "$input" | jsonfilter -e '$.tg_bot_token' 2>/dev/null)
-				v_id=$(echo "$input" | jsonfilter -e '$.tg_admin_id' 2>/dev/null)
-				v_own=$(echo "$input" | jsonfilter -e '$.tg_owner_name' 2>/dev/null)
-				v_gem=$(echo "$input" | jsonfilter -e '$.gemini_api_key' 2>/dev/null)
-				v_ts=$(echo "$input" | jsonfilter -e '$.tailscale_auth_key' 2>/dev/null)
-				v_ph=$(echo "$input" | jsonfilter -e '$.emergency_phone' 2>/dev/null)
-
-				[ -n "$v_tok" ] && TG_BOT_TOKEN="$v_tok"
-				[ -n "$v_id" ] && TG_ADMIN_ID="$v_id"
-				[ -n "$v_own" ] && TG_OWNER_NAME="$v_own"
-				[ -n "$v_gem" ] && GEMINI_API_KEY="$v_gem"
-				[ -n "$v_ts" ] && TAILSCALE_AUTH_KEY="$v_ts"
-				[ -n "$v_ph" ] && EMERGENCY_PHONE="$v_ph"
-
-				mkdir -p /etc/config
-				cat <<EOF > "$VAULT_FILE"
+write_scalar_files() {
+	mkdir -p /etc/config
+	cat <<EOF > "$VAULT_FILE"
 TG_BOT_TOKEN='$(san "$TG_BOT_TOKEN")'
 TG_ADMIN_ID='$(san "$TG_ADMIN_ID")'
 TG_OWNER_NAME='$(san "$TG_OWNER_NAME")'
 GEMINI_API_KEY='$(san "$GEMINI_API_KEY")'
 TAILSCALE_AUTH_KEY='$(san "$TAILSCALE_AUTH_KEY")'
 EMERGENCY_PHONE='$(san "$EMERGENCY_PHONE")'
+CLOUD_REMOTE='$(san "$CLOUD_REMOTE")'
 EOF
-				cat <<EOF > "$TG_CONF"
+	cat <<EOF > "$TG_CONF"
 TG_BOT_TOKEN="$(san "$TG_BOT_TOKEN")"
 TG_ADMIN_ID="$(san "$TG_ADMIN_ID")"
-TG_OWNER_NAME="$(san "$TG_OWNER_NAME")"
+TG_OWNER_NAME="$(san "${TG_OWNER_NAME:-Anh Duy}")"
 EOF
-				chmod 600 "$VAULT_FILE" "$TG_CONF"
+	chmod 600 "$VAULT_FILE" "$TG_CONF"
+	if [ -n "$GEMINI_API_KEY" ]; then
+		printf '%s\n' "$(san "$GEMINI_API_KEY")" > /etc/config/gemini_api.key
+		chmod 600 /etc/config/gemini_api.key
+	fi
+	if [ -n "$TAILSCALE_AUTH_KEY" ]; then
+		printf '%s\n' "$(san "$TAILSCALE_AUTH_KEY")" > /etc/config/tailscale_authkey
+		chmod 600 /etc/config/tailscale_authkey
+	fi
+	if [ -n "$EMERGENCY_PHONE" ]; then
+		printf '%s\n' "$(san "$EMERGENCY_PHONE")" > /etc/config/emergency_phone.txt
+		chmod 600 /etc/config/emergency_phone.txt
+	fi
+}
+
+make_seed_json() {
+	json_init
+	json_add_string "tg_bot_token" "$(san "$TG_BOT_TOKEN")"
+	json_add_string "tg_admin_id" "$(san "$TG_ADMIN_ID")"
+	json_add_string "tg_owner_name" "$(san "${TG_OWNER_NAME:-Anh Duy}")"
+	json_add_string "gemini_api_key" "$(san "$GEMINI_API_KEY")"
+	json_add_string "tailscale_auth_key" "$(san "$TAILSCALE_AUTH_KEY")"
+	json_add_string "emergency_phone" "$(san "$EMERGENCY_PHONE")"
+	json_add_string "cloud_remote" "$(san "$CLOUD_REMOTE")"
+	json_dump
+}
+
+case "$1" in
+	list)
+		echo '{"get":{},"save":{"tg_bot_token":"string","tg_admin_id":"string","tg_owner_name":"string","emergency_phone":"string","gemini_api_key":"string","tailscale_auth_key":"string","cloud_remote":"string","telegram_bots":"array","gemini_keys":"array","tailscale_keys":"array","cameras":"array"},"testTelegram":{"token":"string","chat_id":"string","name":"string"}}'
+		;;
+	call)
+		read -r input
+		case "$2" in
+			get)
+				load_vault_vars
+				if command -v ucode >/dev/null 2>&1; then
+					TMP_SEED="/tmp/.vault_seed_$$.json"
+					(umask 077; make_seed_json > "$TMP_SEED")
+					ucode - "$TMP_SEED" "$MULTI_FILE" "$BOTS_JSON" "$CAMS_CONF" << 'UCODE_GET'
+import { readfile } from 'fs';
+function rdjson(p, defval) {
+	try {
+		let s = readfile(p);
+		if (s) {
+			let v = json(s);
+			if (v != null) return v;
+		}
+	} catch(e) {}
+	return defval;
+}
+let seed = rdjson(ARGV[0], {});
+let multi = rdjson(ARGV[1], {});
+let legacyBots = rdjson(ARGV[2], []);
+let cams = [];
+if (type(multi.cameras) == 'array') {
+	cams = multi.cameras;
+} else {
+	try {
+		let cf = readfile(ARGV[3]);
+		if (cf) {
+			for (let line in split(cf, '\n')) {
+				line = trim(line);
+				if (line != '' && substr(line, 0, 1) != '#') push(cams, line);
+			}
+		}
+	} catch(e) {}
+}
+
+let bots = [];
+if (type(multi.telegram_bots) == 'array') bots = multi.telegram_bots;
+else if (type(legacyBots) == 'array' && length(legacyBots) > 0) bots = legacyBots;
+else if ((seed.tg_bot_token || '') != '' || (seed.tg_admin_id || '') != '') {
+	push(bots, { name: 'Bot Chính (Master)', token: seed.tg_bot_token || '', chat_id: seed.tg_admin_id || '' });
+}
+
+let gkeys = [];
+if (type(multi.gemini_keys) == 'array') gkeys = multi.gemini_keys;
+else if ((seed.gemini_api_key || '') != '') {
+	push(gkeys, { label: 'Gemini Key #1', key: seed.gemini_api_key });
+}
+
+let tkeys = [];
+if (type(multi.tailscale_keys) == 'array') tkeys = multi.tailscale_keys;
+else if ((seed.tailscale_auth_key || '') != '') {
+	push(tkeys, { label: 'Tailscale #1', key: seed.tailscale_auth_key });
+}
+
+let tg_tok = (multi.tg_bot_token != null && multi.tg_bot_token != '') ? multi.tg_bot_token : (seed.tg_bot_token || '');
+let tg_id = (multi.tg_admin_id != null && multi.tg_admin_id != '') ? multi.tg_admin_id : (seed.tg_admin_id || '');
+if (tg_tok == '' && length(bots) > 0) tg_tok = bots[0].token || '';
+if (tg_id == '' && length(bots) > 0) tg_id = bots[0].chat_id || '';
+
+let gem = (multi.gemini_api_key != null && multi.gemini_api_key != '') ? multi.gemini_api_key : (seed.gemini_api_key || '');
+if (gem == '' && length(gkeys) > 0) gem = gkeys[0].key || '';
+
+let ts = (multi.tailscale_auth_key != null && multi.tailscale_auth_key != '') ? multi.tailscale_auth_key : (seed.tailscale_auth_key || '');
+if (ts == '' && length(tkeys) > 0) ts = tkeys[0].key || '';
+
+let out = {
+	success: true,
+	tg_bot_token: tg_tok,
+	tg_admin_id: tg_id,
+	tg_owner_name: (multi.tg_owner_name && multi.tg_owner_name != '') ? multi.tg_owner_name : (seed.tg_owner_name || 'Anh Duy'),
+	gemini_api_key: gem,
+	tailscale_auth_key: ts,
+	emergency_phone: (multi.emergency_phone != null && multi.emergency_phone != '') ? multi.emergency_phone : (seed.emergency_phone || ''),
+	cloud_remote: (multi.cloud_remote != null && multi.cloud_remote != '') ? multi.cloud_remote : (seed.cloud_remote || ''),
+	telegram_bots: bots,
+	gemini_keys: gkeys,
+	tailscale_keys: tkeys,
+	cameras: cams
+};
+printf('%J\n', out);
+UCODE_GET
+					rm -f "$TMP_SEED"
+				else
+					json_init
+					json_add_boolean "success" 1
+					json_add_string "tg_bot_token" "$(san "$TG_BOT_TOKEN")"
+					json_add_string "tg_admin_id" "$(san "$TG_ADMIN_ID")"
+					json_add_string "tg_owner_name" "$(san "${TG_OWNER_NAME:-Anh Duy}")"
+					json_add_string "gemini_api_key" "$(san "$GEMINI_API_KEY")"
+					json_add_string "tailscale_auth_key" "$(san "$TAILSCALE_AUTH_KEY")"
+					json_add_string "emergency_phone" "$(san "$EMERGENCY_PHONE")"
+					json_add_string "cloud_remote" "$(san "$CLOUD_REMOTE")"
+					json_dump
+				fi
+				;;
+			save)
+				load_vault_vars
+				if command -v ucode >/dev/null 2>&1; then
+					TMP_IN="/tmp/.vault_in_$$.json"
+					TMP_SEED="/tmp/.vault_seed_$$.json"
+					TMP_SCALAR="/tmp/.vault_sc_$$.json"
+					(umask 077; printf '%s' "$input" > "$TMP_IN"; make_seed_json > "$TMP_SEED")
+					ucode - "$TMP_IN" "$TMP_SEED" "$MULTI_FILE" "$BOTS_JSON" "$CAMS_CONF" "$TMP_SCALAR" << 'UCODE_SAVE'
+import { readfile, writefile } from 'fs';
+function rdjson(p, defval) {
+	try {
+		let s = readfile(p);
+		if (s) {
+			let v = json(s);
+			if (v != null) return v;
+		}
+	} catch(e) {}
+	return defval;
+}
+function clean(v) {
+	if (v == null) return '';
+	return trim(replace('' + v, /[\r\n]/g, ''));
+}
+let inp = rdjson(ARGV[0], {});
+let seed = rdjson(ARGV[1], {});
+let prev = rdjson(ARGV[2], {});
+
+let bots = [];
+if (type(inp.telegram_bots) == 'array') {
+	for (let i = 0; i < length(inp.telegram_bots); i++) {
+		let b = inp.telegram_bots[i] || {};
+		let tok = clean(b.token);
+		let cid = clean(b.chat_id);
+		let nm = clean(b.name) || ('Bot #' + (length(bots) + 1));
+		if (tok != '' && cid != '') push(bots, { name: nm, token: tok, chat_id: cid });
+	}
+} else if (type(prev.telegram_bots) == 'array') {
+	bots = prev.telegram_bots;
+}
+
+let gkeys = [];
+if (type(inp.gemini_keys) == 'array') {
+	for (let i = 0; i < length(inp.gemini_keys); i++) {
+		let g = inp.gemini_keys[i] || {};
+		let k = clean(g.key);
+		let lbl = clean(g.label) || ('Gemini #' + (length(gkeys) + 1));
+		if (k != '') push(gkeys, { label: lbl, key: k });
+	}
+} else if (type(prev.gemini_keys) == 'array') {
+	gkeys = prev.gemini_keys;
+}
+
+let tkeys = [];
+if (type(inp.tailscale_keys) == 'array') {
+	for (let i = 0; i < length(inp.tailscale_keys); i++) {
+		let t = inp.tailscale_keys[i] || {};
+		let k = clean(t.key);
+		let lbl = clean(t.label) || ('Tailscale #' + (length(tkeys) + 1));
+		if (k != '') push(tkeys, { label: lbl, key: k });
+	}
+} else if (type(prev.tailscale_keys) == 'array') {
+	tkeys = prev.tailscale_keys;
+}
+
+let cams = [];
+if (type(inp.cameras) == 'array') {
+	for (let i = 0; i < length(inp.cameras); i++) {
+		let c = clean(inp.cameras[i]);
+		if (c != '') push(cams, c);
+	}
+} else if (type(prev.cameras) == 'array') {
+	cams = prev.cameras;
+}
+
+let tg_tok = (inp.tg_bot_token != null) ? clean(inp.tg_bot_token) : (prev.tg_bot_token || seed.tg_bot_token || '');
+let tg_id = (inp.tg_admin_id != null) ? clean(inp.tg_admin_id) : (prev.tg_admin_id || seed.tg_admin_id || '');
+if (length(bots) > 0) {
+	if (tg_tok == '' || type(inp.telegram_bots) == 'array') tg_tok = bots[0].token;
+	if (tg_id == '' || type(inp.telegram_bots) == 'array') tg_id = bots[0].chat_id;
+} else if (tg_tok != '' && tg_id != '' && type(inp.telegram_bots) != 'array') {
+	push(bots, { name: 'Bot Chính (Master)', token: tg_tok, chat_id: tg_id });
+}
+
+let gem = (inp.gemini_api_key != null) ? clean(inp.gemini_api_key) : (prev.gemini_api_key || seed.gemini_api_key || '');
+if (length(gkeys) > 0 && (gem == '' || type(inp.gemini_keys) == 'array')) gem = gkeys[0].key;
+else if (gem != '' && type(inp.gemini_keys) != 'array' && length(gkeys) == 0) push(gkeys, { label: 'Gemini Key #1', key: gem });
+
+let ts = (inp.tailscale_auth_key != null) ? clean(inp.tailscale_auth_key) : (prev.tailscale_auth_key || seed.tailscale_auth_key || '');
+if (length(tkeys) > 0 && (ts == '' || type(inp.tailscale_keys) == 'array')) ts = tkeys[0].key;
+else if (ts != '' && type(inp.tailscale_keys) != 'array' && length(tkeys) == 0) push(tkeys, { label: 'Tailscale #1', key: ts });
+
+let tg_own = (inp.tg_owner_name != null) ? (clean(inp.tg_owner_name) || 'Anh Duy') : (prev.tg_owner_name || seed.tg_owner_name || 'Anh Duy');
+let emg = (inp.emergency_phone != null) ? clean(inp.emergency_phone) : (prev.emergency_phone || seed.emergency_phone || '');
+let cl = (inp.cloud_remote != null) ? clean(inp.cloud_remote) : (prev.cloud_remote || seed.cloud_remote || '');
+
+let multi = {
+	tg_bot_token: tg_tok,
+	tg_admin_id: tg_id,
+	tg_owner_name: tg_own,
+	gemini_api_key: gem,
+	tailscale_auth_key: ts,
+	emergency_phone: emg,
+	cloud_remote: cl,
+	telegram_bots: bots,
+	gemini_keys: gkeys,
+	tailscale_keys: tkeys,
+	cameras: cams
+};
+writefile(ARGV[2], sprintf('%J\n', multi));
+writefile(ARGV[3], sprintf('%J\n', bots));
+writefile(ARGV[4], '# Sentinel IP Cameras\n' + join('\n', cams) + (length(cams) ? '\n' : ''));
+writefile(ARGV[5], sprintf('%J\n', {
+	tg_bot_token: tg_tok, tg_admin_id: tg_id, tg_owner_name: tg_own,
+	gemini_api_key: gem, tailscale_auth_key: ts, emergency_phone: emg, cloud_remote: cl
+}));
+UCODE_SAVE
+					TG_BOT_TOKEN=$(jsonfilter -i "$TMP_SCALAR" -e '$.tg_bot_token' 2>/dev/null || printf '%s' "$TG_BOT_TOKEN")
+					TG_ADMIN_ID=$(jsonfilter -i "$TMP_SCALAR" -e '$.tg_admin_id' 2>/dev/null || printf '%s' "$TG_ADMIN_ID")
+					TG_OWNER_NAME=$(jsonfilter -i "$TMP_SCALAR" -e '$.tg_owner_name' 2>/dev/null || printf '%s' "$TG_OWNER_NAME")
+					GEMINI_API_KEY=$(jsonfilter -i "$TMP_SCALAR" -e '$.gemini_api_key' 2>/dev/null || printf '%s' "$GEMINI_API_KEY")
+					TAILSCALE_AUTH_KEY=$(jsonfilter -i "$TMP_SCALAR" -e '$.tailscale_auth_key' 2>/dev/null || printf '%s' "$TAILSCALE_AUTH_KEY")
+					EMERGENCY_PHONE=$(jsonfilter -i "$TMP_SCALAR" -e '$.emergency_phone' 2>/dev/null || printf '%s' "$EMERGENCY_PHONE")
+					CLOUD_REMOTE=$(jsonfilter -i "$TMP_SCALAR" -e '$.cloud_remote' 2>/dev/null || printf '%s' "$CLOUD_REMOTE")
+					chmod 600 "$MULTI_FILE" "$BOTS_JSON" "$CAMS_CONF" 2>/dev/null
+					rm -f "$TMP_IN" "$TMP_SEED" "$TMP_SCALAR"
+				else
+					v_tok=$(echo "$input" | jsonfilter -e '$.tg_bot_token' 2>/dev/null)
+					v_id=$(echo "$input" | jsonfilter -e '$.tg_admin_id' 2>/dev/null)
+					v_own=$(echo "$input" | jsonfilter -e '$.tg_owner_name' 2>/dev/null)
+					v_gem=$(echo "$input" | jsonfilter -e '$.gemini_api_key' 2>/dev/null)
+					v_ts=$(echo "$input" | jsonfilter -e '$.tailscale_auth_key' 2>/dev/null)
+					v_ph=$(echo "$input" | jsonfilter -e '$.emergency_phone' 2>/dev/null)
+					v_cl=$(echo "$input" | jsonfilter -e '$.cloud_remote' 2>/dev/null)
+					[ -n "$v_tok" ] && TG_BOT_TOKEN="$v_tok"
+					[ -n "$v_id" ] && TG_ADMIN_ID="$v_id"
+					[ -n "$v_own" ] && TG_OWNER_NAME="$v_own"
+					[ -n "$v_gem" ] && GEMINI_API_KEY="$v_gem"
+					[ -n "$v_ts" ] && TAILSCALE_AUTH_KEY="$v_ts"
+					[ -n "$v_ph" ] && EMERGENCY_PHONE="$v_ph"
+					[ -n "$v_cl" ] && CLOUD_REMOTE="$v_cl"
+				fi
+				write_scalar_files
 				sync
-				echo '{"success":true,"message":"Đã lưu toàn bộ Key & Token vào Vault an toàn!"}'
+				if [ -n "$TAILSCALE_AUTH_KEY" ] && [ ! -f /etc/config/tailscale_disabled ] && [ -x /usr/bin/doanduy_remote_auto.sh ]; then
+					( /usr/bin/doanduy_remote_auto.sh ensure >/dev/null 2>&1 ) &
+				fi
+				echo '{"success":true,"message":"Đã lưu toàn bộ Kho Key đa tài khoản & Cấu hình Sentinel an toàn!"}'
 				;;
 			testTelegram)
 				load_vault_vars
-				if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_ADMIN_ID" ]; then
+				t_tok=$(echo "$input" | jsonfilter -e '$.token' 2>/dev/null | tr -d ' \r\n')
+				t_id=$(echo "$input" | jsonfilter -e '$.chat_id' 2>/dev/null | tr -d ' \r\n')
+				t_nm=$(echo "$input" | jsonfilter -e '$.name' 2>/dev/null | tr -d '\r\n')
+				[ -z "$t_tok" ] && t_tok="$TG_BOT_TOKEN"
+				[ -z "$t_id" ] && t_id="$TG_ADMIN_ID"
+				if [ -z "$t_tok" ] || [ -z "$t_id" ]; then
 					echo '{"success":false,"message":"Chưa nhập Telegram Bot Token hoặc Chat ID!"}'
 					exit 0
 				fi
 				model=$(cat /tmp/sysinfo/model 2>/dev/null || uname -n)
-				nl_msg="🆘 <b>CẢNH BÁO KHẨN: KIỂM TRA KẾT NỐI ROUTER</b>
+				b_label="${t_nm:-Vault Master}"
+				nl_msg="🆘 <b>KIỂM TRA KẾT NỐI ROUTER</b>
 Router: <b>${model}</b>
-Trạng thái: Vault Telegram hoạt động bình thường!"
-				res=$(/usr/bin/send_telegram "$nl_msg" 2>/dev/null)
+Kênh Bot: <b>${b_label}</b>
+Trạng thái: Kết nối Telegram hoạt động bình thường!"
+				res=""
+				if command -v curl >/dev/null 2>&1; then
+					res=$(curl -s -k -m 10 -X POST "https://api.telegram.org/bot${t_tok}/sendMessage" \
+						-d "chat_id=${t_id}" \
+						-d "parse_mode=HTML" \
+						--data-urlencode "text=${nl_msg}" 2>/dev/null)
+				elif [ -x /usr/bin/send_telegram ]; then
+					res=$(/usr/bin/send_telegram "$nl_msg" 2>/dev/null)
+				fi
 				if echo "$res" | grep -q '"ok":true'; then
 					echo '{"success":true,"message":"Đã gửi tin nhắn thử tới Telegram thành công!"}'
 				else
