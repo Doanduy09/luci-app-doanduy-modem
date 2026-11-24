@@ -129,16 +129,18 @@ fi
 bind_usb_option_driver() {
     local opt_new_id="/sys/bus/usb-serial/drivers/option1/new_id"
     [ -w "$opt_new_id" ] || return 0
-    local udev vid pid bound=0
+    local udev udev_real vid pid bound=0
     for udev in /sys/bus/usb/devices/*; do
         [ -r "$udev/idVendor" ] && [ -r "$udev/idProduct" ] || continue
+        udev_real=$(readlink -f "$udev" 2>/dev/null)
+        [ -d "$udev_real" ] || continue
         vid=$(tr 'A-F' 'a-f' < "$udev/idVendor" 2>/dev/null)
         pid=$(tr 'A-F' 'a-f' < "$udev/idProduct" 2>/dev/null)
         case "${vid}:${pid}" in
-            305a:1421|2dee:4d23|2dee:4d38|3466:3301|2c7c:8101|2c7c:0457|\
+            305a:1421|2dee:4d23|2dee:4d38|3466:3301|2c7c:8101|2c7c:0457|3763:3c93|\
             1782:4038|1782:4039|1782:4040|1782:4056|1782:4057|1782:4058|05c6:90d5)
                 # Guard: never hijack already-bound DM/GPS/flash serial ports
-                if ! find "$udev" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | grep -q .; then
+                if ! find "$udev_real" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | grep -q .; then
                     logger -t duydoan5g "Binding option1 serial driver for USB ${vid}:${pid}"
                     echo "$vid $pid" > "$opt_new_id" 2>/dev/null && bound=1 || true
                 fi
@@ -498,14 +500,18 @@ find_working_at_port() {
 
     case "${USB_VID}:${USB_PID}" in
         0e8d:7126|0e8d:7127) prio_ifnums="04 03" ;;
-        2c7c:0801) prio_ifnums="02 03" ;;
+        2c7c:0457) prio_ifnums="02 07" ;;
+        2c7c:0800|2c7c:0801|2c7c:0900|2c7c:0125|2c7c:0121|2c7c:0306|2c7c:0512|2c7c:0620|2c7c:030b|2c7c:030e|2c7c:0316|2c7c:0435|2c7c:6005) prio_ifnums="02 03" ;;
+        1199:9071|1199:9079|1199:9091|1199:90b1|1199:90d2|1199:90d3) prio_ifnums="02 03" ;;
+        2cb7:0104|2cb7:0105|2cb7:0106|2cb7:010a|2cb7:010d|2cb7:0112) prio_ifnums="02 03" ;;
         1e0e:9011) prio_ifnums="04 05" ;;
         1782:4e00) prio_ifnums="00 03" ;;
         305a:1421|305a:1404) prio_ifnums="01" ;;
         2dee:4d23) prio_ifnums="01" ;;
         2dee:4d38) prio_ifnums="03" ;;
+        3763:3c93) prio_ifnums="01" ;;
         1782:4038|1782:4039|1782:4040|1782:4056|1782:4057|1782:4058) prio_ifnums="02" ;;
-        05c6:90d5) prio_ifnums="02 03" ;;
+        05c6:90d5) prio_ifnums="02 03 05" ;;
     esac
 
     if [ -n "$usb_root" ] && [ -d "$usb_root" ]; then
@@ -592,6 +598,14 @@ detect_modem_profile() {
                     MODEM_VENDOR="openluat"
                     MODEM_PLATFORM="unisoc"
                     MODEM_PDP_IDX="5"
+                    ;;
+                *Fibocom*|*FIBOCOM*|*FM650*|*FG650*|*L610*)
+                    MODEM_VENDOR="fibocom"
+                    MODEM_PLATFORM="unisoc"
+                    ;;
+                *MeiG*|*Meig*|*MEIG*|*SRM821*)
+                    MODEM_VENDOR="meig"
+                    MODEM_PLATFORM="unisoc"
                     ;;
                 4038*|4039*|4040*|*Neoway*|*NU313*|*N510*)
                     MODEM_VENDOR="neoway"
@@ -695,10 +709,15 @@ wait_modem_ready() {
 
 pre_dial_prepare() {
     stop_competing_dialers
+    if [ "$MODE" = "phone_dhcp" ]; then
+        MODEM_VENDOR="phone"
+        [ "$NET_DRV" = "ipheth" ] && MODEM_PLATFORM="apple_ios" || MODEM_PLATFORM="${NET_DRV:-tether}"
+        return 0
+    fi
     find_working_at_port || { detect_modem_profile; return 0; }
     detect_modem_profile
     sync_sim_status
-    local cfun_res cpin_res
+    local cfun_res cpin_res lte_f lte_p nr_f nr_p nr_scs nr_b
     cfun_res=$(safe_at_once "$AT_PORT" "AT+CFUN?")
     if echo "$cfun_res" | grep -qE '\+CFUN:[[:space:]]*[04]'; then
         logger -t duydoan5g "Waking modem radio (AT+CFUN=1 on $AT_PORT)"
@@ -716,6 +735,17 @@ pre_dial_prepare() {
     fi
 
     wait_modem_ready
+
+    if [ "$MODEM_VENDOR" = "quectel" ] && [ -f /etc/config/cell_lock_golden.json ] && command -v jsonfilter >/dev/null 2>&1; then
+        lte_f=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.lte_freq' 2>/dev/null)
+        lte_p=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.lte_pci' 2>/dev/null)
+        nr_f=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_freq' 2>/dev/null)
+        nr_p=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_pci' 2>/dev/null)
+        nr_scs=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_scs' 2>/dev/null)
+        nr_b=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_band' 2>/dev/null)
+        [ -n "$lte_f" ] && [ -n "$lte_p" ] && safe_at_once "$AT_PORT" "AT+QNWLOCK=\"common/4g\",1,${lte_f},${lte_p}" >/dev/null
+        [ -n "$nr_p" ] && [ -n "$nr_f" ] && safe_at_once "$AT_PORT" "AT+QNWLOCK=\"common/5g\",${nr_p},${nr_f},${nr_scs:-1},${nr_b:-41}" >/dev/null
+    fi
 }
 
 at_auth_num() {
@@ -778,7 +808,9 @@ at_dial_activate() {
         huawei)
             cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
             if [ "$MODEM_PLATFORM" = "unisoc" ]; then
-                act_cmd="AT^SETAUTODIAL=1,4"
+                if ! safe_at_once "$AT_PORT" 'AT^SETAUTODIAL?' | grep -qE 'SETAUTODIAL:[[:space:]]*1,'; then
+                    act_cmd="AT^SETAUTODIAL=1,4"
+                fi
             else
                 act_cmd="AT^NDISDUP=1,$cid"
                 if [ -n "$username$password" ] && [ "$auth_num" != "0" ]; then
@@ -834,8 +866,10 @@ at_dial_activate() {
     [ -n "$cgdcont_cmd" ] && safe_at_once "$AT_PORT" "$cgdcont_cmd" >/dev/null
     [ -n "$auth_cmd" ] && safe_at_once "$AT_PORT" "$auth_cmd" >/dev/null
     [ -n "$nat_cmd" ] && safe_at_once "$AT_PORT" "$nat_cmd" >/dev/null
-    logger -t duydoan5g "AT dial ($MODEM_VENDOR/$MODEM_PLATFORM, pdp=$cid): $act_cmd on $AT_PORT"
-    safe_at_once "$AT_PORT" "$act_cmd" >/dev/null
+    if [ -n "$act_cmd" ]; then
+        logger -t duydoan5g "AT dial ($MODEM_VENDOR/$MODEM_PLATFORM, pdp=$cid): $act_cmd on $AT_PORT"
+        safe_at_once "$AT_PORT" "$act_cmd" >/dev/null
+    fi
     AT_DIAL_ACTIVE=1
     sleep 2
 }
@@ -1176,7 +1210,7 @@ run_fm350_usb_dial() {
 }
 
 run_at_dhcp_monitor() {
-    at_dial_activate
+    [ "$MODE" = "phone_dhcp" ] || at_dial_activate
     detach_bridge_master
     ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
     ip link set dev "$IFNAME" up 2>/dev/null || true
@@ -1188,7 +1222,7 @@ run_at_dhcp_monitor() {
     fi
     [ "$MODEM_VENDOR" = "simcom" ] && [ "$MODEM_PLATFORM" = "qualcomm" ] && check_cid="6"
     [ "$MODEM_VENDOR" = "neoway" ] && check_cid="1"
-    if [ "$MODEM_VENDOR" = "openluat" ] || { [ "$MODEM_VENDOR" = "huawei" ] && [ "$MODEM_PLATFORM" = "unisoc" ]; }; then
+    if [ "$MODE" = "phone_dhcp" ] || [ "$MODEM_VENDOR" = "openluat" ] || { [ "$MODEM_VENDOR" = "huawei" ] && [ "$MODEM_PLATFORM" = "unisoc" ]; }; then
         is_auto=1
     fi
 
@@ -1251,8 +1285,36 @@ rotate_cm_log() {
     fi
 }
 
+is_usb_phone_tether() {
+    [ "$NET_DRV" = "ipheth" ] && return 0
+    [ "$MODE" = "at_dhcp" ] || return 1
+    read_usb_ids_for_netdev || true
+    local usb_root
+    usb_root=$(find_usb_root_for_netdev 2>/dev/null || true)
+    [ -n "$usb_root" ] && [ -d "$usb_root" ] || return 1
+    if find "$usb_root" -maxdepth 4 \( -name 'ttyUSB*' -o -name 'ttyACM*' -o -name 'cdc-wdm*' \) 2>/dev/null | grep -q .; then
+        return 1
+    fi
+    case "${USB_VID}:${USB_PID}" in
+        12d1:14db|12d1:14dc) return 0 ;;
+    esac
+    case "$USB_VID" in
+        0e8d|2c7c|2cb7|1508|1199|12dc|3466|1e0e|1a0e|2dee|1bc7|305a|1e2d|3763|1782|413c|05c6|12d1)
+            return 1 ;;
+    esac
+    return 0
+}
+
+run_phone_dhcp_monitor() {
+    MODE="phone_dhcp"
+    run_at_dhcp_monitor
+}
+
 wake_hardware
 detect_endpoint || exit 1
+if is_usb_phone_tether; then
+    MODE="phone_dhcp"
+fi
 pre_dial_prepare
 logger -t duydoan5g "Starting 5G supervised dialer on $IFNAME (Mode: $MODE, Vendor: $MODEM_VENDOR/$MODEM_PLATFORM, PDP: $MODEM_PDP_IDX, AT: ${AT_PORT:-none}, Driver: ${NET_DRV:-unknown}, Ctrl: ${CTRL_DEV:-none}, APN: $apn)"
 
@@ -1263,6 +1325,11 @@ fi
 
 if [ "$MODE" = "fm350_usb" ]; then
     run_fm350_usb_dial
+    exit 0
+fi
+
+if [ "$MODE" = "phone_dhcp" ]; then
+    run_phone_dhcp_monitor
     exit 0
 fi
 
@@ -1285,6 +1352,10 @@ while [ "$STOP_REQ" = "0" ]; do
             wwan*_*) cm_if="${IFNAME%%_*}" ;;
             rmnet*.*) cm_if="${IFNAME%%.*}" ;;
         esac
+        cm_apn="$apn"
+        if [ -z "$cm_apn" ] && { [ "$MODE" = "cm_mbim" ] || [ "$NET_DRV" = "cdc_mbim" ]; }; then
+            cm_apn="auto"
+        fi
         set -- -i "$cm_if"
         case "$pdptype" in
             ip|ipv4) set -- "$@" -4 ;;
@@ -1292,8 +1363,8 @@ while [ "$STOP_REQ" = "0" ]; do
             *) set -- "$@" -4 -6 ;;
         esac
         [ -n "$user_pdp_index" ] && set -- "$@" -n "$user_pdp_index"
-        if [ -n "$apn" ]; then
-            set -- "$@" -s "$apn"
+        if [ -n "$cm_apn" ]; then
+            set -- "$@" -s "$cm_apn"
             if [ -n "$username" ] && [ -n "$password" ]; then
                 q_auth=$(at_auth_num)
                 [ "$q_auth" = "0" ] && q_auth="3"
@@ -1301,12 +1372,16 @@ while [ "$STOP_REQ" = "0" ]; do
             fi
         fi
         [ -n "$pincode" ] && set -- "$@" -p "$pincode"
-        set -- "$@" -d
         case "$local_qcm" in
             */quectel-CM-M)
-                set -- "$@" -D -M "$metric"
+                set -- "$@" -d -D -M "$metric"
                 if [ "$force_apn" = "1" ] || [ "$MODEM_VENDOR" = "telit" ]; then
                     set -- "$@" -F
+                fi
+                ;;
+            *)
+                if [ "$MODE" != "cm_mbim" ] && [ "$NET_DRV" != "cdc_mbim" ]; then
+                    set -- "$@" -d
                 fi
                 ;;
         esac
