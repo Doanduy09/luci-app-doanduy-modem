@@ -12,19 +12,16 @@ chmod +x /usr/libexec/rpcd/modem_ctrl 2>/dev/null
 chmod +x /www/cgi-bin/sim_manager 2>/dev/null
 chmod +x /lib/netifd/proto/duydoan5g.sh 2>/dev/null
 
-# 2. Khoi tao va bao dam du 4 SIM VIP mac dinh goc trong allowed_iccids.dat
+# 2. Khoi tao va bao dam du 3 SIM VIP mac dinh goc trong allowed_iccids.dat
 mkdir -p /etc/config
 touch /etc/config/allowed_iccids.dat
-for vip_id in 89840480009484443869 89840480009578677539 89840480009579026074 89840480009647493181; do
+sed -i '/^89840480009647493181$/d' /etc/config/allowed_iccids.dat 2>/dev/null
+for vip_id in 89840480009484443869 89840480009578677539 89840480009579026074; do
     if ! grep -qx "$vip_id" /etc/config/allowed_iccids.dat 2>/dev/null; then
         echo "$vip_id" >> /etc/config/allowed_iccids.dat
     fi
 done
 chmod 600 /etc/config/allowed_iccids.dat
-
-if [ -f /usr/bin/ai_watchdog.sh ] && ! grep -q "89840480009647493181" /usr/bin/ai_watchdog.sh 2>/dev/null; then
-    sed -i 's/STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074"/STRICT_DEFAULT_ICCIDS="89840480009484443869 89840480009578677539 89840480009579026074 89840480009647493181"/' /usr/bin/ai_watchdog.sh 2>/dev/null
-fi
 
 if [ ! -s /etc/config/sms_custom_time.dat ]; then
     echo "01:25:30" > /etc/config/sms_custom_time.dat
@@ -130,7 +127,9 @@ chmod +x /etc/hotplug.d/net/99_wwan_net.sh
 # 5. Kich hoat service smart_modem_watchdog voi interface duydoan_5g
 /etc/init.d/smart_modem_watchdog enable 2>/dev/null
 
-# 6. Tai lai ubus rpcd de LuCI nhan dien toan bo method moi
+# 6. Xoa cache LuCI va tai lai ubus rpcd de nhan widget Overview + method moi
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null
 
 exit 0

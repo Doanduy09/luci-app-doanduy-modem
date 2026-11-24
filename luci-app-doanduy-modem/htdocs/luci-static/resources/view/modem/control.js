@@ -316,7 +316,7 @@ return view.extend({
    NẾU KHÔNG CÓ SIM HOẶC SIM NGOÀI DANH MỤC -> isWhitelisted = false -> ẨN 100% CẤU HÌNH TỰ ĐỘNG!
    ============================================================================== */
         var hasValidIccid = !!(simMgrData.active_iccid && simMgrData.active_iccid !== 'Chưa phát hiện' && simMgrData.active_iccid !== 'Chua phat hien' && simMgrData.active_iccid.trim() !== '');
-        var isWhitelisted = !!((simMgrData.is_whitelisted && hasValidIccid) || (smsRes && smsRes.is_authenticated === 1));
+        var isWhitelisted = (typeof simMgrData.is_whitelisted === 'boolean') ? !!(simMgrData.is_whitelisted && hasValidIccid) : !!(smsRes && smsRes.is_authenticated === 1 && hasValidIccid);
 
         var iccidTextSpan = E('span', {
             id: 'modem-active-iccid-span',

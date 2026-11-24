@@ -720,14 +720,55 @@ wait_modem_ready() {
     return 0
 }
 
+write_modem_meta() {
+    local usb_root="" usb_mfg="" usb_prod="" m_model="" m_rev="" m_imei=""
+    usb_root=$(find_usb_root_for_netdev 2>/dev/null || true)
+    if [ -n "$usb_root" ] && [ -d "$usb_root" ]; then
+        [ -r "$usb_root/manufacturer" ] && usb_mfg=$(cat "$usb_root/manufacturer" 2>/dev/null)
+        [ -r "$usb_root/product" ] && usb_prod=$(cat "$usb_root/product" 2>/dev/null)
+    fi
+    if [ -n "$ATI_INFO" ]; then
+        m_rev=$(printf '%s\n' "$ATI_INFO" | tr -d '\r' | sed -n 's/.*Revision:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)
+        m_model=$(printf '%s\n' "$ATI_INFO" | tr -d '\r' | awk '
+            /^[[:space:]]*Model:[[:space:]]*/ { sub(/^[[:space:]]*Model:[[:space:]]*/, ""); print; exit }
+            { line=$0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", line) }
+            line=="" || line=="ATI" || line=="OK" || line=="ERROR" || line~/^Revision:/ || line~/^Manufacturer:/ { next }
+            tolower(line) ~ /^(quectel|fibocom|huawei|sierra|simcom|meig|neoway|gosuncn|telit|thales|cinterion|openluat)$/ { next }
+            { print line; exit }
+        ')
+    fi
+    [ -z "$m_model" ] && m_model="$usb_prod"
+    if [ "$MODE" != "phone_dhcp" ] && [ -c "$AT_PORT" ]; then
+        m_imei=$(safe_at_once "$AT_PORT" "AT+CGSN" | grep -oE '[0-9]{15}' | head -n 1)
+    fi
+    local safe_q="tr -d '\\047\\042\\015\\012\\073\\134\\140\\044'"
+    cat <<EOF > "/tmp/duydoan5g_modem_meta_${interface}"
+META_IFACE='$(printf '%s' "$interface" | eval "$safe_q")'
+META_IFNAME='$(printf '%s' "$IFNAME" | eval "$safe_q")'
+META_DRV='$(printf '%s' "$NET_DRV" | eval "$safe_q")'
+META_MODE='$(printf '%s' "$MODE" | eval "$safe_q")'
+META_VENDOR='$(printf '%s' "$MODEM_VENDOR" | eval "$safe_q")'
+META_PLATFORM='$(printf '%s' "$MODEM_PLATFORM" | eval "$safe_q")'
+META_AT_PORT='$(printf '%s' "$AT_PORT" | eval "$safe_q")'
+META_CTRL_DEV='$(printf '%s' "$CTRL_DEV" | eval "$safe_q")'
+META_USB_VID='$(printf '%s' "$USB_VID" | eval "$safe_q")'
+META_USB_PID='$(printf '%s' "$USB_PID" | eval "$safe_q")'
+META_MODEL='$(printf '%s' "${m_model:-$usb_mfg}" | eval "$safe_q")'
+META_REV='$(printf '%s' "$m_rev" | eval "$safe_q")'
+META_IMEI='$(printf '%s' "$m_imei" | eval "$safe_q")'
+EOF
+    cp -f "/tmp/duydoan5g_modem_meta_${interface}" /tmp/duydoan5g_modem_meta 2>/dev/null || true
+}
+
 pre_dial_prepare() {
     stop_competing_dialers
     if [ "$MODE" = "phone_dhcp" ]; then
         MODEM_VENDOR="phone"
         [ "$NET_DRV" = "ipheth" ] && MODEM_PLATFORM="apple_ios" || MODEM_PLATFORM="${NET_DRV:-tether}"
+        write_modem_meta
         return 0
     fi
-    find_working_at_port || { detect_modem_profile; return 0; }
+    find_working_at_port || { detect_modem_profile; write_modem_meta; return 0; }
     detect_modem_profile
     sync_sim_status
     local cfun_res cpin_res lte_f lte_p nr_f nr_p nr_scs nr_b
@@ -759,6 +800,7 @@ pre_dial_prepare() {
         [ -n "$lte_f" ] && [ -n "$lte_p" ] && safe_at_once "$AT_PORT" "AT+QNWLOCK=\"common/4g\",1,${lte_f},${lte_p}" >/dev/null
         [ -n "$nr_p" ] && [ -n "$nr_f" ] && safe_at_once "$AT_PORT" "AT+QNWLOCK=\"common/5g\",${nr_p},${nr_f},${nr_scs:-1},${nr_b:-41}" >/dev/null
     fi
+    write_modem_meta
 }
 
 at_auth_num() {

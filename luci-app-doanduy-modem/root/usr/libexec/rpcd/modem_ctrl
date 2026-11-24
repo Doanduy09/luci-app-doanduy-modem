@@ -1,95 +1,495 @@
 #!/bin/sh
-# === LOCKED: VERIFIED BY DOANDUY - DO NOT MODIFY ===
+# DOANDUY 5G Master Suite - Real-Time Universal Modem Telemetry RPCD Backend
+. /usr/share/libubox/jshn.sh
+
+CACHE_TTL=15
+AT_LOCK="/var/lock/modem_at.lock"
+
+san() {
+	printf '%s' "$1" | tr -d '\047\042\015\012\073\134\140\044' | tr '\000-\037' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//'
+}
+
+human_bytes() {
+	awk -v b="${1:-0}" 'BEGIN{
+		if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
+		else if (b >= 1048576) printf "%.2f MiB", b/1048576;
+		else if (b >= 1024) printf "%.1f KiB", b/1024;
+		else printf "%d B", b;
+	}'
+}
+
+fmt_uptime() {
+	local s="${1:-0}" d h m
+	case "$s" in ''|*[!0-9]*) echo "0s"; return ;; esac
+	d=$((s / 86400))
+	h=$(((s % 86400) / 3600))
+	m=$(((s % 3600) / 60))
+	s=$((s % 60))
+	if [ "$d" -gt 0 ]; then
+		printf '%dd %dh %dm' "$d" "$h" "$m"
+	elif [ "$h" -gt 0 ]; then
+		printf '%dh %dm %ds' "$h" "$m" "$s"
+	elif [ "$m" -gt 0 ]; then
+		printf '%dm %ds' "$m" "$s"
+	else
+		printf '%ds' "$s"
+	fi
+}
+
+is_wwan_netdev() {
+	local n="$1" rp drv
+	[ -n "$n" ] && [ -d "/sys/class/net/$n" ] || return 1
+	case "$n" in
+		lo|br-*|lan*|wan*|wlan*|phy*|mhi_swip*|erspan*|gre*|miireg) return 1 ;;
+	esac
+	rp=$(readlink -f "/sys/class/net/$n" 2>/dev/null)
+	case "$rp" in */mhi*_IP_SW/*) return 1 ;; esac
+	case "$n" in
+		wwan*|mhi_hwip*|rmnet*|usb*|rndis*) return 0 ;;
+		eth*)
+			rp=$(readlink -f "/sys/class/net/$n/device/driver" 2>/dev/null)
+			drv="${rp##*/}"
+			case "$drv" in
+				qmi_wwan|qmi_wwan_q|cdc_mbim|cdc_ncm|huawei_cdc_ncm|cdc_ether|rndis_host|sierra_net|cdc_subset|ipheth|GobiNet|mhi_net|mtk_t7xx|rmnet_nss) return 0 ;;
+			esac
+			;;
+	esac
+	return 1
+}
+
+netdev_bus_info() {
+	local dev="$1" base rel d vid pid mfg prod pcie_slot=""
+	BUS_TYPE=""; USB_VID=""; USB_PID=""; SYS_MFG=""; SYS_PROD=""; USB_ROOT=""; PCIE_SLOT=""
+	[ -n "$dev" ] && base=$(readlink -f "/sys/class/net/$dev/device" 2>/dev/null)
+	[ -d "$base" ] || return 0
+	for rel in "" "/.." "/../.."; do
+		d="${base}${rel}"
+		if [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ]; then
+			BUS_TYPE="USB"
+			USB_ROOT=$(readlink -f "$d" 2>/dev/null)
+			USB_VID=$(tr 'A-F' 'a-f' < "$d/idVendor" 2>/dev/null)
+			USB_PID=$(tr 'A-F' 'a-f' < "$d/idProduct" 2>/dev/null)
+			[ -r "$d/manufacturer" ] && SYS_MFG=$(san "$(cat "$d/manufacturer" 2>/dev/null)")
+			[ -r "$d/product" ] && SYS_PROD=$(san "$(cat "$d/product" 2>/dev/null)")
+			return 0
+		fi
+	done
+	for rel in "" "/.."; do
+		d=$(readlink -f "${base}${rel}" 2>/dev/null)
+		pcie_slot="${d##*/}"
+		case "$pcie_slot" in
+			[0-9][0-9][0-9][0-9]:[0-9a-f][0-9a-f]:*)
+				BUS_TYPE="PCIe"
+				PCIE_SLOT="$pcie_slot"
+				return 0
+				;;
+		esac
+	done
+}
+
+find_at_port_for_dev() {
+	local dev="$1" cand="" tpath
+	if [ -n "$USB_ROOT" ] && [ -d "$USB_ROOT" ]; then
+		for tpath in $(find "$USB_ROOT" -maxdepth 4 \( -name 'ttyUSB[0-9]*' -o -name 'ttyACM[0-9]*' \) 2>/dev/null | sort); do
+			cand="/dev/${tpath##*/}"
+			[ -c "$cand" ] || continue
+			case "$cand" in *ttyUSB2|*ttyUSB3|*ttyACM0) echo "$cand"; return 0 ;; esac
+		done
+		for tpath in $(find "$USB_ROOT" -maxdepth 4 \( -name 'ttyUSB[0-9]*' -o -name 'ttyACM[0-9]*' \) 2>/dev/null | sort); do
+			[ -c "/dev/${tpath##*/}" ] && { echo "/dev/${tpath##*/}"; return 0; }
+		done
+		return 1
+	fi
+	for cand in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyFMI0; do
+		[ -c "$cand" ] && { echo "$cand"; return 0; }
+	done
+	return 1
+}
+
+safe_at_query() {
+	local port="$1" cmd="$2"
+	[ -c "$port" ] && [ -n "$cmd" ] || return 1
+	case "$port" in
+		/dev/wwan*|/dev/mhi*)
+			if [ -x /usr/bin/read_pcie_sms.lua ]; then
+				timeout 3 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && return 0
+			fi
+			if command -v tom_modem >/dev/null 2>&1; then
+				timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
+			fi
+			if command -v sms_tool >/dev/null 2>&1; then
+				timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
+			fi
+			;;
+		*)
+			if command -v atinout >/dev/null 2>&1; then
+				printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null && return 0
+			fi
+			if command -v tom_modem >/dev/null 2>&1; then
+				timeout 2 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
+			fi
+			if command -v sms_tool >/dev/null 2>&1; then
+				timeout 2 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
+			fi
+			;;
+	esac
+	return 1
+}
+
+read_rf_telemetry_cached() {
+	local key="$1" port="$2" vendor="$3" mode="$4" drv="$5" need_id="$6"
+	C_OP="" C_RAT="" C_BAND="" C_RSRP="" C_RSRQ="" C_SINR="" C_CSQ="" C_TEMP="" C_PCT="" C_MODEL="" C_REV="" C_IMEI="" C_EXTRA=""
+	[ "$mode" = "phone_dhcp" ] || [ "$drv" = "ipheth" ] && return 0
+
+	local safe_key cache_file now mtime=0
+	safe_key=$(printf '%s' "${key:-default}" | tr -cd 'a-zA-Z0-9_-')
+	cache_file="/tmp/duydoan5g_signal_cache_${safe_key}"
+	now=$(date +%s 2>/dev/null || echo 0)
+
+	if [ -f "$cache_file" ]; then
+		mtime=$(date -r "$cache_file" +%s 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+		if [ $((now - mtime)) -lt "$CACHE_TTL" ]; then
+			. "$cache_file" 2>/dev/null
+			return 0
+		fi
+	fi
+
+	if [ ! -c "$port" ] || [ -e /tmp/sms_sending.lock ] || ls /tmp/quectel_dialing* >/dev/null 2>&1; then
+		[ -f "$cache_file" ] && . "$cache_file" 2>/dev/null
+		return 0
+	fi
+
+	(
+		flock -x -n 9 2>/dev/null || exit 1
+		local cops_out act_num cgmm_out cgsn_out rf_out lte_line nr_line temp_out max_t
+		local rsrp="" rsrq="" sinr="" band="" rat="" csq="" pct="" op="" model="" imei="" extra=""
+
+		cops_out=$(safe_at_query "$port" "AT+COPS?")
+		op=$(printf '%s\n' "$cops_out" | sed -n 's/.*+COPS:[[:space:]]*[0-9]*,[0-9]*,"\([^"]*\)".*/\1/p' | head -n 1)
+		act_num=$(printf '%s\n' "$cops_out" | sed -n 's/.*+COPS:[[:space:]]*[0-9]*,[0-9]*,"[^"]*",\([0-9]*\).*/\1/p' | head -n 1)
+		case "$act_num" in
+			13) rat="5G NR-NSA" ;;
+			11|12) rat="5G NR-SA" ;;
+			7|8|9|10) rat="4G LTE" ;;
+			2|4|5|6) rat="3G UMTS" ;;
+			0|1|3) rat="2G GSM" ;;
+		esac
+
+		if [ "$need_id" = "1" ]; then
+			cgmm_out=$(safe_at_query "$port" "AT+CGMM")
+			model=$(printf '%s\n' "$cgmm_out" | tr -d '\r' | grep -vE '^(AT\+CGMM|OK|ERROR|$)' | head -n 1)
+			cgsn_out=$(safe_at_query "$port" "AT+CGSN")
+			imei=$(printf '%s\n' "$cgsn_out" | grep -oE '[0-9]{15}' | head -n 1)
+		fi
+
+		if [ "$vendor" = "quectel" ] || [ "$USB_VID" = "2c7c" ]; then
+			rf_out=$(safe_at_query "$port" 'AT+QENG="servingcell"')
+			lte_line=$(printf '%s\n' "$rf_out" | grep -E '\+QENG:[[:space:]]*"LTE"' | head -n 1)
+			nr_line=$(printf '%s\n' "$rf_out" | grep -E 'NR5G-NSA|NR5G-SA' | head -n 1)
+			if [ -n "$nr_line" ]; then
+				case "$nr_line" in
+					*NR5G-SA*)
+						rat="5G SA"
+						eval "$(printf '%s\n' "$nr_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "nr_band=%s nr_rsrp=%s nr_rsrq=%s nr_sinr=%s", $11, $13, $14, $15}')"
+						rsrp="$nr_rsrp"; rsrq="$nr_rsrq"; sinr="$nr_sinr"
+						[ -n "$nr_band" ] && band="n${nr_band}"
+						;;
+					*)
+						rat="5G NSA"
+						eval "$(printf '%s\n' "$nr_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "nr_rsrp=%s nr_sinr=%s nr_rsrq=%s nr_band=%s", $5, $6, $7, $9}')"
+						[ -n "$lte_line" ] && eval "$(printf '%s\n' "$lte_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "lte_band=%s lte_rsrp=%s lte_rsrq=%s lte_sinr=%s", $10, $14, $15, $17}')"
+						if [ -n "$lte_band" ] && [ -n "$nr_band" ]; then
+							band="B${lte_band} + n${nr_band}"
+						elif [ -n "$nr_band" ]; then
+							band="n${nr_band}"
+						elif [ -n "$lte_band" ]; then
+							band="B${lte_band}"
+						fi
+						rsrp="${nr_rsrp:-$lte_rsrp}"
+						rsrq="${nr_rsrq:-$lte_rsrq}"
+						sinr="${nr_sinr:-$lte_sinr}"
+						;;
+				esac
+			elif [ -n "$lte_line" ]; then
+				rat="${rat:-4G LTE}"
+				eval "$(printf '%s\n' "$lte_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "lte_band=%s lte_rsrp=%s lte_rsrq=%s lte_sinr=%s", $10, $14, $15, $17}')"
+				[ -n "$lte_band" ] && band="B${lte_band}"
+				rsrp="$lte_rsrp"; rsrq="$lte_rsrq"; sinr="$lte_sinr"
+			fi
+			temp_out=$(safe_at_query "$port" "AT+QTEMP")
+			max_t=$(printf '%s\n' "$temp_out" | grep -oE '"-?[0-9]+"' | tr -d '"' | awk '$1>=10 && $1<=120 {if($1>m)m=$1} END{if(m>0)print m}')
+		elif [ "$vendor" = "sierra" ] || [ "$USB_VID" = "1199" ]; then
+			rf_out=$(safe_at_query "$port" "AT!GSTATUS?")
+			[ -n "$rf_out" ] && {
+				rat=$(printf '%s\n' "$rf_out" | sed -n 's/.*System mode:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)
+				rsrp=$(printf '%s\n' "$rf_out" | sed -n 's/.*RSRP (dBm):[[:space:]]*\(-[0-9.]*\).*/\1/p' | head -n 1 | cut -d'.' -f1)
+				rsrq=$(printf '%s\n' "$rf_out" | sed -n 's/.*RSRQ (dB):[[:space:]]*\(-[0-9.]*\).*/\1/p' | head -n 1)
+				sinr=$(printf '%s\n' "$rf_out" | sed -n 's/.*SINR (dB):[[:space:]]*\([-0-9.]*\).*/\1/p' | head -n 1)
+				max_t=$(printf '%s\n' "$rf_out" | sed -n 's/.*Temperature:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1)
+			}
+		fi
+
+		if [ -z "$rsrp" ]; then
+			rf_out=$(safe_at_query "$port" "AT+CSQ")
+			csq=$(printf '%s\n' "$rf_out" | sed -n 's/.*+CSQ:[[:space:]]*\([0-9]*\),.*/\1/p' | head -n 1)
+			case "$csq" in
+				''|99|*[!0-9]*) csq="" ;;
+				*)
+					[ "$csq" -gt 31 ] && csq=31
+					rsrp=$(( -113 + (csq * 2) ))
+					pct=$(( csq * 100 / 31 ))
+					;;
+			esac
+		fi
+
+		case "$rsrp" in
+			-[0-9]*)
+				if [ -z "$pct" ]; then
+					pct=$(( (rsrp + 120) * 2 ))
+					[ "$pct" -lt 0 ] && pct=0
+					[ "$pct" -gt 100 ] && pct=100
+				fi
+				extra="RSRP ${rsrp} dBm"
+				case "$rsrq" in -[0-9]*) extra="$extra | RSRQ ${rsrq} dB" ;; esac
+				case "$sinr" in ''|'-'|'255') ;; *) extra="$extra | SNR ${sinr} dB" ;; esac
+				;;
+		esac
+
+		cat <<EOF > "${cache_file}.tmp"
+C_OP='$(san "$op")'
+C_RAT='$(san "$rat")'
+C_BAND='$(san "$band")'
+C_RSRP='$(san "$rsrp")'
+C_RSRQ='$(san "$rsrq")'
+C_SINR='$(san "$sinr")'
+C_CSQ='$(san "$csq")'
+C_TEMP='$(san "$max_t")'
+C_PCT='$(san "$pct")'
+C_MODEL='$(san "$model")'
+C_REV=''
+C_IMEI='$(san "$imei")'
+C_EXTRA='$(san "$extra")'
+EOF
+		mv -f "${cache_file}.tmp" "$cache_file"
+		exit 0
+	) 9>"$AT_LOCK" 2>/dev/null
+
+	if [ -f "$cache_file" ]; then
+		. "$cache_file" 2>/dev/null
+	fi
+}
+
+append_modem_entry() {
+	local iface="$1" dev_hint="$2"
+	local META_IFACE="" META_IFNAME="" META_DRV="" META_MODE="" META_VENDOR="" META_PLATFORM=""
+	local META_AT_PORT="" META_CTRL_DEV="" META_USB_VID="" META_USB_PID="" META_MODEL="" META_REV="" META_IMEI=""
+
+	if [ -n "$iface" ] && [ -f "/tmp/duydoan5g_modem_meta_${iface}" ]; then
+		. "/tmp/duydoan5g_modem_meta_${iface}" 2>/dev/null
+	elif [ -f /tmp/duydoan5g_modem_meta ]; then
+		. /tmp/duydoan5g_modem_meta 2>/dev/null
+		if [ -n "$iface" ] && [ -n "$META_IFACE" ] && [ "$META_IFACE" != "$iface" ]; then
+			META_IFNAME="" META_DRV="" META_MODE="" META_VENDOR="" META_PLATFORM="" META_AT_PORT="" META_CTRL_DEV="" META_USB_VID="" META_USB_PID="" META_MODEL="" META_REV="" META_IMEI=""
+		fi
+	fi
+
+	local st="" if_up="" l3_dev="" if_dev="" uptime="" v4="" m4="" v6="" m6=""
+	if [ -n "$iface" ]; then
+		st=$(ubus call "network.interface.${iface}" status 2>/dev/null)
+		if [ -n "$st" ]; then
+			if_up=$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)
+			l3_dev=$(echo "$st" | jsonfilter -e '@.l3_device' 2>/dev/null)
+			if_dev=$(echo "$st" | jsonfilter -e '@.device' 2>/dev/null)
+			uptime=$(echo "$st" | jsonfilter -e '@.uptime' 2>/dev/null)
+			v4=$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+			m4=$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].mask' 2>/dev/null)
+			v6=$(echo "$st" | jsonfilter -e '@["ipv6-address"][0].address' 2>/dev/null)
+			m6=$(echo "$st" | jsonfilter -e '@["ipv6-address"][0].mask' 2>/dev/null)
+		fi
+	fi
+
+	local dev=""
+	for cand in "$l3_dev" "$if_dev" "$META_IFNAME" "$dev_hint"; do
+		[ -n "$cand" ] && [ -d "/sys/class/net/$cand" ] && { dev="$cand"; break; }
+	done
+	[ -n "$dev" ] || [ "$if_up" = "true" ] || return 1
+
+	local drv="$META_DRV" rp
+	if [ -n "$dev" ] && [ -z "$drv" ]; then
+		rp=$(readlink -f "/sys/class/net/$dev/device/driver" 2>/dev/null)
+		drv="${rp##*/}"
+	fi
+	netdev_bus_info "$dev"
+	[ -n "$META_USB_VID" ] && [ -z "$USB_VID" ] && USB_VID="$META_USB_VID"
+	[ -n "$META_USB_PID" ] && [ -z "$USB_PID" ] && USB_PID="$META_USB_PID"
+
+	local at_port="$META_AT_PORT"
+	[ -c "$at_port" ] || at_port=$(find_at_port_for_dev "$dev" 2>/dev/null || true)
+
+	local mode="$META_MODE" vendor="$META_VENDOR"
+	if [ -z "$mode" ]; then
+		case "$drv" in
+			ipheth) mode="phone_dhcp" ;;
+			mtk_t7xx) mode="mtk_pcie" ;;
+			cdc_mbim) mode="cm_mbim" ;;
+			qmi_wwan|qmi_wwan_q|GobiNet) mode="cm_usb" ;;
+			rndis_host|cdc_ncm|cdc_ether|huawei_cdc_ncm)
+				[ -c "$at_port" ] && mode="at_dhcp" || mode="phone_dhcp" ;;
+		esac
+	fi
+
+	local need_id=0
+	[ -z "$META_MODEL" ] || [ -z "$META_IMEI" ] && need_id=1
+	read_rf_telemetry_cached "${iface:-$dev}" "$at_port" "$vendor" "$mode" "$drv" "$need_id"
+
+	local model="${META_MODEL:-$C_MODEL}"
+	[ -z "$model" ] && model="${SYS_PROD}"
+	[ -z "$model" ] && [ "$drv" = "ipheth" ] && model="Apple iPhone USB Tether"
+	[ -z "$model" ] && [ -n "$vendor" ] && model="$vendor $META_PLATFORM"
+	[ -z "$model" ] && model="WWAN / USB Modem (${drv:-auto})"
+	[ -n "$SYS_MFG" ] && case "$model" in *"$SYS_MFG"*) ;; *) [ "$BUS_TYPE" = "USB" ] && model="${SYS_MFG} ${model}" ;; esac
+	local model_full="$model"
+	[ -n "$META_REV" ] && model_full="${model} (${META_REV})"
+
+	local hw_str=""
+	if [ "$BUS_TYPE" = "USB" ] && [ -n "$USB_VID" ]; then
+		hw_str="USB (${USB_VID}:${USB_PID})"
+	elif [ "$BUS_TYPE" = "PCIe" ] && [ -n "$PCIE_SLOT" ]; then
+		hw_str="PCIe ($PCIE_SLOT)"
+	else
+		hw_str="${BUS_TYPE:-Modem}"
+	fi
+	[ -n "$drv" ] && hw_str="${hw_str} • ${drv}"
+	[ -n "$dev" ] && hw_str="${hw_str} • ${dev}"
+	[ -c "$at_port" ] && hw_str="${hw_str} • AT: ${at_port##*/}"
+
+	local state_str="Đang kết nối..."
+	if [ "$if_up" = "true" ]; then
+		state_str="Đã kết nối (${iface:-auto}, Uptime $(fmt_uptime "$uptime"))"
+	elif [ -n "$iface" ]; then
+		state_str="Chờ kết nối (${iface})"
+	fi
+
+	local traffic_str=""
+	if [ -n "$dev" ] && [ -r "/sys/class/net/$dev/statistics/rx_bytes" ]; then
+		local rxb txb
+		rxb=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null || echo 0)
+		txb=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null || echo 0)
+		traffic_str="Tải xuống: $(human_bytes "$rxb") / Tải lên: $(human_bytes "$txb")"
+	fi
+
+	local imei="${META_IMEI:-$C_IMEI}"
+	local sim_str=""
+	if [ "$mode" = "phone_dhcp" ] || [ "$drv" = "ipheth" ]; then
+		sim_str="USB Tethering (Chia sẻ mạng từ điện thoại)"
+	else
+		local iccid sim_st
+		iccid=$(cat /tmp/sms_current_iccid /tmp/current_sim_iccid /etc/config/active_iccid 2>/dev/null | grep -oE '[0-9]{10,22}' | head -n 1)
+		sim_st=$(cat /tmp/master_sim_status 2>/dev/null)
+		if [ -n "$iccid" ] && [ "${#iccid}" -ge 10 ]; then
+			iccid=$(echo "$iccid" | awk '{print substr($0,1,6) "******" substr($0,length($0)-3)}')
+			case "$sim_st" in
+				VALID) sim_str="$iccid (Hợp lệ / Đang hoạt động)" ;;
+				LOCKED) sim_str="$iccid (Khóa / Ngoài Whitelist)" ;;
+				*) sim_str="$iccid (Đang hoạt động)" ;;
+			esac
+		else
+			sim_str="Đang kiểm tra / Chưa đọc ICCID"
+		fi
+	fi
+
+	local net_str=""
+	[ -n "$C_OP" ] && net_str="$C_OP"
+	[ -n "$C_RAT" ] && net_str="${net_str:+${net_str} • }${C_RAT}"
+	[ -n "$C_BAND" ] && net_str="${net_str:+${net_str} • }${C_BAND}"
+
+	json_add_object
+		json_add_array "modem_info"
+			add_item() {
+				[ -n "$3" ] || return 0
+				json_add_object
+				json_add_string "class" "$1"
+				json_add_string "full_name" "$2"
+				json_add_string "value" "$3"
+				json_close_object
+			}
+			add_item "Base Information" "Mã Modem / Thiết bị" "$model_full"
+			add_item "Base Information" "Giao tiếp & Phần cứng" "$hw_str"
+			add_item "Base Information" "Trạng thái WAN" "$state_str"
+			[ -n "$imei" ] && add_item "Base Information" "Số IMEI" "$imei"
+			[ -n "$C_TEMP" ] && add_item "Base Information" "Nhiệt độ Modem" "${C_TEMP}°C"
+			[ -n "$traffic_str" ] && add_item "Base Information" "Lưu lượng phiên" "$traffic_str"
+			[ -n "$net_str" ] && add_item "SIM Information" "Nhà mạng & Sóng" "$net_str"
+			add_item "SIM Information" "Thẻ SIM / Chế độ" "$sim_str"
+			[ -n "$v4" ] && add_item "SIM Information" "Địa chỉ IPv4 WAN" "${v4}/${m4:-30}"
+			[ -n "$v6" ] && add_item "SIM Information" "Địa chỉ IPv6 WAN" "${v6}/${m6:-64}"
+			if [ -n "$C_PCT" ]; then
+				json_add_object
+				json_add_string "class" "Cell Information"
+				json_add_string "type" "progress_bar"
+				json_add_string "full_name" "Tín hiệu sóng"
+				json_add_string "extra_info" "${C_EXTRA:-${C_PCT}%}"
+				json_add_int "value" "$C_PCT"
+				json_add_int "max_value" 100
+				json_add_int "min_value" 0
+				json_add_string "unit" "%"
+				json_close_object
+			fi
+		json_close_array
+	json_close_object
+	return 0
+}
+
+build_info_json() {
+	local ifaces seen_devs="" iface_list="" count=0
+	json_init
+	json_add_array "info"
+
+	iface_list=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p")
+	if [ -z "$iface_list" ]; then
+		iface_list=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='\(qmi\|mbim\|ncm\|modemmanager\|3g\)'$/\1/p")
+	fi
+	for iface in $iface_list; do
+		if append_modem_entry "$iface" ""; then
+			count=$((count + 1))
+			local d=$(ubus call "network.interface.${iface}" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+			[ -n "$d" ] && seen_devs="$seen_devs $d"
+		fi
+	done
+
+	if [ "$count" -eq 0 ] && [ -f /tmp/duydoan5g_modem_meta ]; then
+		local meta_if=""
+		meta_if=$(sed -n "s/^META_IFACE='\([^']*\)'.*/\1/p" /tmp/duydoan5g_modem_meta 2>/dev/null)
+		append_modem_entry "$meta_if" "" && count=$((count + 1))
+	fi
+
+	for entry in /sys/class/net/*; do
+		[ -e "$entry" ] || continue
+		local net="${entry##*/}"
+		is_wwan_netdev "$net" || continue
+		case " $seen_devs " in *" $net "*) continue ;; esac
+		if [ "$count" -eq 0 ]; then
+			append_modem_entry "" "$net" && count=$((count + 1))
+			seen_devs="$seen_devs $net"
+		fi
+	done
+
+	json_close_array
+	json_dump
+}
+
 case "$1" in
 	list)
-		echo '{ "info": {  }, "base_info": { }, "sim_info": { }, "network_info": { }, "cell_info": { } }'
-	;;
+		echo '{ "info": {}, "base_info": {}, "sim_info": {}, "network_info": {}, "cell_info": {} }'
+		;;
 	call)
 		case "$2" in
-			"info")
-				ipv4_addr=$(ubus call network.interface.duydoan_5g status 2>/dev/null | jq -r '."ipv4-address"[0].address // empty' 2>/dev/null)
-				[ -z "$ipv4_addr" ] && ipv4_addr="29.58.129.242"
-				ipv4_mask=$(ubus call network.interface.duydoan_5g status 2>/dev/null | jq -r '."ipv4-address"[0].mask // empty' 2>/dev/null)
-				[ -z "$ipv4_mask" ] && ipv4_mask="30"
-				ipv6_addr=$(ubus call network.interface.duydoan_5g status 2>/dev/null | jq -r '."ipv6-address"[0].address // empty' 2>/dev/null)
-				[ -z "$ipv6_addr" ] && ipv6_addr="2401:d800:bf1:8237:200:ff:fe00:0"
-				dev_name=$(ubus call network.interface.duydoan_5g status 2>/dev/null | jq -r '.l3_device // empty' 2>/dev/null)
-				[ -z "$dev_name" ] && dev_name="mhi_hwip0"
-				
-				imei_val=$(cat /etc/config/default_device_imei /etc/config/default_vip_imei 2>/dev/null | head -1)
-				[ -z "$imei_val" ] && imei_val=$(cat /tmp/master_imei 2>/dev/null)
-				[ -z "$imei_val" ] && imei_val="030537611972346"
-
-				iccid_val=$(cat /etc/config/active_iccid /tmp/sms_current_iccid /tmp/current_sim_iccid 2>/dev/null | grep -oE '[0-9]{10,22}' | head -1)
-				[ -z "$iccid_val" ] && iccid_val="Chưa phát hiện"
-				if [ "$iccid_val" != "Chưa phát hiện" ] && [ ${#iccid_val} -ge 10 ]; then
-					iccid_val=$(echo "$iccid_val" | awk '{print substr($0,1,6) "******" substr($0,length($0)-3)}')
-				fi
-
-				cat << JSONEOF
-{
-  "info": [
-    {
-      "modem_info": [
-        {
-          "class": "Base Information",
-          "full_name": "Mã Modem / Card WWAN",
-          "value": "Sierra Wireless EM9190 (Qualcomm Snapdragon X55 5G Sub-6/mmWave)"
-        },
-        {
-          "class": "Base Information",
-          "full_name": "Chuẩn Giao Tiếp & Phần Cứng",
-          "value": "PCIe Gen3 MHI Bus (Endpoint 0000:01:00.0, Interface $dev_name)"
-        },
-        {
-          "class": "Base Information",
-          "full_name": "Giao Diện WAN LuCI",
-          "value": "duydoan_5g (Giao thức: DuyDoan 5G/LTE Cellular)"
-        },
-        {
-          "class": "Base Information",
-          "full_name": "Số IMEI Modem",
-          "value": "$imei_val"
-        },
-        {
-          "class": "SIM Information",
-          "full_name": "Nhà Mạng Di Động",
-          "value": "Viettel Telecom (452-04) • 5G NSA / LTE CA"
-        },
-        {
-          "class": "SIM Information",
-          "full_name": "Thẻ SIM & Mã ICCID",
-          "value": "SIM Viettel • $iccid_val (Đang Hoạt Động)"
-        },
-        {
-          "class": "SIM Information",
-          "full_name": "Địa Chỉ IPv4 WAN",
-          "value": "${ipv4_addr}/${ipv4_mask}"
-        },
-        {
-          "class": "SIM Information",
-          "full_name": "Địa Chỉ IPv6 (Dual Stack)",
-          "value": "${ipv6_addr}/64"
-        },
-        {
-          "class": "Cell Information",
-          "type": "progress_bar",
-          "full_name": "Cường Độ Tín Hiệu Sóng (RSRP)",
-          "extra_info": "RSRP -81 dBm | RSRQ -17 dB | SNR 16.2 dB (75%)",
-          "value": 75,
-          "max_value": 100,
-          "min_value": 0,
-          "unit": "%"
-        }
-      ]
-    }
-  ]
-}
-JSONEOF
-			;;
+			info|base_info|sim_info|network_info|cell_info)
+				build_info_json
+				;;
 			*)
 				echo '{"info":[]}'
-			;;
+				;;
 		esac
-	;;
+		;;
 esac

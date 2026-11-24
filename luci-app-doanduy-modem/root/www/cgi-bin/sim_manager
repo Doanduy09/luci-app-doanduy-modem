@@ -57,8 +57,7 @@ local LAST_SENT_FILE = "/etc/config/sim_last_sent.dat"
 local DEFAULT_ICCID_HASHES = {
     ["a7a16520a4144e79d6b262ce4265a5d585154221b52803d8e8e6b62213e49865"] = true,
     ["c317b0ec0ee235c2bae6baf0efde7b03a05e35ad84cf794fc71a809802d47df9"] = true,
-    ["e972c309ace289c3037d4479d79b983d02151f3868f003073085abf4bf508575"] = true,
-    ["3ffa33cb79a1994ed822d056a2d60e336d5a47382838e6705f130df80ed3eb09"] = true
+    ["e972c309ace289c3037d4479d79b983d02151f3868f003073085abf4bf508575"] = true
 }
 
 local function calc_sha256(str)
