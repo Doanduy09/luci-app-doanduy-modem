@@ -126,6 +126,29 @@ if [ "$delay" -gt 0 ]; then
     done
 fi
 
+bind_usb_option_driver() {
+    local opt_new_id="/sys/bus/usb-serial/drivers/option1/new_id"
+    [ -w "$opt_new_id" ] || return 0
+    local udev vid pid bound=0
+    for udev in /sys/bus/usb/devices/*; do
+        [ -r "$udev/idVendor" ] && [ -r "$udev/idProduct" ] || continue
+        vid=$(tr 'A-F' 'a-f' < "$udev/idVendor" 2>/dev/null)
+        pid=$(tr 'A-F' 'a-f' < "$udev/idProduct" 2>/dev/null)
+        case "${vid}:${pid}" in
+            305a:1421|2dee:4d23|2dee:4d38|3466:3301|2c7c:8101|2c7c:0457|\
+            1782:4038|1782:4039|1782:4040|1782:4056|1782:4057|1782:4058|05c6:90d5)
+                # Guard: never hijack already-bound DM/GPS/flash serial ports
+                if ! find "$udev" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | grep -q .; then
+                    logger -t duydoan5g "Binding option1 serial driver for USB ${vid}:${pid}"
+                    echo "$vid $pid" > "$opt_new_id" 2>/dev/null && bound=1 || true
+                fi
+                ;;
+        esac
+    done
+    [ "$bound" = "1" ] && sleep 1
+    return 0
+}
+
 wake_hardware() {
     local f
     for f in /sys/bus/pci/devices/*/power/control /sys/bus/mhi/devices/*/power/control; do
@@ -134,6 +157,7 @@ wake_hardware() {
     for f in /sys/bus/usb/devices/*/bConfigurationValue; do
         [ -f "$f" ] && [ -z "$(cat "$f" 2>/dev/null)" ] && echo 1 > "$f" 2>/dev/null || true
     done
+    bind_usb_option_driver
 }
 
 detach_bridge_master() {
@@ -209,16 +233,28 @@ heal_pcie_mhi_id() {
     done
 }
 
+pick_mux_or_netdev() {
+    local entry="$1" name="$2" sub cname
+    for sub in "$entry/net"/* "/sys/class/net/$name/net"/*; do
+        [ -e "$sub" ] || continue
+        cname="${sub##*/}"
+        if is_real_wwan_netdev "$cname"; then
+            echo "$cname"
+            return 0
+        fi
+    done
+    is_real_wwan_netdev "$name" && { echo "$name"; return 0; }
+    return 1
+}
+
 resolve_netdev_from_ctrl() {
-    local sys_base="$1" fallback_list="$2" real_dir netdir entry name parent_dir cand
+    local sys_base="$1" fallback_list="$2" real_dir netdir entry name resolved parent_dir cand
     for netdir in "$sys_base/device/net" "$sys_base/net"; do
         [ -d "$netdir" ] || continue
         for entry in "$netdir"/*; do
             [ -e "$entry" ] || continue
             name="${entry##*/}"
-            is_real_wwan_netdev "$name" || continue
-            echo "$name"
-            return 0
+            resolved=$(pick_mux_or_netdev "$entry" "$name") && { echo "$resolved"; return 0; }
         done
     done
     real_dir=$(readlink -f "$sys_base" 2>/dev/null)
@@ -227,9 +263,7 @@ resolve_netdev_from_ctrl() {
         for entry in "$parent_dir/net"/*; do
             [ -e "$entry" ] || continue
             name="${entry##*/}"
-            is_real_wwan_netdev "$name" || continue
-            echo "$name"
-            return 0
+            resolved=$(pick_mux_or_netdev "$entry" "$name") && { echo "$resolved"; return 0; }
         done
     fi
     for cand in $fallback_list; do
@@ -416,9 +450,10 @@ extract_gtdns_ipv4() {
 
 read_usb_ids_for_netdev() {
     USB_VID=""; USB_PID=""
-    local base="" rel d
-    for base in "/sys/class/net/$IFNAME/device" "/sys/class/tty/${AT_PORT##*/}/device"; do
-        [ -e "$base" ] || continue
+    local base="" raw rel d
+    for raw in "/sys/class/net/$IFNAME/device" "/sys/class/tty/${AT_PORT##*/}/device"; do
+        base=$(readlink -f "$raw" 2>/dev/null)
+        [ -d "$base" ] || continue
         for rel in "" "/.." "/../.." "/../../.."; do
             d="${base}${rel}"
             if [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ]; then
@@ -431,12 +466,68 @@ read_usb_ids_for_netdev() {
     return 1
 }
 
+find_usb_root_for_netdev() {
+    local base rel d
+    base=$(readlink -f "/sys/class/net/$IFNAME/device" 2>/dev/null)
+    [ -d "$base" ] || return 1
+    for rel in "" "/.." "/../.."; do
+        d="${base}${rel}"
+        if [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ]; then
+            readlink -f "$d" 2>/dev/null
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_unique_port() {
+    local p="$1"
+    [ -c "$p" ] || return 0
+    case " $CAND_PORTS " in
+        *" $p "*) ;;
+        *) CAND_PORTS="$CAND_PORTS $p" ;;
+    esac
+}
+
 find_working_at_port() {
     AT_PORT=""; ATI_INFO=""
+    local CAND_PORTS=""
     read_usb_ids_for_netdev || true
-    local p out cgmm ports
-    ports="/dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB4 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0"
-    for p in $ports; do
+    local usb_root prio_ifnums="" ifnum ifdir tpath p out cgmm
+    usb_root=$(find_usb_root_for_netdev 2>/dev/null || true)
+
+    case "${USB_VID}:${USB_PID}" in
+        0e8d:7126|0e8d:7127) prio_ifnums="04 03" ;;
+        2c7c:0801) prio_ifnums="02 03" ;;
+        1e0e:9011) prio_ifnums="04 05" ;;
+        1782:4e00) prio_ifnums="00 03" ;;
+        305a:1421|305a:1404) prio_ifnums="01" ;;
+        2dee:4d23) prio_ifnums="01" ;;
+        2dee:4d38) prio_ifnums="03" ;;
+        1782:4038|1782:4039|1782:4040|1782:4056|1782:4057|1782:4058) prio_ifnums="02" ;;
+        05c6:90d5) prio_ifnums="02 03" ;;
+    esac
+
+    if [ -n "$usb_root" ] && [ -d "$usb_root" ]; then
+        for ifnum in $prio_ifnums; do
+            for ifdir in "$usb_root"/*; do
+                [ -r "$ifdir/bInterfaceNumber" ] || continue
+                [ "$(cat "$ifdir/bInterfaceNumber" 2>/dev/null)" = "$ifnum" ] || continue
+                for tpath in $(find "$ifdir" -maxdepth 3 \( -name 'ttyUSB[0-9]*' -o -name 'ttyACM[0-9]*' \) 2>/dev/null | sort); do
+                    append_unique_port "/dev/${tpath##*/}"
+                done
+            done
+        done
+        for tpath in $(find "$usb_root" -maxdepth 4 \( -name 'ttyUSB[0-9]*' -o -name 'ttyACM[0-9]*' \) 2>/dev/null | sort); do
+            append_unique_port "/dev/${tpath##*/}"
+        done
+    fi
+
+    for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB4 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0; do
+        append_unique_port "$p"
+    done
+
+    for p in $CAND_PORTS; do
         [ -c "$p" ] || continue
         out=$(safe_at_once "$p" "ATI" | head -c 512)
         if echo "$out" | grep -qE '(^|[[:space:]])OK([[:space:]]|$)|Sierra|Quectel|Fibocom|FIBOCOM|FM350|Huawei|HUAWEI|Simcom|SIMCOM|Meig|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Air724|OpenLuat'; then
@@ -578,6 +669,30 @@ sync_sim_status() {
     fi
 }
 
+wait_modem_ready() {
+    [ -c "$AT_PORT" ] || return 0
+    local w=0 cpin_out reg_out cmd
+    while [ "$w" -lt 3 ] && [ "$STOP_REQ" = "0" ]; do
+        cpin_out=$(safe_at_once "$AT_PORT" "AT+CPIN?")
+        echo "$cpin_out" | grep -qiE '\+CPIN:[[:space:]]*READY' && break
+        w=$((w + 1))
+        [ "$w" -lt 3 ] && sleep 2
+    done
+
+    w=0
+    while [ "$w" -lt 5 ] && [ "$STOP_REQ" = "0" ]; do
+        for cmd in "AT+C5GREG?" "AT+CEREG?" "AT+CREG?"; do
+            reg_out=$(safe_at_once "$AT_PORT" "$cmd")
+            if echo "$reg_out" | grep -qE '\+(C5GREG|CEREG|CREG):[[:space:]]*[0-9]+,[[:space:]]*(1|5)([^0-9]|$)'; then
+                return 0
+            fi
+        done
+        w=$((w + 1))
+        [ "$w" -lt 5 ] && sleep 2
+    done
+    return 0
+}
+
 pre_dial_prepare() {
     stop_competing_dialers
     find_working_at_port || { detect_modem_profile; return 0; }
@@ -599,6 +714,8 @@ pre_dial_prepare() {
             sleep 2
         fi
     fi
+
+    wait_modem_ready
 }
 
 at_auth_num() {
@@ -1137,7 +1254,7 @@ rotate_cm_log() {
 wake_hardware
 detect_endpoint || exit 1
 pre_dial_prepare
-logger -t duydoan5g "Starting 5G supervised dialer on $IFNAME (Mode: $MODE, Vendor: $MODEM_VENDOR/$MODEM_PLATFORM, PDP: $MODEM_PDP_IDX, Driver: ${NET_DRV:-unknown}, Ctrl: ${CTRL_DEV:-none}, APN: $apn)"
+logger -t duydoan5g "Starting 5G supervised dialer on $IFNAME (Mode: $MODE, Vendor: $MODEM_VENDOR/$MODEM_PLATFORM, PDP: $MODEM_PDP_IDX, AT: ${AT_PORT:-none}, Driver: ${NET_DRV:-unknown}, Ctrl: ${CTRL_DEV:-none}, APN: $apn)"
 
 if [ "$MODE" = "mtk_pcie" ]; then
     run_mtk_pcie_dial && exit 0
