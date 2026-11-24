@@ -97,6 +97,7 @@ ensure_dnsmasq_config() {
     fi
     if [ "$changed" = "1" ]; then
         uci commit dhcp 2>/dev/null
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
         /etc/init.d/odhcpd restart >/dev/null 2>&1
     fi
 

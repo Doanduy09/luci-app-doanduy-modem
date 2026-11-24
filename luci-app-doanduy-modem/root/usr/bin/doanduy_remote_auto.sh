@@ -370,6 +370,9 @@ cmd_ensure() {
 	if [ -n "$ts_bin" ] && pidof tailscaled >/dev/null 2>&1; then
 		cur_ip=$("$ts_bin" ip -4 2>/dev/null | grep -oE '100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -n 1)
 		if [ -n "$cur_ip" ]; then
+			if ! has_root_password && "$ts_bin" serve status 2>/dev/null | grep -qi "Funnel on"; then
+				"$ts_bin" serve reset >/dev/null 2>&1 || true
+			fi
 			configure_vm_routing
 			exit 0
 		fi
