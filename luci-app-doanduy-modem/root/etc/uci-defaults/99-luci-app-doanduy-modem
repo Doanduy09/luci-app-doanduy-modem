@@ -71,22 +71,33 @@ fi
 /etc/init.d/modemmanager stop 2>/dev/null
 /etc/init.d/modemmanager disable 2>/dev/null
 
-# Gan duydoan_5g vao Firewall Zone WAN de NAT masquerade va badge do LuCI hoat dong 100%
+# Gan duydoan_5g vao Firewall Zone WAN dong (tuong thich moi bo cuc router OpenWrt)
 if [ -f /etc/config/firewall ]; then
-    for old_if in wwan0 wwan0_4 wwan0_6 duydoan_5g; do
-        uci del_list firewall.@zone[1].network="$old_if" 2>/dev/null
+    wan_zone=""
+    for zi in 0 1 2 3 4 5 6 7 8 9; do
+        [ "$(uci -q get firewall.@zone[$zi].name)" = "wan" ] && { wan_zone="@zone[$zi]"; break; }
     done
-    uci add_list firewall.@zone[1].network='duydoan_5g'
+    [ -n "$wan_zone" ] || wan_zone="@zone[1]"
+    for old_if in wwan0 wwan0_4 wwan0_6 duydoan_5g; do
+        uci del_list "firewall.${wan_zone}.network=$old_if" 2>/dev/null
+    done
+    uci add_list "firewall.${wan_zone}.network=duydoan_5g"
     uci commit firewall
 fi
 
-# Dong bo hotplug WWAN de bat dung interface duydoan_5g (tranh tao lai wwan0)
-if [ -f /etc/hotplug.d/net/99_wwan_net.sh ]; then
+# Dong bo hotplug WWAN de bat dung interface duydoan_5g cho moi card PCIe/USB
+mkdir -p /etc/hotplug.d/net
 cat << 'HP_EOF' > /etc/hotplug.d/net/99_wwan_net.sh
 #!/bin/sh
 [ "$ACTION" = "add" ] || exit 0
 case "$INTERFACE" in
-    wwan*|mhi_hwip*|rmnet*|usb0)
+    wwan*|mhi_hwip*|rmnet*|usb0|rndis0|eth2)
+        if [ "$INTERFACE" = "eth2" ]; then
+            drv_link=$(readlink -f /sys/class/net/eth2/device/driver 2>/dev/null)
+            case "$drv_link" in
+                *r8152*|*ax88179*|*asix*|*nss*|*igc*|*r8169*) exit 0 ;;
+            esac
+        fi
         (
             sleep 2
             if command -v ubus >/dev/null 2>&1; then
@@ -98,7 +109,6 @@ case "$INTERFACE" in
 esac
 HP_EOF
 chmod +x /etc/hotplug.d/net/99_wwan_net.sh
-fi
 
 # 5. Kich hoat service smart_modem_watchdog voi interface duydoan_5g
 /etc/init.d/smart_modem_watchdog enable 2>/dev/null

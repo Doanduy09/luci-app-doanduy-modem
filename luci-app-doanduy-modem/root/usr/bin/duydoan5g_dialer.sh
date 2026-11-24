@@ -14,6 +14,8 @@ password="$8"
 auth="$9"
 shift 9 2>/dev/null || shift $#
 delay="${1:-0}"
+user_pdp_index="$2"
+force_apn="${3:-0}"
 
 [ -n "$interface" ] || exit 1
 case "$mtu" in ''|*[!0-9]*) mtu=1460 ;; esac
@@ -21,6 +23,8 @@ case "$mtu" in ''|*[!0-9]*) mtu=1460 ;; esac
 [ "$mtu" -gt 1500 ] && mtu=1500
 case "$metric" in ''|*[!0-9]*) metric=10 ;; esac
 case "$delay" in ''|*[!0-9]*) delay=0 ;; esac
+case "$user_pdp_index" in ''|*[!0-9]*) user_pdp_index="" ;; esac
+[ "$force_apn" = "1" ] || force_apn=0
 
 mkdir -p /var/lock /var/run /tmp/quectel_cm
 exec 8>"/var/lock/duydoan5g_dial.lock"
@@ -31,15 +35,27 @@ PID_FILE="/var/run/duydoan5g.pid"
 STOP_REQ=0
 CM_PID=""
 CM_START=""
+UDHCPC_PID=""
+UDHCPC_START=""
 UMBIM_ACTIVE=0
 UMBIM_TID=""
+UMBIM_LAST_SIG=""
+UMBIM_LAST_V4=""
+AT_DIAL_ACTIVE=0
 CTRL_DEV=""
 IFNAME=""
 NET_DRV=""
 MODE=""
+AT_PORT=""
+ATI_INFO=""
+USB_VID=""
+USB_PID=""
+MODEM_VENDOR="unknown"
+MODEM_PLATFORM="qualcomm"
+MODEM_PDP_IDX="1"
 
-stop_cm_graceful() {
-    local p="${1:-$CM_PID}" exp="${2:-$CM_START}"
+stop_pid_graceful() {
+    local p="$1" exp="$2"
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null || return 0
     if [ -n "$exp" ] && [ -r "/proc/$p/stat" ]; then
         [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$exp" ] || return 0
@@ -60,9 +76,13 @@ stop_cm_graceful() {
 cleanup_and_exit() {
     STOP_REQ=1
     rm -f /tmp/quectel_dialing
-    stop_cm_graceful "$CM_PID" "$CM_START"
+    stop_pid_graceful "$CM_PID" "$CM_START"
+    stop_pid_graceful "$UDHCPC_PID" "$UDHCPC_START"
     if [ "$UMBIM_ACTIVE" = "1" ] && [ -n "$UMBIM_TID" ] && [ -c "$CTRL_DEV" ]; then
         timeout 4 umbim -n -t "$UMBIM_TID" -d "$CTRL_DEV" disconnect >/dev/null 2>&1 || true
+    fi
+    if [ "$AT_DIAL_ACTIVE" = "1" ]; then
+        at_hangup
     fi
     rm -f "$PID_FILE"
     exit 0
@@ -175,10 +195,25 @@ detect_endpoint() {
     while [ "$STOP_REQ" = "0" ]; do
         heal_pcie_mhi_id
         IFNAME=""; CTRL_DEV=""; NET_DRV=""; MODE=""
-        local d b net drv cand
+        local entry d b net drv cand
 
-        # 1. PCIe MHI QMI FIRST (preferred for Sierra EM919x/Quectel RM520N Raw-IP hardware path)
-        for d in /dev/wwan*qmi* /dev/mhi_QMI0; do
+        # 1. PCIe MediaTek T7xx FIRST (Fibocom FM350-GL exposes /dev/wwan*mbim* alongside mtk_t7xx)
+        for entry in /sys/class/net/*; do
+            [ -e "$entry" ] || continue
+            net="${entry##*/}"
+            is_real_wwan_netdev "$net" || continue
+            drv=$(netdev_driver "$net")
+            if [ "$drv" = "mtk_t7xx" ]; then
+                for d in /dev/wwan*mbim*; do
+                    [ -c "$d" ] && { CTRL_DEV="$d"; break; }
+                done
+                IFNAME="$net"; NET_DRV="$drv"; MODE="mtk_pcie"
+                return 0
+            fi
+        done
+
+        # 2. PCIe MHI QMI (Sierra EM919x, Quectel RM5xxQ/RM520N Raw-IP hardware path)
+        for d in /dev/wwan*qmi* /dev/mhi_QMI*; do
             [ -c "$d" ] || continue
             b="${d##*/}"
             net=$(resolve_netdev_from_ctrl "/sys/class/wwan/$b" "mhi_hwip0 rmnet_mhi0.1 rmnet_mhi0 wwan0")
@@ -188,8 +223,8 @@ detect_endpoint() {
             fi
         done
 
-        # 2. PCIe MHI MBIM (for native MBIM-only PCIe modems such as Foxconn SDX55/T99W175)
-        for d in /dev/wwan*mbim* /dev/mhi_MBIM; do
+        # 3. PCIe MHI MBIM (Foxconn T99W175/T99W373/T99W640/DW5930e/SDX55, non-MTK)
+        for d in /dev/wwan*mbim* /dev/mhi_MBIM*; do
             [ -c "$d" ] || continue
             b="${d##*/}"
             net=$(resolve_netdev_from_ctrl "/sys/class/wwan/$b" "wwan0 mhi_hwip0")
@@ -199,30 +234,21 @@ detect_endpoint() {
             fi
         done
 
-        # 3. USB QMI / MBIM
-        for d in /dev/cdc-wdm*; do
+        # 4. USB QMI / MBIM / GobiNet
+        for d in /dev/cdc-wdm* /dev/qcqmi*; do
             [ -c "$d" ] || continue
             b="${d##*/}"
-            net=$(resolve_netdev_from_ctrl "/sys/class/usbmisc/$b" "wwan0 usb0 eth2")
+            case "$d" in
+                /dev/qcqmi*) net=$(resolve_netdev_from_ctrl "/sys/class/GobiQMI/$b" "wwan0 eth2 usb0") ;;
+                *) net=$(resolve_netdev_from_ctrl "/sys/class/usbmisc/$b" "wwan0 usb0 eth2") ;;
+            esac
             if is_real_wwan_netdev "$net"; then
                 CTRL_DEV="$d"; IFNAME="$net"; NET_DRV=$(netdev_driver "$net"); MODE="cm_usb"
                 return 0
             fi
         done
 
-        # 4. PCIe MediaTek T7xx (Fibocom FM350-GL PCIe)
-        for entry in /sys/class/net/*; do
-            [ -e "$entry" ] || continue
-            net="${entry##*/}"
-            is_real_wwan_netdev "$net" || continue
-            drv=$(netdev_driver "$net")
-            if [ "$drv" = "mtk_t7xx" ]; then
-                IFNAME="$net"; NET_DRV="$drv"; MODE="at_dhcp"
-                return 0
-            fi
-        done
-
-        # 5. USB ECM / NCM / RNDIS / Sierra Net / HiLink cellular netdevs
+        # 5. USB ECM / NCM / RNDIS / SierraNet / HiLink / iPhone tether
         for entry in /sys/class/net/*; do
             [ -e "$entry" ] || continue
             net="${entry##*/}"
@@ -252,15 +278,37 @@ detect_endpoint() {
 
 safe_at_once() {
     local port="$1" cmd="$2"
-    [ -c "$port" ] || return 1
+    [ -c "$port" ] && [ -n "$cmd" ] || return 1
     case "$port" in
         /dev/wwan*|/dev/mhi*)
-            [ -x /usr/bin/read_pcie_sms.lua ] || return 1
-            timeout 4 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null
-            return $?
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                timeout 4 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && return 0
+            fi
+            if command -v tom_modem >/dev/null 2>&1; then
+                timeout 4 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
+            fi
+            if command -v sms_tool >/dev/null 2>&1; then
+                timeout 4 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
+            fi
+            return 1
             ;;
         *)
-            ( /usr/bin/flock -x -w 4 9 && printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - ) 9>/var/lock/modem_at.lock 2>/dev/null
+            (
+                /usr/bin/flock -x -w 4 9 2>/dev/null || true
+                if command -v atinout >/dev/null 2>&1; then
+                    printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null && exit 0
+                fi
+                if command -v tom_modem >/dev/null 2>&1; then
+                    timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null && exit 0
+                fi
+                if command -v sms_tool >/dev/null 2>&1; then
+                    timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null && exit 0
+                fi
+                if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                    timeout 3 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && exit 0
+                fi
+                exit 1
+            ) 9>/var/lock/modem_at.lock 2>/dev/null
             return $?
             ;;
     esac
@@ -279,26 +327,162 @@ stop_competing_dialers() {
     fi
 }
 
-AT_PORT=""
-ATI_INFO=""
+extract_cgpaddr_ipv4() {
+    echo "$1" | tr '," ' '\n' | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && $0 != "0.0.0.0" {print; exit}'
+}
+
+extract_cgpaddr_ipv6() {
+    echo "$1" | tr '," ' '\n' | awk '/^[0-9A-Fa-f:]+:[0-9A-Fa-f:]+$/ && $0 != "::" {print; exit}'
+}
+
+extract_gtdns_ipv4() {
+    echo "$1" | tr '," ' '\n' | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && $0 != "0.0.0.0" {printf "%s ", $0}'
+}
+
+read_usb_ids_for_netdev() {
+    USB_VID=""; USB_PID=""
+    local base="" rel d
+    for base in "/sys/class/net/$IFNAME/device" "/sys/class/tty/${AT_PORT##*/}/device"; do
+        [ -e "$base" ] || continue
+        for rel in "" "/.." "/../.." "/../../.."; do
+            d="${base}${rel}"
+            if [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ]; then
+                USB_VID=$(tr 'A-F' 'a-f' < "$d/idVendor" 2>/dev/null)
+                USB_PID=$(tr 'A-F' 'a-f' < "$d/idProduct" 2>/dev/null)
+                return 0
+            fi
+        done
+    done
+    return 1
+}
 
 find_working_at_port() {
     AT_PORT=""; ATI_INFO=""
-    local p out
-    for p in /dev/wwan0at0 /dev/mhi_DUN /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyFMI0; do
+    local p out cgmm
+    for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyUSB3 /dev/ttyUSB4 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0; do
         [ -c "$p" ] || continue
         out=$(safe_at_once "$p" "ATI")
-        if echo "$out" | grep -qE 'OK|Sierra|Quectel|Fibocom|FM350|Huawei|Simcom|SIMCOM|Meig|Neoway|Gosuncn'; then
+        if echo "$out" | grep -qE 'OK|Sierra|Quectel|Fibocom|FIBOCOM|FM350|Huawei|HUAWEI|Simcom|SIMCOM|Meig|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Air724|OpenLuat'; then
             AT_PORT="$p"; ATI_INFO="$out"
+            case "$ATI_INFO" in
+                *Sierra*|*Quectel*|*Fibocom*|*FIBOCOM*|*FM350*|*Huawei*|*HUAWEI*|*Simcom*|*SIMCOM*|*Meig*|*MeiG*|*Neoway*|*Gosuncn*|*Telit*|*Thales*|*Air724*) ;;
+                *)
+                    cgmm=$(safe_at_once "$p" "AT+CGMM")
+                    [ -n "$cgmm" ] && ATI_INFO="${ATI_INFO} ${cgmm}"
+                    ;;
+            esac
             return 0
         fi
     done
     return 1
 }
 
+detect_modem_profile() {
+    read_usb_ids_for_netdev || true
+    MODEM_VENDOR="unknown"
+    MODEM_PLATFORM="qualcomm"
+    MODEM_PDP_IDX="1"
+
+    local vinfo="${USB_VID}:${USB_PID}|${NET_DRV}|${ATI_INFO}"
+    case "$vinfo" in
+        *mtk_t7xx*|0e8d:*|*FM350*|*T700*)
+            MODEM_VENDOR="fibocom"
+            MODEM_PLATFORM="mediatek"
+            MODEM_PDP_IDX="0"
+            ;;
+        2c7c:*|*Quectel*)
+            MODEM_VENDOR="quectel"
+            case "$ATI_INFO" in
+                *RG801*|*RG500H*|*HiSilicon*|*Hisilicon*) MODEM_PLATFORM="hisilicon" ;;
+                *RM500U*|*RG500U*|*RG200U*|*EC200U*|*Unisoc*) MODEM_PLATFORM="unisoc" ;;
+                *) MODEM_PLATFORM="qualcomm" ;;
+            esac
+            ;;
+        2cb7:*|1508:*|*Fibocom*|*FIBOCOM*)
+            MODEM_VENDOR="fibocom"
+            case "$ATI_INFO" in
+                *FM350*|*T700*|*MTK*)
+                    MODEM_PLATFORM="mediatek"
+                    MODEM_PDP_IDX="0"
+                    ;;
+                *FG650*|*FM650*|*NL668*|*L610*|*Unisoc*) MODEM_PLATFORM="unisoc" ;;
+                *) MODEM_PLATFORM="qualcomm" ;;
+            esac
+            ;;
+        1199:*|*Sierra*)
+            MODEM_VENDOR="sierra"
+            MODEM_PLATFORM="qualcomm"
+            ;;
+        413c:*|05c6:*|*Foxconn*|*T99W*|*DW593*)
+            MODEM_VENDOR="foxconn"
+            MODEM_PLATFORM="qualcomm"
+            ;;
+        1782:*)
+            case "${USB_PID}|${ATI_INFO}" in
+                4e00*|*Air724*|*OpenLuat*)
+                    MODEM_VENDOR="openluat"
+                    MODEM_PLATFORM="unisoc"
+                    MODEM_PDP_IDX="5"
+                    ;;
+                4038*|4039*|4040*|*Neoway*|*NU313*|*N510*)
+                    MODEM_VENDOR="neoway"
+                    MODEM_PLATFORM="unisoc"
+                    ;;
+                *)
+                    MODEM_VENDOR="huawei"
+                    MODEM_PLATFORM="unisoc"
+                    ;;
+            esac
+            ;;
+        12d1:*|12dc:*|3466:*|*Huawei*|*HUAWEI*|*MT5700*|*MH5000*)
+            MODEM_VENDOR="huawei"
+            MODEM_PLATFORM="hisilicon"
+            ;;
+        1e0e:*|1a0e:*|*Simcom*|*SIMCOM*)
+            MODEM_VENDOR="simcom"
+            case "$ATI_INFO" in
+                *A7600*|*A7670*|*ASR*) MODEM_PLATFORM="asrmicro" ;;
+                *SIM7600*|*SIM7100*) MODEM_PLATFORM="lte" ;;
+                *) MODEM_PLATFORM="qualcomm" ;;
+            esac
+            ;;
+        2dee:*|*Meig*|*MeiG*|*SRM8*)
+            MODEM_VENDOR="meig"
+            MODEM_PLATFORM="qualcomm"
+            ;;
+        1bc7:*|*Telit*|*FN980*|*FN990*|*LM960*)
+            MODEM_VENDOR="telit"
+            MODEM_PLATFORM="qualcomm"
+            ;;
+        305a:*|*Gosuncn*|*GM800*|*GM500*)
+            MODEM_VENDOR="gosuncn"
+            MODEM_PLATFORM="lte"
+            ;;
+        1e2d:*|*Thales*|*Cinterion*|*MV31*|*MV32*)
+            MODEM_VENDOR="thales"
+            MODEM_PLATFORM="qualcomm"
+            ;;
+        3763:*|*Neoway*)
+            MODEM_VENDOR="neoway"
+            MODEM_PLATFORM="unisoc"
+            ;;
+        *Air724*|*OpenLuat*)
+            MODEM_VENDOR="openluat"
+            MODEM_PLATFORM="unisoc"
+            MODEM_PDP_IDX="5"
+            ;;
+    esac
+
+    [ -n "$user_pdp_index" ] && MODEM_PDP_IDX="$user_pdp_index"
+    if [ "$MODE" = "at_dhcp" ] && [ "$MODEM_VENDOR" = "fibocom" ] && [ "$MODEM_PLATFORM" = "mediatek" ]; then
+        MODE="fm350_usb"
+    fi
+}
+
 pre_dial_prepare() {
     stop_competing_dialers
-    find_working_at_port || return 0
+    find_working_at_port || { detect_modem_profile; return 0; }
+    detect_modem_profile
     local cfun_res cpin_res
     cfun_res=$(safe_at_once "$AT_PORT" "AT+CFUN?")
     if echo "$cfun_res" | grep -qE '\+CFUN:[[:space:]]*[04]'; then
@@ -317,30 +501,140 @@ pre_dial_prepare() {
     fi
 }
 
+at_auth_num() {
+    case "$auth" in
+        pap|1) echo 1 ;;
+        chap|2) echo 2 ;;
+        mschapv2|both|auto|3) echo 3 ;;
+        *) echo 0 ;;
+    esac
+}
+
 at_dial_activate() {
     [ -c "$AT_PORT" ] || find_working_at_port || return 0
-    local pdp_str="IPV4V6" act_cmd=""
+    local cid="$MODEM_PDP_IDX" pdp_str="IPV4V6" cgdcont_cmd="" auth_cmd="" nat_cmd="" act_cmd="" auth_num plmn cnmp
     case "$pdptype" in
         ip|ipv4) pdp_str="IP" ;;
         ipv6) pdp_str="IPV6" ;;
     esac
-    safe_at_once "$AT_PORT" "AT+CGDCONT=1,\"$pdp_str\",\"$apn\"" >/dev/null
-    case "$ATI_INFO" in
-        *Quectel*) act_cmd='AT+QNETDEVCTL=3,1,1' ;;
-        *Fibocom*|*FIBOCOM*|*FM350*)
-            [ "$NET_DRV" = "mtk_t7xx" ] && act_cmd='AT+CGACT=1,1' || act_cmd='AT+GTRNDIS=1,1'
+    auth_num=$(at_auth_num)
+
+    if [ "$MODEM_VENDOR" != "openluat" ]; then
+        safe_at_once "$AT_PORT" "AT+COPS=0,0" >/dev/null
+    fi
+
+    case "$MODEM_VENDOR" in
+        quectel)
+            case "$MODEM_PLATFORM" in
+                hisilicon)
+                    act_cmd="AT+QNETDEVCTL=1,1,1"
+                    ;;
+                unisoc)
+                    cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+                    act_cmd="AT+QNETDEVCTL=1,$cid,1"
+                    ;;
+                *)
+                    cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+                    nat_cmd='AT+QCFG="nat",1'
+                    act_cmd="AT+QNETDEVCTL=3,$cid,1"
+                    ;;
+            esac
             ;;
-        *Sierra*) act_cmd='AT!SCACT=1,1' ;;
-        *Huawei*|*HUAWEI*) act_cmd="AT^NDISDUP=1,1,\"$apn\"" ;;
-        *Meig*|*MeiG*|*MEIG*) act_cmd='AT$QCRMCALL=1,1,3,2,1' ;;
-        *Simcom*|*SIMCOM*) act_cmd='AT$QCRMCALL=1,1' ;;
-        *Neoway*) act_cmd='AT$MYUSBNETACT=1,1' ;;
-        *Gosuncn*) act_cmd='AT+ZECMCALL=1' ;;
-        *) act_cmd='AT+CGACT=1,1' ;;
+        fibocom)
+            cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+            if [ "$MODEM_PLATFORM" = "mediatek" ]; then
+                act_cmd="AT+CGACT=1,$cid"
+            else
+                act_cmd="AT+GTRNDIS=1,$cid"
+                if [ -n "$username$password" ] && [ "$auth_num" != "0" ]; then
+                    auth_cmd="AT+MGAUTH=$cid,$auth_num,\"$username\",\"$password\""
+                fi
+            fi
+            ;;
+        huawei)
+            cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+            if [ "$MODEM_PLATFORM" = "unisoc" ]; then
+                act_cmd="AT^SETAUTODIAL=1,4"
+            else
+                act_cmd="AT^NDISDUP=1,$cid"
+                if [ -n "$username$password" ] && [ "$auth_num" != "0" ]; then
+                    plmn=$(safe_at_once "$AT_PORT" "AT+COPS=3,2;+COPS?" | sed -n 's/.*"\([0-9][0-9][0-9][0-9][0-9][0-9]*\)".*/\1/p' | head -n1 | cut -c1-5)
+                    [ -n "$plmn" ] || plmn="00000"
+                    auth_cmd="AT^AUTHDATA=$cid,$auth_num,$plmn,\"$username\",\"$password\""
+                fi
+            fi
+            ;;
+        openluat)
+            act_cmd="AT+RNDISCALL=1"
+            ;;
+        simcom)
+            if [ "$MODEM_PLATFORM" = "qualcomm" ]; then
+                cgdcont_cmd="AT+CGDCONT=1,\"$pdp_str\",\"$apn\""
+                cnmp=$(safe_at_once "$AT_PORT" "AT+CNMP?" | sed -n 's/.*+CNMP:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+                act_cmd="AT+CNMP=${cnmp:-2};+CNWINFO=1"
+            else
+                cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+                act_cmd="AT+CGACT=1,$cid"
+            fi
+            ;;
+        sierra)
+            cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+            act_cmd="AT!SCACT=1,$cid"
+            ;;
+        meig)
+            cgdcont_cmd="AT+CGDCONT=1,\"$pdp_str\",\"$apn\""
+            act_cmd="AT\$QCRMCALL=1,0,3,2,$cid"
+            ;;
+        neoway)
+            cgdcont_cmd="AT+CGDCONT=1,\"$pdp_str\",\"$apn\""
+            act_cmd='AT$MYUSBNETACT=0,1'
+            ;;
+        telit)
+            cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+            act_cmd="AT#ICMAUTOCONN=1,$cid"
+            ;;
+        gosuncn)
+            cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+            act_cmd="AT+ZECMCALL=1"
+            ;;
+        thales)
+            cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+            act_cmd="AT^SWWAN=1,$cid"
+            ;;
+        *)
+            cgdcont_cmd="AT+CGDCONT=$cid,\"$pdp_str\",\"$apn\""
+            act_cmd="AT+CGACT=1,$cid"
+            ;;
     esac
-    logger -t duydoan5g "Sending AT dial command ($act_cmd) on $AT_PORT"
+
+    [ -n "$cgdcont_cmd" ] && safe_at_once "$AT_PORT" "$cgdcont_cmd" >/dev/null
+    [ -n "$auth_cmd" ] && safe_at_once "$AT_PORT" "$auth_cmd" >/dev/null
+    [ -n "$nat_cmd" ] && safe_at_once "$AT_PORT" "$nat_cmd" >/dev/null
+    logger -t duydoan5g "AT dial ($MODEM_VENDOR/$MODEM_PLATFORM, pdp=$cid): $act_cmd on $AT_PORT"
     safe_at_once "$AT_PORT" "$act_cmd" >/dev/null
+    AT_DIAL_ACTIVE=1
     sleep 2
+}
+
+at_hangup() {
+    [ -c "$AT_PORT" ] || return 0
+    local cid="$MODEM_PDP_IDX" hcmd=""
+    case "$MODEM_VENDOR" in
+        openluat) return 0 ;;
+        huawei)
+            [ "$MODEM_PLATFORM" = "unisoc" ] && hcmd="AT^SETAUTODIAL=0" || hcmd="AT^NDISDUP=0,0"
+            ;;
+        quectel) hcmd="AT+QNETDEVCTL=$cid,2,1" ;;
+        fibocom) [ "$MODEM_PLATFORM" = "mediatek" ] && hcmd="AT+CGACT=0,$cid" || hcmd="AT+GTRNDIS=0,$cid" ;;
+        meig) hcmd="AT\$QCRMCALL=0,0,3,2,$cid" ;;
+        neoway) hcmd='AT$MYUSBNETACT=0,0' ;;
+        gosuncn) hcmd="AT+ZECMCALL=0" ;;
+        sierra) hcmd="AT!SCACT=0,$cid" ;;
+        thales) hcmd="AT^SWWAN=0,$cid" ;;
+        *) return 0 ;;
+    esac
+    safe_at_once "$AT_PORT" "$hcmd" >/dev/null || true
+    AT_DIAL_ACTIVE=0
 }
 
 clamp_mtu() {
@@ -428,6 +722,23 @@ run_uqmi_fallback() {
     return 0
 }
 
+publish_umbim_config() {
+    local mbimconfig="$1" cidr4 m4 v4 gw4 dns4 cidr6 v6 m6 gw6
+    cidr4=$(echo "$mbimconfig" | awk '/ipv4address:/{print $2; exit}')
+    v4="${cidr4%/*}"; m4="${cidr4#*/}"; [ "$m4" = "$cidr4" ] && m4=30
+    gw4=$(echo "$mbimconfig" | awk '/ipv4gateway:/{print $2; exit}')
+    dns4=$(echo "$mbimconfig" | awk '/ipv4dnsserver:/{printf "%s ", $2}')
+    cidr6=$(echo "$mbimconfig" | awk '/ipv6address:/{print $2; exit}')
+    v6="${cidr6%/*}"; m6="${cidr6#*/}"; [ "$m6" = "$cidr6" ] && m6=64
+    gw6=$(echo "$mbimconfig" | awk '/ipv6gateway:/{print $2; exit}')
+    [ -n "$v4" ] || [ -n "$v6" ] || return 1
+    rm -f /tmp/quectel_dialing
+    publish_netifd_up "$v4" "$m4" "$gw4" "$v6" "$m6" "$gw6" "$dns4"
+    UMBIM_LAST_SIG="${v4}/${m4}|${gw4}|${v6}/${m6}"
+    UMBIM_LAST_V4="$v4"
+    return 0
+}
+
 run_umbim_fallback() {
     logger -t duydoan5g "Switching to native umbim fallback on $CTRL_DEV ($IFNAME)"
     stop_competing_dialers
@@ -471,30 +782,18 @@ run_umbim_fallback() {
     mbimconfig=$(timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" config 2>/dev/null)
     UMBIM_TID=$((tid + 1))
 
-    local cidr4 m4 v4 gw4 dns4 cidr6 v6 m6 gw6
-    cidr4=$(echo "$mbimconfig" | awk '/ipv4address:/{print $2; exit}')
-    v4="${cidr4%/*}"; m4="${cidr4#*/}"; [ "$m4" = "$cidr4" ] && m4=30
-    gw4=$(echo "$mbimconfig" | awk '/ipv4gateway:/{print $2; exit}')
-    dns4=$(echo "$mbimconfig" | awk '/ipv4dnsserver:/{printf "%s ", $2}')
-    cidr6=$(echo "$mbimconfig" | awk '/ipv6address:/{print $2; exit}')
-    v6="${cidr6%/*}"; m6="${cidr6#*/}"; [ "$m6" = "$cidr6" ] && m6=64
-    gw6=$(echo "$mbimconfig" | awk '/ipv6gateway:/{print $2; exit}')
-
-    [ -n "$v4" ] || [ -n "$v6" ] || {
+    publish_umbim_config "$mbimconfig" || {
         timeout 4 umbim -n -t "$UMBIM_TID" -d "$CTRL_DEV" disconnect >/dev/null 2>&1 || true
         UMBIM_ACTIVE=0
         return 1
     }
-
-    rm -f /tmp/quectel_dialing
-    publish_netifd_up "$v4" "$m4" "$gw4" "$v6" "$m6" "$gw6" "$dns4"
-    logger -t duydoan5g "Connected via umbim fallback! IP: $v4, GW: $gw4, IPv6: $v6"
+    logger -t duydoan5g "Connected via umbim fallback ($MODEM_VENDOR/$MODEM_PLATFORM)! Sig: $UMBIM_LAST_SIG"
 
     while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
         clamp_mtu
         local live4
         live4=$(ip -4 addr show dev "$IFNAME" 2>/dev/null | awk '/inet /{print $2; exit}')
-        [ -n "$v4" ] && [ -z "$live4" ] && break
+        [ -n "$UMBIM_LAST_V4" ] && [ -z "$live4" ] && break
         sleep 5
     done
     if [ "$STOP_REQ" = "0" ]; then
@@ -504,6 +803,148 @@ run_umbim_fallback() {
     fi
     UMBIM_ACTIVE=0
     return 0
+}
+
+run_mtk_pcie_dial() {
+    [ -c "$CTRL_DEV" ] || [ -z "$AT_PORT" ] || CTRL_DEV=$(echo "$AT_PORT" | sed 's/at/mbim/g')
+    if [ ! -c "$CTRL_DEV" ] || ! command -v umbim >/dev/null 2>&1; then
+        logger -t duydoan5g "mtk_pcie missing CTRL_DEV=$CTRL_DEV or umbim; falling back to AT+DHCP"
+        return 1
+    fi
+    logger -t duydoan5g "Starting MTK PCIe MBIM dialer on $IFNAME (Ctrl: $CTRL_DEV, APN: $apn)"
+    while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
+        ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
+        ip link set dev "$IFNAME" up 2>/dev/null || true
+        local rf_state mbimconfig prev_sig="" ok_cfg=0
+        rf_state=$(timeout 5 umbim -d "$CTRL_DEV" radio 2>/dev/null | sed -n 's/.*swradiostate: *//p')
+        [ "$rf_state" = "off" ] && timeout 5 umbim -d "$CTRL_DEV" radio on >/dev/null 2>&1 || true
+        timeout 6 umbim -d "$CTRL_DEV" disconnect >/dev/null 2>&1 || true
+        sleep 1
+
+        if timeout 12 umbim -d "$CTRL_DEV" connect 0 --apn "${apn:-auto}" >/dev/null 2>&1; then
+            mbimconfig=$(timeout 8 umbim -d "$CTRL_DEV" config 2>/dev/null)
+            publish_umbim_config "$mbimconfig" && ok_cfg=1
+        fi
+        if [ "$ok_cfg" = "1" ]; then
+            logger -t duydoan5g "MTK PCIe connected! Sig: $UMBIM_LAST_SIG"
+            prev_sig="$UMBIM_LAST_SIG"
+            while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
+                sleep 15
+                [ "$STOP_REQ" = "0" ] || break
+                mbimconfig=$(timeout 8 umbim -d "$CTRL_DEV" config 2>/dev/null)
+                local c4 c6 cur_sig
+                c4=$(echo "$mbimconfig" | awk '/ipv4address:/{print $2; exit}')
+                c6=$(echo "$mbimconfig" | awk '/ipv6address:/{print $2; exit}')
+                [ -n "$c4" ] || [ -n "$c6" ] || break
+                cur_sig="${c4}|$(echo "$mbimconfig" | awk '/ipv4gateway:/{print $2; exit}')|${c6}"
+                if [ "$cur_sig" != "$prev_sig" ]; then
+                    publish_umbim_config "$mbimconfig" || break
+                    prev_sig="$UMBIM_LAST_SIG"
+                fi
+            done
+            if [ "$STOP_REQ" = "0" ]; then
+                proto_init_update "$IFNAME" 0
+                proto_send_update "$interface"
+            fi
+        else
+            # Fallback to stock OpenWrt umbim transaction mode
+            run_umbim_fallback || sleep 5
+        fi
+    done
+}
+
+run_fm350_usb_dial() {
+    local cid="$MODEM_PDP_IDX" cgp v4 v6 gw4 dns4 sig last_sig=""
+    logger -t duydoan5g "Starting FM350 USB static IP dialer on $IFNAME (pdp=$cid, APN=$apn)"
+    while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
+        at_dial_activate
+        ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
+        ip link set dev "$IFNAME" up 2>/dev/null || true
+        v4=""; v6=""
+        local t=0
+        while [ "$t" -lt 4 ] && [ "$STOP_REQ" = "0" ]; do
+            cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$cid")
+            v4=$(extract_cgpaddr_ipv4 "$cgp")
+            v6=$(extract_cgpaddr_ipv6 "$cgp")
+            [ -n "$v4" ] || [ -n "$v6" ] && break
+            t=$((t + 1)); sleep 2
+        done
+        if [ -z "$v4" ] && [ -z "$v6" ]; then
+            sleep 5
+            continue
+        fi
+        gw4=""; [ -n "$v4" ] && gw4="${v4%.*}.1"
+        dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$cid")")
+        last_sig="${v4}|${gw4}|${v6}"
+        publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
+        logger -t duydoan5g "FM350 USB connected! IP: $v4, GW: $gw4, IPv6: $v6"
+
+        while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
+            sleep 15
+            [ "$STOP_REQ" = "0" ] || break
+            cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$cid")
+            v4=$(extract_cgpaddr_ipv4 "$cgp")
+            v6=$(extract_cgpaddr_ipv6 "$cgp")
+            [ -n "$v4" ] || [ -n "$v6" ] || break
+            gw4=""; [ -n "$v4" ] && gw4="${v4%.*}.1"
+            sig="${v4}|${gw4}|${v6}"
+            if [ "$sig" != "$last_sig" ]; then
+                dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$cid")")
+                publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
+                last_sig="$sig"
+            fi
+        done
+        if [ "$STOP_REQ" = "0" ]; then
+            proto_init_update "$IFNAME" 0
+            proto_send_update "$interface"
+            sleep 3
+        fi
+    done
+}
+
+run_at_dhcp_monitor() {
+    at_dial_activate
+    ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
+    ip link set dev "$IFNAME" up 2>/dev/null || true
+
+    local check_cid="$MODEM_PDP_IDX" is_auto=0 cgp v4 v6 cur_sig last_sig=""
+    [ "$MODEM_VENDOR" = "simcom" ] && [ "$MODEM_PLATFORM" = "qualcomm" ] && check_cid="6"
+    [ "$MODEM_VENDOR" = "neoway" ] && check_cid="1"
+    if [ "$MODEM_VENDOR" = "openluat" ] || { [ "$MODEM_VENDOR" = "huawei" ] && [ "$MODEM_PLATFORM" = "unisoc" ]; }; then
+        is_auto=1
+    fi
+
+    while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
+        if [ -z "$UDHCPC_PID" ] || ! kill -0 "$UDHCPC_PID" 2>/dev/null; then
+            INTERFACE="$interface" /sbin/udhcpc -f -p "$PID_FILE" -i "$IFNAME" -s /lib/netifd/dhcp.script >/dev/null 2>&1 &
+            UDHCPC_PID=$!
+            UDHCPC_START=$(awk '{print $22}' "/proc/$UDHCPC_PID/stat" 2>/dev/null)
+        fi
+        sleep 15
+        [ "$STOP_REQ" = "0" ] || break
+        clamp_mtu
+        [ "$is_auto" = "1" ] && continue
+        [ -c "$AT_PORT" ] || continue
+
+        cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$check_cid")
+        [ -n "$cgp" ] || continue
+        v4=$(extract_cgpaddr_ipv4 "$cgp")
+        v6=$(extract_cgpaddr_ipv6 "$cgp")
+        cur_sig="${v4}|${v6}"
+        if [ -z "$v4" ] && [ -z "$v6" ]; then
+            logger -t duydoan5g "PDP $check_cid dropped on $IFNAME; re-dialing AT"
+            at_dial_activate
+            [ -n "$UDHCPC_PID" ] && kill -USR1 "$UDHCPC_PID" 2>/dev/null || true
+            last_sig=""
+        elif [ -n "$last_sig" ] && [ "$cur_sig" != "$last_sig" ]; then
+            [ -n "$UDHCPC_PID" ] && kill -USR1 "$UDHCPC_PID" 2>/dev/null || true
+            last_sig="$cur_sig"
+        else
+            last_sig="$cur_sig"
+        fi
+    done
+    stop_pid_graceful "$UDHCPC_PID" "$UDHCPC_START"
+    UDHCPC_PID=""; UDHCPC_START=""
 }
 
 rotate_cm_log() {
@@ -517,16 +958,22 @@ rotate_cm_log() {
 
 wake_hardware
 detect_endpoint || exit 1
-logger -t duydoan5g "Starting 5G supervised dialer on $IFNAME (Mode: $MODE, Driver: ${NET_DRV:-unknown}, Ctrl: ${CTRL_DEV:-none}, APN: $apn)"
-
 pre_dial_prepare
+logger -t duydoan5g "Starting 5G supervised dialer on $IFNAME (Mode: $MODE, Vendor: $MODEM_VENDOR/$MODEM_PLATFORM, PDP: $MODEM_PDP_IDX, Driver: ${NET_DRV:-unknown}, Ctrl: ${CTRL_DEV:-none}, APN: $apn)"
+
+if [ "$MODE" = "mtk_pcie" ]; then
+    run_mtk_pcie_dial && exit 0
+    MODE="at_dhcp"
+fi
+
+if [ "$MODE" = "fm350_usb" ]; then
+    run_fm350_usb_dial
+    exit 0
+fi
 
 if [ "$MODE" = "at_dhcp" ]; then
-    at_dial_activate
-    ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
-    ip link set dev "$IFNAME" up 2>/dev/null || true
-    export INTERFACE="$interface"
-    exec /sbin/udhcpc -f -p "$PID_FILE" -i "$IFNAME" -s /lib/netifd/dhcp.script
+    run_at_dhcp_monitor
+    exit 0
 fi
 
 fail_streak=0
@@ -549,22 +996,22 @@ while [ "$STOP_REQ" = "0" ]; do
             ipv6) set -- "$@" -6 ;;
             *) set -- "$@" -4 -6 ;;
         esac
+        [ -n "$user_pdp_index" ] && set -- "$@" -n "$user_pdp_index"
         if [ -n "$apn" ]; then
             set -- "$@" -s "$apn"
             if [ -n "$username" ] && [ -n "$password" ]; then
-                case "$auth" in
-                    pap|1) auth_code=1 ;;
-                    chap|2) auth_code=2 ;;
-                    mschapv2|both|3) auth_code=3 ;;
-                    *) auth_code=0 ;;
-                esac
-                set -- "$@" "$username" "$password" "$auth_code"
+                set -- "$@" "$username" "$password" "$(at_auth_num)"
             fi
         fi
         [ -n "$pincode" ] && set -- "$@" -p "$pincode"
         set -- "$@" -d
         case "$local_qcm" in
-            */quectel-CM-M) set -- "$@" -D -M "$metric" ;;
+            */quectel-CM-M)
+                set -- "$@" -D -M "$metric"
+                if [ "$force_apn" = "1" ] || [ "$MODEM_VENDOR" = "telit" ]; then
+                    set -- "$@" -F
+                fi
+                ;;
         esac
         set -- "$@" -f "$LOG_FILE"
 
@@ -611,7 +1058,7 @@ while [ "$STOP_REQ" = "0" ]; do
                 connecting_sec=$((connecting_sec + 1))
                 if [ "$connecting_sec" -ge 45 ]; then
                     logger -t duydoan5g "Dial handshake stalled 45s on $IFNAME; cycling $local_qcm"
-                    stop_cm_graceful "$CM_PID" "$CM_START"
+                    stop_pid_graceful "$CM_PID" "$CM_START"
                     break
                 fi
             fi
@@ -636,12 +1083,16 @@ while [ "$STOP_REQ" = "0" ]; do
     fi
 
     if { [ -z "$local_qcm" ] || [ "$fail_streak" -ge 3 ]; } && [ -c "$CTRL_DEV" ]; then
-        if [ "$MODE" = "cm_mbim" ] && [ -x /sbin/umbim ]; then
-            run_umbim_fallback
-            fail_streak=0
-        elif [ "$MODE" = "cm_qmi" ] && command -v uqmi >/dev/null 2>&1; then
-            run_uqmi_fallback
-            fail_streak=0
+        if [ "$MODE" = "cm_mbim" ] || { [ "$MODE" = "cm_usb" ] && [ "$NET_DRV" = "cdc_mbim" ]; }; then
+            if [ -x /sbin/umbim ]; then
+                run_umbim_fallback
+                fail_streak=0
+            fi
+        elif [ "$MODE" = "cm_qmi" ] || [ "$MODE" = "cm_usb" ]; then
+            if command -v uqmi >/dev/null 2>&1; then
+                run_uqmi_fallback
+                fail_streak=0
+            fi
         fi
     fi
 
