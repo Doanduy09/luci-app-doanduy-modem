@@ -32,19 +32,19 @@ detect_hw() {
 
 	if [ "$MEM_MB" -le 128 ]; then
 		RAM_TIER="Ultra-Low-RAM (<=128MB)"
-		CFG_CONNTRACK=8192; CFG_BUF=131072; CFG_MINFREE=2048; CFG_SWAP=10
+		CFG_CONNTRACK=8192; CFG_BUF=262144; CFG_RDEF=131072; CFG_MINFREE=2048; CFG_SWAP=10
 		CFG_BACKLOG=1000; CFG_SOMAX=512
 	elif [ "$MEM_MB" -le 256 ]; then
 		RAM_TIER="Low-RAM (129-256MB)"
-		CFG_CONNTRACK=16384; CFG_BUF=262144; CFG_MINFREE=4096; CFG_SWAP=10
+		CFG_CONNTRACK=16384; CFG_BUF=1048576; CFG_RDEF=131072; CFG_MINFREE=4096; CFG_SWAP=10
 		CFG_BACKLOG=2000; CFG_SOMAX=1024
 	elif [ "$MEM_MB" -le 768 ]; then
 		RAM_TIER="Mid-Tier (256-768MB)"
-		CFG_CONNTRACK=65536; CFG_BUF=1048576; CFG_MINFREE=8192; CFG_SWAP=20
+		CFG_CONNTRACK=65536; CFG_BUF=4194304; CFG_RDEF=262144; CFG_MINFREE=8192; CFG_SWAP=20
 		CFG_BACKLOG=16384; CFG_SOMAX=8192
 	else
 		RAM_TIER="High-Tier (>=1GB)"
-		CFG_CONNTRACK=131072; CFG_BUF=4194304; CFG_MINFREE=16384; CFG_SWAP=30
+		CFG_CONNTRACK=131072; CFG_BUF=8388608; CFG_RDEF=262144; CFG_MINFREE=16384; CFG_SWAP=30
 		CFG_BACKLOG=16384; CFG_SOMAX=8192
 	fi
 
@@ -67,9 +67,16 @@ detect_hw() {
 }
 
 disable_wwan_powersave() {
-	local p
-	for p in /sys/bus/usb/devices/*/power/control /sys/bus/pci/devices/*/power/control /sys/bus/mhi/devices/*/power/control; do
+	local p d cls
+	for p in /sys/bus/usb/devices/*/power/control /sys/bus/mhi/devices/*/power/control; do
 		[ -w "$p" ] && echo on > "$p" 2>/dev/null || true
+	done
+	for d in /sys/bus/pci/devices/*; do
+		[ -r "$d/class" ] || continue
+		cls=$(cat "$d/class" 2>/dev/null)
+		case "$cls" in
+			0x0d*) [ -w "$d/power/control" ] && echo on > "$d/power/control" 2>/dev/null || true ;;
+		esac
 	done
 	[ -w /sys/module/usbcore/parameters/autosuspend ] && echo -1 > /sys/module/usbcore/parameters/autosuspend 2>/dev/null || true
 }
@@ -108,14 +115,22 @@ cmd_apply() {
 	cat <<EOF > "$OPT_CONF"
 # DOANDUY 5G Hardware-Adaptive Sysctl (${RAM_TIER} / ${SOC_TYPE})
 net.netfilter.nf_conntrack_max = ${CFG_CONNTRACK}
+net.core.rmem_default = ${CFG_RDEF}
+net.core.wmem_default = ${CFG_RDEF}
 net.core.rmem_max = ${CFG_BUF}
 net.core.wmem_max = ${CFG_BUF}
 net.ipv4.tcp_rmem = 4096 131072 ${CFG_BUF}
 net.ipv4.tcp_wmem = 4096 65536 ${CFG_BUF}
 net.core.netdev_max_backlog = ${CFG_BACKLOG}
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
+net.core.rps_sock_flow_entries = 16384
 net.core.somaxconn = ${CFG_SOMAX}
 net.core.default_qdisc = ${qdisc}
 net.ipv4.tcp_congestion_control = ${cc}
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
 vm.min_free_kbytes = ${CFG_MINFREE}
 vm.swappiness = ${CFG_SWAP}
 vm.vfs_cache_pressure = 60

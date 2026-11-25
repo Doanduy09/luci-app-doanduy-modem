@@ -184,8 +184,25 @@ check_internet_status() {
     if command -v ubus >/dev/null 2>&1; then
         local if_up=$(ubus call network.interface."$act_iface" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
         if [ "$if_up" != "true" ]; then
+            LAST_RX_BYTES=0
+            RX_SKIP_STREAK=0
             return 1
         fi
+    fi
+
+    if [ -r "/sys/class/net/$l3_dev/statistics/rx_bytes" ]; then
+        local cur_rx
+        cur_rx=$(cat "/sys/class/net/$l3_dev/statistics/rx_bytes" 2>/dev/null || echo 0)
+        case "$cur_rx" in
+            ''|*[!0-9]*) cur_rx=0 ;;
+        esac
+        if [ "${FAIL_STREAK:-0}" -eq 0 ] && [ "${LAST_RX_BYTES:-0}" -gt 0 ] && [ "$((cur_rx - LAST_RX_BYTES))" -ge 8192 ] && [ "${RX_SKIP_STREAK:-0}" -lt 2 ]; then
+            LAST_RX_BYTES="$cur_rx"
+            RX_SKIP_STREAK=$(( ${RX_SKIP_STREAK:-0} + 1 ))
+            return 0
+        fi
+        LAST_RX_BYTES="$cur_rx"
+        RX_SKIP_STREAK=0
     fi
 
     local real_curl=0
@@ -248,7 +265,14 @@ check_dns_status() {
 apply_mss_clamping() {
     if command -v nft >/dev/null 2>&1; then
         if ! nft list table inet fw4 2>/dev/null | grep -q "maxseg size set rt mtu"; then
-            nft add rule inet fw4 forward oifname { "mhi_hwip0", "wwan0", "eth2", "usb0", "wan" } tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
+            local l3_dev if_set="" cand
+            l3_dev=$(get_smart_device)
+            for cand in "$l3_dev" "mhi_hwip0" "wwan0" "rmnet_mhi0.1" "eth2" "usb0" "wan"; do
+                [ -n "$cand" ] || continue
+                case " $if_set " in *" \"$cand\" "*) continue ;; esac
+                if_set="${if_set:+$if_set, }\"$cand\""
+            done
+            nft add rule inet fw4 forward oifname "{ $if_set }" tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
         fi
     fi
     if command -v iptables >/dev/null 2>&1; then
@@ -310,7 +334,7 @@ warm_reset_wwan_baseband() {
         local m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
         if echo "$m_type" | grep -iqE "sierra|1199:"; then
             wd_at_cmd "$port" "AT!RESET" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1 || true
-        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
+        elif echo "$m_type" | grep -iqE "fibocom|fm350|2cb7:|0e8d:"; then
             wd_at_cmd "$port" "AT+CFUN=15" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1 || true
         else
             wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1 || true
@@ -495,7 +519,7 @@ heal_tier3_cfun_cell_failover() {
         [ -z "$m_type" ] && command -v lsusb >/dev/null 2>&1 && m_type=$(lsusb 2>/dev/null)
         if echo "$m_type" | grep -iqE "sierra|1199:"; then
             wd_at_cmd "$port" "AT!RESET" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1
-        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
+        elif echo "$m_type" | grep -iqE "fibocom|fm350|2cb7:|0e8d:"; then
             wd_at_cmd "$port" "AT+CFUN=15" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1
         else
             wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1
@@ -607,7 +631,7 @@ switch_dual_sim() {
             cur_slot=$(wd_at_cmd "$port" "AT!UIMS?" 3 2>/dev/null | grep -i "!UIMS:" | awk -F':' '{print $2}' | tr -d ' \r\n')
             [ "$cur_slot" = "0" ] && cur_slot="1"
             [ "$cur_slot" = "1" ] && cur_slot="2"
-        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
+        elif echo "$m_type" | grep -iqE "fibocom|fm350|2cb7:|0e8d:"; then
             # Fibocom: AT+GTSETSIM?
             cur_slot=$(wd_at_cmd "$port" "AT+GTSETSIM?" 3 2>/dev/null | grep -i "+GTSETSIM:" | awk -F':' '{print $2}' | tr -d ' \r\n')
         else
@@ -627,7 +651,7 @@ switch_dual_sim() {
             local sierra_slot=0
             [ "$target_slot" = "2" ] && sierra_slot=1
             wd_at_cmd "$port" "AT!UIMS=$sierra_slot" 3 >/dev/null 2>&1 || true
-        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
+        elif echo "$m_type" | grep -iqE "fibocom|fm350|2cb7:|0e8d:"; then
             wd_at_cmd "$port" "AT+GTSETSIM=$target_slot" 3 >/dev/null 2>&1 || true
         else
             wd_at_cmd "$port" "AT+QUIMSLOT=$target_slot" 3 >/dev/null 2>&1 || true
@@ -808,6 +832,8 @@ check_silent_pdp_freeze() {
 }
 
 HEALTHY_STREAK=0
+LAST_RX_BYTES=0
+RX_SKIP_STREAK=0
 SLEEP_INTERVAL=20
 
 while true; do

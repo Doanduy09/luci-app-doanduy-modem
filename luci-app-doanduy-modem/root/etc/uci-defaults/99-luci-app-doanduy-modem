@@ -126,7 +126,7 @@ case "$INTERFACE" in
             eth*)
                 drv_link=$(readlink -f "/sys/class/net/${INTERFACE}/device/driver" 2>/dev/null)
                 case "${drv_link##*/}" in
-                    cdc_ncm|huawei_cdc_ncm|cdc_ether|rndis_host|sierra_net|cdc_subset|ipheth|qmi_wwan|qmi_wwan_q|cdc_mbim|GobiNet) ;;
+                    cdc_ncm|huawei_cdc_ncm|cdc_ether|rndis_host|sierra_net|cdc_subset|ipheth|qmi_wwan|qmi_wwan_q|cdc_mbim|GobiNet|mtk_t7xx|mhi_net|rmnet_nss) ;;
                     *) exit 0 ;;
                 esac
                 ;;

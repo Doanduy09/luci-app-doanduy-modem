@@ -231,6 +231,10 @@ read_rf_telemetry_cached() {
 			fi
 			temp_out=$(safe_at_query "$port" "AT+QTEMP")
 			max_t=$(printf '%s\n' "$temp_out" | grep -oE '"-?[0-9]+"' | tr -d '"' | awk '$1>=10 && $1<=120 {if($1>m)m=$1} END{if(m>0)print m}')
+			local ca_out scc_cnt
+			ca_out=$(safe_at_query "$port" "AT+QCAINFO")
+			scc_cnt=$(printf '%s\n' "$ca_out" | grep -c '"SCC"' 2>/dev/null || echo 0)
+			[ -n "$band" ] && [ "${scc_cnt:-0}" -gt 0 ] 2>/dev/null && band="${band} (+${scc_cnt}CA)"
 		elif [ "$vendor" = "sierra" ] || [ "$USB_VID" = "1199" ]; then
 			rf_out=$(safe_at_query "$port" "AT!GSTATUS?")
 			[ -n "$rf_out" ] && {
@@ -298,6 +302,16 @@ read_rf_telemetry_cached() {
 				fi
 			elif [ -n "$lte_rsrp" ]; then
 				rsrp="$lte_rsrp"
+			fi
+			local ca_out scc_cnt
+			ca_out=$(safe_at_query "$port" "AT+GTCAINFO?")
+			scc_cnt=$(printf '%s\n' "$ca_out" | grep -ic 'SCC' 2>/dev/null || echo 0)
+			[ -n "$band" ] && [ "${scc_cnt:-0}" -gt 0 ] 2>/dev/null && band="${band} (+${scc_cnt}CA)"
+			temp_out=$(safe_at_query "$port" "AT+GTSENRDTEMP=1")
+			max_t=$(printf '%s\n' "$temp_out" | sed -n 's/.*+GTSENRDTEMP:[[:space:]]*\(.*\)/\1/p' | awk -F',' '{for(i=1;i<=NF;i++){gsub(/[^0-9.-]/,"",$i); if($i!=""){v=$i+0; if(v>=1000) v=int(v/1000); if(v>=10 && v<=120 && v>m) m=v}}} END{if(m>0) printf "%.0f", m}')
+			if [ -z "$max_t" ]; then
+				temp_out=$(safe_at_query "$port" "AT+MTSM=1,6")
+				max_t=$(printf '%s\n' "$temp_out" | sed -n 's/.*+MTSM:[[:space:]]*\([0-9]*\).*/\1/p' | awk '$1>=10 && $1<=120 {if($1>m)m=$1} END{if(m>0)print m}')
 			fi
 		fi
 

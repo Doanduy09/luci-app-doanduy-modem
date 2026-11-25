@@ -21,6 +21,13 @@ is_sierra_modem() {
     printf '%s' "${mt}|${META_VENDOR}|${META_MODEL}|${META_USB_VID}" | grep -iqE "sierra|em919|em75|1199"
 }
 
+is_fibocom_modem() {
+    local mt=""
+    mt=$(cat /tmp/master_m_type 2>/dev/null || echo "")
+    [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    printf '%s' "${mt}|${META_VENDOR}|${META_MODEL}|${META_USB_VID}" | grep -iqE "fibocom|fm350|fm150|2cb7|0e8d"
+}
+
 get_modem_meta_str() {
     local mt=""
     mt=$(cat /tmp/master_m_type 2>/dev/null || echo "")
@@ -466,9 +473,11 @@ EOF
                 
                 if [ "$mode" = "auto_carrier" ] || [ "$mode" = "5g_max" ]; then
                     case "$carrier" in
-                        VinaPhone*) eff_mode="vina_5g" ;;
-                        MobiFone*)  eff_mode="mobi_5g" ;;
-                        Viettel*|*) eff_mode="viettel_5g" ;;
+                        VinaPhone*|*VNPT*) eff_mode="vina_5g" ;;
+                        MobiFone*)         eff_mode="mobi_5g" ;;
+                        Wintel*)           eff_mode="wintel_5g" ;;
+                        Vietnamobile*)     eff_mode="vietnamobile" ;;
+                        Viettel*|*)        eff_mode="viettel_5g" ;;
                     esac
                 else
                     eff_mode="$mode"
@@ -477,14 +486,14 @@ EOF
                 if is_sierra_modem; then
                     # Sierra Wireless EM9190 / EM9191 Band Selection
                     send_at_direct "$port" 'AT!ENTERCND="A710"' >/dev/null 2>&1
-                    if [ "$eff_mode" = "viettel_5g" ] || [ "$eff_mode" = "vina_5g" ] || [ "$eff_mode" = "mobi_5g" ]; then
+                    if [ "$eff_mode" = "viettel_5g" ] || [ "$eff_mode" = "vina_5g" ] || [ "$eff_mode" = "wintel_5g" ] || [ "$eff_mode" = "mobi_5g" ]; then
                         send_at_direct "$port" 'AT!SELRAT=0F' >/dev/null 2>&1
                         send_at_direct "$port" 'AT!SELACQ=NR5G,LTE' >/dev/null 2>&1
                         send_at_direct "$port" 'AT!BAND=00' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Sierra EM9190: Đã khóa 5G NSA/SA (LTE + NR5G Band n41/n78/n28 + LTE B1/B3/B7/B8)!"
-                    elif [ "$eff_mode" = "4g_ca" ]; then
+                    elif [ "$eff_mode" = "4g_ca" ] || [ "$eff_mode" = "vietnamobile" ]; then
                         send_at_direct "$port" 'AT!SELRAT=04' >/dev/null 2>&1
                         send_at_direct "$port" 'AT!BAND=09' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
@@ -498,34 +507,94 @@ EOF
                         rm -f /tmp/band_lock_mode 2>/dev/null
                         msg="Sierra EM9190: Đã khôi phục chế độ Băng Tần Tự Động (Auto RAT + Toàn bộ băng tần)!"
                     fi
+                elif is_fibocom_modem; then
+                    # Fibocom FM350-GL (AT+GTACT: LTE=100+B, NR=5000+n, 17=LTE+NR, 2=LTE, 20=Auto)
+                    gt_chk=$(send_at_direct "$port" "AT+GTACT?")
+                    if [ -z "$gt_chk" ] || { printf '%s' "$gt_chk" | grep -qi "ERROR" && ! printf '%s' "$gt_chk" | grep -q "+GTACT:"; }; then
+                        echo '{"success":false,"message":"Modem Fibocom không phản hồi AT+GTACT trên cổng AT hiện tại!"}'
+                        exit 0
+                    fi
+                    case "$eff_mode" in
+                        viettel_5g)
+                            gt_cmd="AT+GTACT=17,6,3,101,103,107,108,128,140,141,5028,5041,5078"
+                            msg="Fibocom FM350: Đã khóa 5G Viettel (n41/n78/n28 + LTE B1/B3/B7/B8/B28/B40/B41)!"
+                            ;;
+                        vina_5g|wintel_5g)
+                            gt_cmd="AT+GTACT=17,6,3,101,103,108,5077,5078"
+                            msg="Fibocom FM350: Đã khóa 5G VinaPhone/Wintel (n77/n78 + LTE B1/B3/B8)!"
+                            ;;
+                        mobi_5g)
+                            gt_cmd="AT+GTACT=17,6,3,101,103,107,108,5077,5078"
+                            msg="Fibocom FM350: Đã khóa 5G MobiFone (n77/n78 + LTE B1/B3/B7/B8)!"
+                            ;;
+                        vietnamobile)
+                            gt_cmd="AT+GTACT=2,3,,103,108"
+                            msg="Fibocom FM350: Đã khóa Vietnamobile 4G (LTE B3/B8)!"
+                            ;;
+                        4g_ca)
+                            gt_cmd="AT+GTACT=2,3,,101,103,107,108,128,140,141"
+                            msg="Fibocom FM350: Đã khóa 4G LTE CA (B1+B3+B7+B8+B28+B40+B41)!"
+                            ;;
+                        *)
+                            gt_cmd="AT+GTACT=20,6,3"
+                            save_mode="auto"
+                            msg="Fibocom FM350: Đã khôi phục chế độ Băng Tần Tự Động (Auto RAT + Toàn bộ băng tần)!"
+                            ;;
+                    esac
+                    gt_res=$(send_at_direct "$port" "$gt_cmd")
+                    if [ -z "$gt_res" ] || printf '%s' "$gt_res" | grep -qi "ERROR"; then
+                        printf '{"success":false,"message":"Modem Fibocom từ chối lệnh %s!","mode":"%s"}\n' "$gt_cmd" "$save_mode"
+                        exit 0
+                    fi
+                    if [ "$save_mode" = "auto" ]; then
+                        echo "auto" > /etc/config/band_lock_mode
+                        rm -f /tmp/band_lock_mode 2>/dev/null
+                    else
+                        echo "$save_mode" > /etc/config/band_lock_mode
+                        echo "$save_mode" > /tmp/band_lock_mode
+                    fi
                 else
-                    # Quectel RM502Q / RM520N / EC25 (PCIe MHI & USB TTY)
+                    # Quectel RM502Q / RM520N / EC25 (PCIe MHI & USB TTY — both NSA + SA + mode_pref)
                     if [ "$eff_mode" = "viettel_5g" ]; then
+                        send_at_direct "$port" 'AT+QNWPREFCFG="mode_pref",LTE:NR5G' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",28:41:78' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nsa_nr5g_band",28:41:78' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:7:8:28:40:41' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Đã khóa 5G Viettel: n41 (2600MHz Băng tần Vàng) + n78 (3500MHz) + n28 (700MHz) + LTE B1/B3/B7/B8/B28/B40/B41!"
-                    elif [ "$eff_mode" = "vina_5g" ]; then
+                    elif [ "$eff_mode" = "vina_5g" ] || [ "$eff_mode" = "wintel_5g" ]; then
+                        send_at_direct "$port" 'AT+QNWPREFCFG="mode_pref",LTE:NR5G' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",77:78' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nsa_nr5g_band",77:78' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:8' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
-                        msg="Đã khóa 5G VinaPhone: n77/n78 (3700-3800MHz C-Band) + LTE B1/B3/B8 tối ưu sóng chuẩn!"
+                        msg="Đã khóa 5G VinaPhone/Wintel: n77/n78 (3700-3800MHz C-Band) + LTE B1/B3/B8 tối ưu sóng chuẩn!"
                     elif [ "$eff_mode" = "mobi_5g" ]; then
+                        send_at_direct "$port" 'AT+QNWPREFCFG="mode_pref",LTE:NR5G' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",77:78' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nsa_nr5g_band",77:78' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:7:8' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Đã khóa 5G MobiFone: n77/n78 (3800-3900MHz C-Band) + LTE B1/B3/B7/B8 tối ưu sóng chuẩn!"
+                    elif [ "$eff_mode" = "vietnamobile" ]; then
+                        send_at_direct "$port" 'AT+QNWPREFCFG="mode_pref",LTE' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",3:8' >/dev/null 2>&1
+                        echo "$save_mode" > /etc/config/band_lock_mode
+                        echo "$save_mode" > /tmp/band_lock_mode
+                        msg="Đã khóa Vietnamobile 4G (LTE B3/B8) ổn định sóng!"
                     elif [ "$eff_mode" = "4g_ca" ]; then
+                        send_at_direct "$port" 'AT+QNWPREFCFG="mode_pref",LTE' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:3:7:8:28:40:41' >/dev/null 2>&1
-                        send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",28:41:77:78' >/dev/null 2>&1
                         echo "$save_mode" > /etc/config/band_lock_mode
                         echo "$save_mode" > /tmp/band_lock_mode
                         msg="Đã khóa 4G CA (B1+B3+B7+B8+B28+B40+B41) gộp sóng đa tầng siêu ổn định!"
                     else
+                        send_at_direct "$port" 'AT+QNWPREFCFG="mode_pref",AUTO' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band",1:2:3:5:7:8:12:20:25:28:38:40:41:48:66:71:77:78:79' >/dev/null 2>&1
+                        send_at_direct "$port" 'AT+QNWPREFCFG="nsa_nr5g_band",1:2:3:5:7:8:12:20:25:28:38:40:41:48:66:71:77:78:79' >/dev/null 2>&1
                         send_at_direct "$port" 'AT+QNWPREFCFG="lte_band",1:2:3:4:5:7:8:12:13:14:17:18:19:20:25:26:28:29:30:32:34:38:39:40:41:42:43:46:48:66:71' >/dev/null 2>&1
                         echo "auto" > /etc/config/band_lock_mode
                         rm -f /tmp/band_lock_mode 2>/dev/null
@@ -573,13 +642,54 @@ EOF
                     nr_rsrp=$(echo "$gstatus" | grep -i "NR5G RSRP" | sed 's/.*NR5G RSRP (dBm):[[:space:]]*//' | awk '{print $1}' | tr -d '\r\n ')
 
                     nr_sinr=$(echo "$gstatus" | grep -i "NR5G SINR" | sed 's/.*NR5G SINR (dB):[[:space:]]*//' | awk '{print $1}' | tr -d '\r\n ')
-                elif printf '%s' "$m_meta" | grep -iqE "fibocom|fm350|2cb7|0e8d"; then
-                    # Fibocom FM350-GL Parser
-                    gt_out=$(send_at_direct "$port" "AT+GTCCINFO?")
-                    csq_out=$(send_at_direct "$port" "AT+CSQ")
-                    csq_val=$(echo "$csq_out" | grep -oE '[0-9]+' | head -1)
-                    if [ -n "$csq_val" ] && [ "$csq_val" -ne 99 ]; then
-                        lte_rsrp=$(( -113 + csq_val * 2 ))
+                elif is_fibocom_modem; then
+                    # Fibocom FM350-GL Parser (AT+GTCCINFO? + AT+CESQ)
+                    gt_out=$(send_at_direct "$port" "AT+GTCCINFO?" | tr -d '\r')
+                    if [ -n "$gt_out" ]; then
+                        eval "$(printf '%s\n' "$gt_out" | awk -F',' '
+                            /^1,4,/ {
+                                gsub(/[^0-9A-Fa-f]/,"",$6); if($6!="") lcid=$6;
+                                gsub(/[^0-9]/,"",$7); if($7!="") lear=$7;
+                                gsub(/[^0-9]/,"",$8); if($8!="") lpci=$8;
+                                b=$9+0; if (b >= 100 && b < 500) b -= 100; if (b > 0) lb=b;
+                                r=$12; gsub(/[^0-9]/,"",r); if (r != "" && (r+0) <= 97) lr=(r+0)-140;
+                            }
+                            /^1,9,/ {
+                                gsub(/[^0-9]/,"",$7); if($7!="") narf=$7;
+                                gsub(/[^0-9]/,"",$8); if($8!="") npci=$8;
+                                nb=$9+0; if (nb >= 5000 && nb < 6000) nb -= 5000; else if (nb >= 500 && nb < 1000) nb -= 500;
+                                if (nb > 0) nrb=nb;
+                            }
+                            END {
+                                if(lcid!="") printf "lte_cellid=%s ", lcid;
+                                if(lear!="") printf "lte_earfcn=%s ", lear;
+                                if(lpci!="") printf "lte_pci=%s ", lpci;
+                                if(lb!="")   printf "lte_band=%s ", lb;
+                                if(lr!="")   printf "lte_rsrp=%s ", lr;
+                                if(narf!="") printf "nr_arfcn=%s ", narf;
+                                if(npci!="") printf "nr_pci=%s ", npci;
+                                if(nrb!="")  printf "nr_band=%s ", nrb;
+                            }')"
+                    fi
+                    cesq_out=$(send_at_direct "$port" "AT+CESQ" | tr -d '\r')
+                    if [ -n "$cesq_out" ]; then
+                        eval "$(printf '%s\n' "$cesq_out" | sed -n 's/.*+CESQ:[[:space:]]*\([0-9,]*\).*/\1/p' | head -n 1 | awk -F',' '{
+                            printf "rsrp_l=%s ss_rsrp=%s ss_sinr=%s", $6+0, $8+0, $9+0
+                        }')"
+                        case "$rsrp_l" in ''|*[!0-9]*) rsrp_l=255 ;; esac
+                        case "$ss_rsrp" in ''|*[!0-9]*) ss_rsrp=255 ;; esac
+                        case "$ss_sinr" in ''|*[!0-9]*) ss_sinr=255 ;; esac
+                        if [ -z "$lte_rsrp" ] && [ "$rsrp_l" -le 97 ] && [ "$rsrp_l" -ne 255 ]; then
+                            lte_rsrp=$((rsrp_l - 140))
+                        fi
+                        [ "$ss_rsrp" -le 126 ] && [ "$ss_rsrp" -ne 255 ] && nr_rsrp=$((ss_rsrp - 156))
+                        [ "$ss_sinr" -le 127 ] && [ "$ss_sinr" -ne 255 ] && nr_sinr=$(( (ss_sinr / 2) - 23 ))
+                    elif [ -z "$lte_rsrp" ]; then
+                        csq_out=$(send_at_direct "$port" "AT+CSQ")
+                        csq_val=$(echo "$csq_out" | sed -n 's/.*+CSQ:[[:space:]]*\([0-9]*\),.*/\1/p' | head -1)
+                        if [ -n "$csq_val" ] && [ "$csq_val" -ne 99 ] 2>/dev/null; then
+                            lte_rsrp=$(( -113 + csq_val * 2 ))
+                        fi
                     fi
                 else
                     # Quectel RM502Q / RM520N / EC25 Parser (works on both PCIe MHI & USB TTY)
@@ -624,8 +734,8 @@ EOF
                 [ -z "$carrier_name" ] && carrier_name="Viettel"
 
                 printf '{"success":true,"lte_band":"%s","lte_cellid":"%s","lte_pci":"%s","lte_earfcn":"%s","lte_rsrp":"%s","lte_sinr":"%s","nr_band":"%s","nr_pci":"%s","nr_arfcn":"%s","nr_rsrp":"%s","nr_sinr":"%s","is_cell_locked":%s,"locked_details":"%s","supports_cell_lock":%s,"carrier_name":"%s"}\n' \
-                    "${lte_band:-3}" "${lte_cellid:---}" "${lte_pci:---}" "${lte_earfcn:---}" "${lte_rsrp:---}" "${lte_sinr:---}" \
-                    "${nr_band:-41}" "${nr_pci:---}" "${nr_arfcn:---}" "${nr_rsrp:---}" "${nr_sinr:---}" \
+                    "${lte_band:---}" "${lte_cellid:---}" "${lte_pci:---}" "${lte_earfcn:---}" "${lte_rsrp:---}" "${lte_sinr:---}" \
+                    "${nr_band:---}" "${nr_pci:---}" "${nr_arfcn:---}" "${nr_rsrp:---}" "${nr_sinr:---}" \
                     "$is_locked" "$locked_details" "$supports_cell_lock" "$carrier_name"
                 ;;
             setCellLock)

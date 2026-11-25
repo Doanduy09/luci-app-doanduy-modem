@@ -1004,10 +1004,56 @@ apply_carrier_ipv6_route_mtu() {
     fi
 }
 
+tune_wwan_datapath() {
+    [ -n "$IFNAME" ] && [ -d "/sys/class/net/$IFNAME" ] || return 0
+    ip link set dev "$IFNAME" txqueuelen 2048 2>/dev/null || true
+    if command -v ethtool >/dev/null 2>&1; then
+        ethtool -K "$IFNAME" gro on gso on 2>/dev/null || true
+    fi
+
+    [ -w /sys/module/usbcore/parameters/autosuspend ] && echo -1 > /sys/module/usbcore/parameters/autosuspend 2>/dev/null || true
+    local dev_base rel pwr
+    dev_base=$(readlink -f "/sys/class/net/$IFNAME/device" 2>/dev/null)
+    if [ -d "$dev_base" ]; then
+        for rel in "" "/.." "/../.."; do
+            pwr=$(readlink -f "${dev_base}${rel}/power/control" 2>/dev/null)
+            [ -w "$pwr" ] && echo on > "$pwr" 2>/dev/null || true
+        done
+    fi
+
+    local cores mask cur_rfe q irq irq_cpus
+    cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+    if [ "$cores" -ge 2 ] 2>/dev/null; then
+        mask=$(awk -v c="$cores" 'BEGIN{m=1; for(i=0;i<c;i++) m*=2; printf "%x", m-2}')
+        if [ -w /proc/sys/net/core/rps_sock_flow_entries ]; then
+            cur_rfe=$(cat /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || echo 0)
+            [ "${cur_rfe:-0}" -lt 16384 ] 2>/dev/null && echo 16384 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+        fi
+        for q in "/sys/class/net/$IFNAME/queues"/rx-*; do
+            [ -d "$q" ] || continue
+            [ -w "$q/rps_cpus" ] && echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
+            [ -w "$q/rps_flow_cnt" ] && echo 4096 > "$q/rps_flow_cnt" 2>/dev/null || true
+        done
+        for q in "/sys/class/net/$IFNAME/queues"/tx-*; do
+            [ -d "$q" ] || continue
+            [ -w "$q/xps_cpus" ] && echo "$mask" > "$q/xps_cpus" 2>/dev/null || true
+        done
+        if [ "$cores" -eq 2 ]; then
+            irq_cpus="1"
+        else
+            irq_cpus="1-$((cores - 1))"
+        fi
+        for irq in $(awk '/mtk_t7xx|t7xx|mhi|xhci/{gsub(":","",$1); if($1 ~ /^[0-9]+$/) print $1}' /proc/interrupts 2>/dev/null); do
+            [ -w "/proc/irq/$irq/smp_affinity_list" ] && echo "$irq_cpus" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
+        done
+    fi
+}
+
 publish_netifd_up() {
     local v4="$1" m4="$2" gw4="$3" v6="$4" m6="$5" gw6="$6" extra_dns="$7"
     local d added_dns=""
     clamp_mtu
+    tune_wwan_datapath
     proto_init_update "$IFNAME" 1
     if [ -n "$v4" ]; then
         proto_add_ipv4_address "$v4" "${m4:-30}"
@@ -1578,7 +1624,7 @@ while [ "$STOP_REQ" = "0" ]; do
             ticks=$((ticks + 1))
             [ "$is_up" = "1" ] && apply_carrier_ipv6_route_mtu "$gw6"
             [ $((ticks % 60)) -eq 0 ] && rotate_cm_log
-            [ "$is_up" = "1" ] && sleep 4 || sleep 1
+            [ "$is_up" = "1" ] && sleep 8 || sleep 1
         done
 
         wait "$CM_PID" 2>/dev/null || true
