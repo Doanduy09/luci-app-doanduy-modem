@@ -16,7 +16,12 @@ exec 202>"$LOCK_FILE"
 if [ "$1" = "ensure" ]; then
 	flock -n 202 2>/dev/null || exit 0
 else
-	flock -w 15 202 2>/dev/null || true
+	_rl=0
+	while ! flock -n 202 2>/dev/null; do
+		_rl=$((_rl + 1))
+		[ "$_rl" -ge 15 ] && break
+		sleep 1
+	done
 fi
 
 read_kv() {

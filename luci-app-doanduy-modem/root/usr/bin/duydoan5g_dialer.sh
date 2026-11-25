@@ -971,10 +971,8 @@ apply_carrier_ipv6_route_mtu() {
     if [ -n "$v6_mtu" ]; then
         [ "$v6_mtu" -lt 1280 ] && v6_mtu=1280
         [ "$v6_mtu" -gt 1500 ] && v6_mtu=1500
-    elif [ "$MODE" = "fm350_usb" ]; then
-        v6_mtu=1360
     else
-        return 0
+        v6_mtu=1360
     fi
 
     cur_rt=$(ip -6 route show dev "$IFNAME" default 2>/dev/null | head -n 1)

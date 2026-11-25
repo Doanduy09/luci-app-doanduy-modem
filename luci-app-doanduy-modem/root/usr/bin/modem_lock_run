@@ -7,6 +7,11 @@ mkdir -p /var/lock 2>/dev/null
 export _MODEM_AT_LOCKED=1
 if command -v flock >/dev/null 2>&1; then
 	exec 9>"/var/lock/modem_at.lock"
-	flock -x -w 6 9 || exit 1
+	_i=0
+	while ! flock -x -n 9 2>/dev/null; do
+		_i=$((_i + 1))
+		[ "$_i" -ge 30 ] && exit 1
+		usleep 200000 2>/dev/null || sleep 1
+	done
 fi
 exec "$@"

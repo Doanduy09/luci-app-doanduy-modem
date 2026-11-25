@@ -10,6 +10,18 @@ san() {
 	printf '%s' "$1" | tr -d '\047\042\015\012\073\134\140\044' | tr '\000-\037' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//'
 }
 
+acquire_at_lock() {
+	local fd="$1" secs="${2:-5}" i=0 max
+	command -v flock >/dev/null 2>&1 || return 0
+	max=$((secs * 5))
+	while [ "$i" -lt "$max" ]; do
+		flock -x -n "$fd" 2>/dev/null && return 0
+		usleep 200000 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
 find_at_port() {
 	local p="" iface="" dev="" base="" usb_root="" tpath="" cand=""
 	if [ -f /tmp/duydoan5g_modem_meta ]; then
@@ -58,14 +70,18 @@ run_at() {
 			fi
 			;;
 		*)
-			if command -v atinout >/dev/null 2>&1; then
-				printf '%s\r\n' "$cmd" | timeout 3 atinout - "$port" - 2>/dev/null && return 0
+			local out=""
+			if command -v sms_tool >/dev/null 2>&1; then
+				out=$(timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null)
+				[ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
 			fi
 			if command -v tom_modem >/dev/null 2>&1; then
-				timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
+				out=$(timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+				[ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
 			fi
-			if command -v sms_tool >/dev/null 2>&1; then
-				timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
+			if command -v atinout >/dev/null 2>&1; then
+				out=$(printf '%s\r\n' "$cmd" | timeout 3 atinout - "$port" - 2>/dev/null)
+				[ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
 			fi
 			;;
 	esac
@@ -142,7 +158,7 @@ case "$1" in
 				imei="${META_IMEI:-}"
 				if [ -c "$port" ]; then
 					(
-						flock -x -w 4 9 2>/dev/null || exit 1
+						acquire_at_lock 9 4 || exit 1
 						export _MODEM_AT_LOCKED=1
 						ati=$(run_at "$port" "ATI")
 						[ -z "$imei" ] && imei=$(get_modem_imei "$port")
@@ -203,7 +219,7 @@ EOF
 				res_msg=""
 				ok_flag=0
 				(
-					flock -x -w 8 9 2>/dev/null || exit 1
+					acquire_at_lock 9 8 || exit 1
 					export _MODEM_AT_LOCKED=1
 					ati=$(run_at "$port" "ATI")
 					brand=$(detect_vendor "$port" "$brand_in" "$ati")
@@ -344,7 +360,7 @@ EOF
 					exit 0
 				fi
 				out=$(
-					flock -x -w 5 9 2>/dev/null || exit 1
+					acquire_at_lock 9 5 || exit 1
 					export _MODEM_AT_LOCKED=1
 					run_at "$port" "$cmd"
 				) 9>"$AT_LOCK" 2>/dev/null

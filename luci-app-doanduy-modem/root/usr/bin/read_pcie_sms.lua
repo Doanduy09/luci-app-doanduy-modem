@@ -3,12 +3,12 @@
 local nixio = require("nixio")
 
 -- Ensure exclusive access against modem_lock_run (/var/lock/modem_at.lock)
-if not os.getenv("_AT_FLOCKED") and nixio.fs.access("/usr/bin/flock") then
+if os.getenv("_AT_FLOCKED") ~= "1" and os.getenv("_MODEM_AT_LOCKED") ~= "1" and nixio.fs.access("/usr/bin/modem_lock_run") then
     local qargs = {}
     for i = 0, #arg do
         qargs[#qargs + 1] = "'" .. tostring(arg[i]):gsub("'", "'\\''") .. "'"
     end
-    local rc = os.execute("_AT_FLOCKED=1 exec /usr/bin/flock -x -w 6 /var/lock/modem_at.lock /usr/bin/lua " .. table.concat(qargs, " "))
+    local rc = os.execute("_AT_FLOCKED=1 exec /usr/bin/modem_lock_run /usr/bin/lua " .. table.concat(qargs, " "))
     os.exit((rc == 0 or rc == true) and 0 or 1)
 end
 

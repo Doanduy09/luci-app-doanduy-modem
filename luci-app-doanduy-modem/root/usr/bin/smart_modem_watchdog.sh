@@ -255,7 +255,13 @@ warm_reset_wwan_baseband() {
         else
             local m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
             (
-                flock -x -w 5 200 || exit 0
+                _wi=0
+                while ! flock -x -n 200 2>/dev/null; do
+                    _wi=$((_wi + 1))
+                    [ "$_wi" -ge 25 ] && exit 0
+                    usleep 200000 2>/dev/null || sleep 1
+                done
+                export _MODEM_AT_LOCKED=1
                 if echo "$m_type" | grep -iqE "sierra|1199:"; then
                     timeout 3 sh -c "printf 'AT!RESET\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
                 elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
