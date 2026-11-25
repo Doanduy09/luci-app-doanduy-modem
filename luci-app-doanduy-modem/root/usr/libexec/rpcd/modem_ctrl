@@ -122,14 +122,18 @@ safe_at_query() {
 			fi
 			;;
 		*)
-			if command -v atinout >/dev/null 2>&1; then
-				printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null && return 0
+			local out=""
+			if command -v sms_tool >/dev/null 2>&1; then
+				out=$(timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null)
+				[ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
 			fi
 			if command -v tom_modem >/dev/null 2>&1; then
-				timeout 2 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
+				out=$(timeout 2 tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+				[ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
 			fi
-			if command -v sms_tool >/dev/null 2>&1; then
-				timeout 2 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
+			if command -v atinout >/dev/null 2>&1; then
+				out=$(printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null)
+				[ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
 			fi
 			;;
 	esac
@@ -167,6 +171,14 @@ read_rf_telemetry_cached() {
 
 		cops_out=$(safe_at_query "$port" "AT+COPS?")
 		op=$(printf '%s\n' "$cops_out" | sed -n 's/.*+COPS:[[:space:]]*[0-9]*,[0-9]*,"\([^"]*\)".*/\1/p' | head -n 1)
+		case "$op" in
+			45204|452-04) op="Viettel" ;;
+			45201|452-01) op="MobiFone" ;;
+			45202|452-02) op="VinaPhone" ;;
+			45205|452-05) op="Vietnamobile" ;;
+			45207|452-07) op="Wintel" ;;
+			45208|452-08) op="Itelecom" ;;
+		esac
 		act_num=$(printf '%s\n' "$cops_out" | sed -n 's/.*+COPS:[[:space:]]*[0-9]*,[0-9]*,"[^"]*",\([0-9]*\).*/\1/p' | head -n 1)
 		case "$act_num" in
 			13) rat="5G NR-NSA" ;;
@@ -228,6 +240,65 @@ read_rf_telemetry_cached() {
 				sinr=$(printf '%s\n' "$rf_out" | sed -n 's/.*SINR (dB):[[:space:]]*\([-0-9.]*\).*/\1/p' | head -n 1)
 				max_t=$(printf '%s\n' "$rf_out" | sed -n 's/.*Temperature:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1)
 			}
+		elif [ "$vendor" = "fibocom" ] || [ "$USB_VID" = "0e8d" ] || [ "$USB_VID" = "2cb7" ]; then
+			local lte_band="" lte_rsrp="" nr_band="" cesq_out="" ss_rsrq="" ss_rsrp="" ss_sinr="" rsrq_l="" rsrp_l=""
+			rf_out=$(safe_at_query "$port" "AT+GTCCINFO?" | tr -d '\r')
+			if [ -n "$rf_out" ]; then
+				eval "$(printf '%s\n' "$rf_out" | awk -F',' '
+					/^1,4,/ {
+						b=$9+0; if (b >= 100 && b < 500) b -= 100;
+						r=$12; gsub(/[^0-9]/,"",r);
+						if (b > 0) lb=b;
+						if (r != "" && (r+0) <= 97) lr=(r+0)-140;
+					}
+					/^1,9,/ {
+						nb=$9+0; if (nb >= 5000 && nb < 6000) nb -= 5000;
+						if (nb > 0) nr=nb;
+					}
+					END {
+						if (lb != "") printf "lte_band=%s ", lb;
+						if (lr != "") printf "lte_rsrp=%s ", lr;
+						if (nr != "") printf "nr_band=%s ", nr;
+					}')"
+				if [ -n "$lte_band" ] && [ -n "$nr_band" ]; then
+					rat="5G NSA"
+					band="B${lte_band} + n${nr_band}"
+				elif [ -n "$nr_band" ]; then
+					rat="5G SA"
+					band="n${nr_band}"
+				elif [ -n "$lte_band" ]; then
+					rat="${rat:-4G LTE}"
+					band="B${lte_band}"
+				fi
+			fi
+			cesq_out=$(safe_at_query "$port" "AT+CESQ" | tr -d '\r')
+			if [ -n "$cesq_out" ]; then
+				eval "$(printf '%s\n' "$cesq_out" | sed -n 's/.*+CESQ:[[:space:]]*\([0-9,]*\).*/\1/p' | head -n 1 | awk -F',' '{
+					printf "rsrq_l=%s rsrp_l=%s ss_rsrq=%s ss_rsrp=%s ss_sinr=%s", $5+0, $6+0, $7+0, $8+0, $9+0
+				}')"
+				case "$ss_rsrp" in ''|*[!0-9]*) ss_rsrp=255 ;; esac
+				case "$rsrp_l" in ''|*[!0-9]*) rsrp_l=255 ;; esac
+				case "$ss_rsrq" in ''|*[!0-9]*) ss_rsrq=255 ;; esac
+				case "$rsrq_l" in ''|*[!0-9]*) rsrq_l=255 ;; esac
+				case "$ss_sinr" in ''|*[!0-9]*) ss_sinr=255 ;; esac
+				if [ "$ss_rsrp" -le 126 ] && [ "$ss_rsrp" -ne 255 ]; then
+					rsrp=$((ss_rsrp - 156))
+				elif [ "$rsrp_l" -le 97 ] && [ "$rsrp_l" -ne 255 ]; then
+					rsrp=$((rsrp_l - 140))
+				elif [ -n "$lte_rsrp" ]; then
+					rsrp="$lte_rsrp"
+				fi
+				if [ "$ss_rsrq" -le 126 ] && [ "$ss_rsrq" -ne 255 ]; then
+					rsrq=$(( (ss_rsrq / 2) - 43 ))
+				elif [ "$rsrq_l" -le 34 ] && [ "$rsrq_l" -ne 255 ]; then
+					rsrq=$(( (rsrq_l / 2) - 20 ))
+				fi
+				if [ "$ss_sinr" -le 127 ] && [ "$ss_sinr" -ne 255 ]; then
+					sinr=$(( (ss_sinr / 2) - 23 ))
+				fi
+			elif [ -n "$lte_rsrp" ]; then
+				rsrp="$lte_rsrp"
+			fi
 		fi
 
 		if [ -z "$rsrp" ]; then
@@ -238,7 +309,6 @@ read_rf_telemetry_cached() {
 				*)
 					[ "$csq" -gt 31 ] && csq=31
 					rsrp=$(( -113 + (csq * 2) ))
-					pct=$(( csq * 100 / 31 ))
 					;;
 			esac
 		fi
@@ -314,6 +384,24 @@ append_modem_entry() {
 		[ -n "$cand" ] && [ -d "/sys/class/net/$cand" ] && { dev="$cand"; break; }
 	done
 	[ -n "$dev" ] || [ "$if_up" = "true" ] || return 1
+
+	if [ -z "$v6" ] && [ -n "$iface" ]; then
+		local st6
+		st6=$(ubus call "network.interface.${iface}_6" status 2>/dev/null)
+		if [ -n "$st6" ]; then
+			v6=$(echo "$st6" | jsonfilter -e '@["ipv6-address"][0].address' 2>/dev/null)
+			m6=$(echo "$st6" | jsonfilter -e '@["ipv6-address"][0].mask' 2>/dev/null)
+		fi
+	fi
+	if [ -z "$v6" ] && [ -n "$dev" ]; then
+		local v6_cidr
+		v6_cidr=$(ip -6 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4; exit}')
+		if [ -n "$v6_cidr" ]; then
+			v6="${v6_cidr%%/*}"
+			m6="${v6_cidr#*/}"
+			[ "$m6" = "$v6_cidr" ] && m6="64"
+		fi
+	fi
 
 	local drv="$META_DRV" rp
 	if [ -n "$dev" ] && [ -z "$drv" ]; then

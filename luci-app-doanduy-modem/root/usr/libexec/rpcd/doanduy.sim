@@ -75,10 +75,13 @@ probe_live_iccid() {
 		fi
 	done
 
-	port=$(cat /tmp/master_sms_port 2>/dev/null)
+	local META_AT_PORT=""
+	[ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+	port="$META_AT_PORT"
+	echo "$port" | grep -q '/dev/tty' || port=$(cat /tmp/master_sms_port 2>/dev/null)
 	echo "$port" | grep -q '/dev/tty' || port=""
 	if [ -z "$port" ]; then
-		for wp in /dev/ttyUSB2 /dev/ttyUSB3 /dev/ttyUSB0; do
+		for wp in /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB3 /dev/ttyUSB0; do
 			[ -c "$wp" ] && { port="$wp"; break; }
 		done
 	fi

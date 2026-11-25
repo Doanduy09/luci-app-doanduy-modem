@@ -42,7 +42,7 @@ jobs:
           # Control file
           cat << 'EOF' > build_staging/control/control
           Package: luci-app-doanduy-modem
-          Version: 2.0.1-1
+          Version: 2.0.2-1
           Depends: luci-base, rpcd, ubus, jsonfilter, atinout
           Section: luci
           Architecture: all
@@ -95,28 +95,28 @@ jobs:
           tar -czf build_staging/control.tar.gz -C build_staging/control .
           
           # Pack final IPK
-          tar -czf luci-app-doanduy-modem_2.0.1-1_all.ipk -C build_staging debian-binary control.tar.gz data.tar.gz
+          tar -czf luci-app-doanduy-modem_2.0.2-1_all.ipk -C build_staging debian-binary control.tar.gz data.tar.gz
           
-          ls -la luci-app-doanduy-modem_2.0.1-1_all.ipk
+          ls -la luci-app-doanduy-modem_2.0.2-1_all.ipk
 
       - name: Upload IPK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: luci-app-doanduy-modem_2.0.1-1_all
-          path: luci-app-doanduy-modem_2.0.1-1_all.ipk
+          name: luci-app-doanduy-modem_2.0.2-1_all
+          path: luci-app-doanduy-modem_2.0.2-1_all.ipk
           if-no-files-found: error
 
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="v2.0.1"
+          TAG_NAME="v2.0.2"
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             echo "Release $TAG_NAME already exists, uploading asset..."
-            gh release upload "$TAG_NAME" luci-app-doanduy-modem_2.0.1-1_all.ipk --clobber
+            gh release upload "$TAG_NAME" luci-app-doanduy-modem_2.0.2-1_all.ipk --clobber
           else
             echo "Creating new release $TAG_NAME..."
-            gh release create "$TAG_NAME" luci-app-doanduy-modem_2.0.1-1_all.ipk \
-              --title "LuCI App DoanDuy Modem v2.0.1" \
+            gh release create "$TAG_NAME" luci-app-doanduy-modem_2.0.2-1_all.ipk \
+              --title "LuCI App DoanDuy Modem v2.0.2" \
               --notes "Release v2.0.1: Smart Adaptive TTL/Flow-Offload, carrier IPv6 MTU 1360 & FM350 default route, IPv6 NAT6 LAN, nested AT lock guard, deduplicated Clean DNS."
           fi

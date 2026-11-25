@@ -45,15 +45,67 @@ clean_stale_lock() {
 }
 
 get_at_port() {
-    local p=""
-    [ -f /tmp/master_sms_port ] && p=$(cat /tmp/master_sms_port 2>/dev/null)
+    local p="" META_AT_PORT=""
+    [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    [ -n "$META_AT_PORT" ] && [ -c "$META_AT_PORT" ] && p="$META_AT_PORT"
+    [ -z "$p" ] || [ ! -c "$p" ] && [ -f /tmp/master_sms_port ] && p=$(cat /tmp/master_sms_port 2>/dev/null)
     [ -z "$p" ] || [ ! -c "$p" ] && p=$(cat /tmp/custom_at_port 2>/dev/null)
     [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/wwan0at0" ] && p="/dev/wwan0at0"
     [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/mhi_DUN" ] && p="/dev/mhi_DUN"
     [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB2" ] && p="/dev/ttyUSB2"
+    [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB1" ] && p="/dev/ttyUSB1"
     [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB0" ] && p="/dev/ttyUSB0"
     [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB3" ] && p="/dev/ttyUSB3"
     echo "${p:-/dev/wwan0at0}"
+}
+
+is_quectel_modem() {
+    local META_VENDOR="" META_USB_VID=""
+    [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    [ "$META_VENDOR" = "quectel" ] || [ "$META_USB_VID" = "2c7c" ] && return 0
+    local m_type
+    m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
+    echo "$m_type" | grep -iqE "quectel|2c7c:"
+}
+
+wd_at_cmd() {
+    local port="$1" cmd="$2" t="${3:-3}" out=""
+    [ -c "$port" ] && [ -n "$cmd" ] || return 1
+    case "$port" in
+        /dev/wwan*|/dev/mhi*)
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                out=$(timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+            fi
+            return 1
+            ;;
+        *)
+            if command -v modem_lock_run >/dev/null 2>&1; then
+                if command -v sms_tool >/dev/null 2>&1; then
+                    out=$(modem_lock_run timeout "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
+                if command -v tom_modem >/dev/null 2>&1; then
+                    out=$(modem_lock_run timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
+                if command -v atinout >/dev/null 2>&1; then
+                    out=$(printf '%s\r\n' "$cmd" | modem_lock_run timeout "$t" atinout - "$port" - 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
+            else
+                if command -v sms_tool >/dev/null 2>&1; then
+                    out=$(timeout "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
+                if command -v atinout >/dev/null 2>&1; then
+                    out=$(printf '%s\r\n' "$cmd" | timeout "$t" atinout - "$port" - 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
+            fi
+            return 1
+            ;;
+    esac
 }
 
 send_tg_alert() {
@@ -136,8 +188,13 @@ check_internet_status() {
         fi
     fi
 
+    local real_curl=0
+    if command -v curl >/dev/null 2>&1 && ! curl --version 2>/dev/null | grep -qi 'uclient-fetch'; then
+        real_curl=1
+    fi
+
     # 0. ĐẶC TRỊ PHÁT HIỆN TRANG CHẶN CƯỚC data.viettel.vn (CAPTIVE PORTAL / WALLED GARDEN)
-    if command -v curl >/dev/null 2>&1; then
+    if [ "$real_curl" -eq 1 ]; then
         local probe_hdr
         if [ -d "/sys/class/net/$l3_dev" ]; then
             probe_hdr=$(curl --interface "$l3_dev" -4 -s -I -m 3 "http://connectivitycheck.gstatic.com/generate_204" 2>/dev/null)
@@ -154,16 +211,16 @@ check_internet_status() {
 
     # 1. Fast Anycast Ping check (Ràng buộc qua l3_dev nếu có để kiểm tra thực tế trên đường truyền 4G/5G)
     if [ -d "/sys/class/net/$l3_dev" ]; then
-        if ping -I "$l3_dev" -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 || ping -I "$l3_dev" -c 2 -W 3 8.8.8.8 >/dev/null 2>&1 || ping -I "$l3_dev" -c 2 -W 3 9.9.9.9 >/dev/null 2>&1; then
+        if ping -4 -I "$l3_dev" -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 || ping -4 -I "$l3_dev" -c 2 -W 3 8.8.8.8 >/dev/null 2>&1 || ping -4 -I "$l3_dev" -c 2 -W 3 9.9.9.9 >/dev/null 2>&1; then
             return 0
         fi
     else
-        if ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 || ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1 || ping -c 2 -W 3 9.9.9.9 >/dev/null 2>&1; then
+        if ping -4 -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 || ping -4 -c 2 -W 3 8.8.8.8 >/dev/null 2>&1 || ping -4 -c 2 -W 3 9.9.9.9 >/dev/null 2>&1; then
             return 0
         fi
     fi
     # 2. Probe HTTP 204 qua Google & Cloudflare
-    if command -v curl >/dev/null 2>&1; then
+    if [ "$real_curl" -eq 1 ]; then
         local c1=$(curl -4 -s -o /dev/null -w "%{http_code}" -m 3 "http://connectivitycheck.gstatic.com/generate_204" 2>/dev/null)
         [ "$c1" = "204" ] && return 0
         local c2=$(curl -4 -s -o /dev/null -w "%{http_code}" -m 3 "http://cp.cloudflare.com/generate_204" 2>/dev/null)
@@ -202,7 +259,7 @@ apply_mss_clamping() {
 
 # --- THỰC HIỆN TỪNG TẦNG CỨU MẠNG ---
 heal_tier1_dns_mss() {
-    echo "$(date): [Tầng 1] Sửa lỗi DNS & Ghim TCP MSS 1420..."
+    echo "$(date): [Tầng 1] Sửa lỗi DNS & TCP MSS PMTU Clamping..."
     # 0. Bảo vệ tường lửa Firewall & NAT Masquerade (Chống rớt mạng LAN/Wi-Fi)
     if command -v nft >/dev/null 2>&1; then
         if ! nft list table inet fw4 >/dev/null 2>&1 || [ ! -e /etc/rc.d/*firewall* ]; then
@@ -250,33 +307,20 @@ warm_reset_wwan_baseband() {
 
     # 2. Khóa cổng AT và phát lệnh Warm Reset tương thích mọi module
     if [ -c "$port" ]; then
-        if [ -x /usr/bin/read_pcie_sms.lua ] && [ "${port#/dev/tty}" = "$port" ]; then
-            /usr/bin/read_pcie_sms.lua -p "$port" --at "AT!RESET" >/dev/null 2>&1 || /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=1,1" >/dev/null 2>&1 || true
+        local m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
+        if echo "$m_type" | grep -iqE "sierra|1199:"; then
+            wd_at_cmd "$port" "AT!RESET" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1 || true
+        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
+            wd_at_cmd "$port" "AT+CFUN=15" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1 || true
         else
-            local m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
-            (
-                _wi=0
-                while ! flock -x -n 200 2>/dev/null; do
-                    _wi=$((_wi + 1))
-                    [ "$_wi" -ge 25 ] && exit 0
-                    usleep 200000 2>/dev/null || sleep 1
-                done
-                export _MODEM_AT_LOCKED=1
-                if echo "$m_type" | grep -iqE "sierra|1199:"; then
-                    timeout 3 sh -c "printf 'AT!RESET\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
-                elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
-                    timeout 3 sh -c "printf 'AT+CFUN=15\r\n' | atinout - '$port' -" >/dev/null 2>&1 || timeout 2 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
-                else
-                    timeout 3 sh -c "printf 'AT+CFUN=1,1\r\n' | atinout - '$port' -" >/dev/null 2>&1 || true
-                fi
-            ) 200>/var/lock/modem_at.lock
+            wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1 || true
         fi
     fi
 
     # 3. Chờ chip Baseband modem reboot sạch phần cứng (12-14s)
     sleep 12
     for w in $(seq 1 12); do
-        [ -e "/dev/cdc-wdm0" ] || [ -e "/dev/wwan0mbim0" ] || [ -e "/dev/wwan0qmi0" ] || [ -e "/dev/mhi_QMI0" ] || [ -e "/dev/mhi_MBIM" ] || [ -e "/dev/ttyUSB0" ] && break
+        [ -e "/dev/cdc-wdm0" ] || [ -e "/dev/wwan0mbim0" ] || [ -e "/dev/wwan0qmi0" ] || [ -e "/dev/mhi_QMI0" ] || [ -e "/dev/mhi_MBIM" ] || [ -e "/dev/ttyUSB0" ] || [ -e "/dev/ttyUSB1" ] || [ -e "/dev/ttyUSB2" ] && break
         sleep 1
     done
 
@@ -322,22 +366,10 @@ heal_tier2_wwan_session() {
     # Với MBIM / PCIe MHI đang chạy: KHÔNG gửi AT+CGDCONT vì sẽ đá bearer vào trạng thái Deactivating (4)!
     if [ "$is_mbim" -eq 0 ] && [ -c "$port" ]; then
         local apn=$(uci -q get network."$iface".apn || echo "v-internet")
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" >/dev/null 2>&1
-            modem_lock_run sh -c "echo 'AT+CGACT=0,1' | atinout - '$port' -" >/dev/null 2>&1
-            sleep 1
-            modem_lock_run sh -c "echo 'AT+CGACT=1,1' | atinout - '$port' -" >/dev/null 2>&1
-        elif command -v atinout >/dev/null 2>&1; then
-            echo "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" | atinout - "$port" - >/dev/null 2>&1
-            echo "AT+CGACT=0,1" | atinout - "$port" - >/dev/null 2>&1
-            sleep 1
-            echo "AT+CGACT=1,1" | atinout - "$port" - >/dev/null 2>&1
-        elif command -v sms_tool >/dev/null 2>&1; then
-            sms_tool -d "$port" at "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" >/dev/null 2>&1
-            sms_tool -d "$port" at "AT+CGACT=0,1" >/dev/null 2>&1
-            sleep 1
-            sms_tool -d "$port" at "AT+CGACT=1,1" >/dev/null 2>&1
-        fi
+        wd_at_cmd "$port" "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" 3 >/dev/null 2>&1
+        wd_at_cmd "$port" "AT+CGACT=0,1" 3 >/dev/null 2>&1
+        sleep 1
+        wd_at_cmd "$port" "AT+CGACT=1,1" 3 >/dev/null 2>&1
     fi
 
     # 2. Làm mới interface qua ubus netifd (Chờ duydoan5g_dialer đóng phiên MBIM sạch)
@@ -394,9 +426,9 @@ heal_tier3_cfun_cell_failover() {
     # Tự động giải phóng cell lock nếu có
     if [ -f /tmp/cell_lock_active ] || [ -f /etc/config/cell_lock_mode ]; then
         echo "$(date): [Tầng 3] Giải phóng Cell Lock để kết nối trạm phụ..."
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            modem_lock_run sh -c "echo 'AT+QNWLOCK=\"common/4g\",0' | atinout - '$port' -" 2>/dev/null
-            modem_lock_run sh -c "echo 'AT+QNWLOCK=\"common/5g\",0' | atinout - '$port' -" 2>/dev/null
+        if is_quectel_modem; then
+            wd_at_cmd "$port" 'AT+QNWLOCK="common/4g",0' 3 >/dev/null 2>&1
+            wd_at_cmd "$port" 'AT+QNWLOCK="common/5g",0' 3 >/dev/null 2>&1
         fi
         rm -f /tmp/cell_lock_active 2>/dev/null
     fi
@@ -413,15 +445,9 @@ heal_tier3_cfun_cell_failover() {
         killall -INT quectel-CM-M quectel-CM quectel-cm umbim 2>/dev/null || true
         sleep 2
         if [ -c "$port" ]; then
-            if [ -x /usr/bin/read_pcie_sms.lua ] && [ "${port#/dev/tty}" = "$port" ]; then
-                /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=4" >/dev/null 2>&1
-                sleep 3
-                /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=1" >/dev/null 2>&1
-            elif command -v modem_lock_run >/dev/null 2>&1; then
-                modem_lock_run sh -c "echo 'AT+CFUN=4' | atinout - '$port' -" >/dev/null 2>&1
-                sleep 2
-                modem_lock_run sh -c "echo 'AT+CFUN=1' | atinout - '$port' -" >/dev/null 2>&1
-            fi
+            wd_at_cmd "$port" "AT+CFUN=4" 3 >/dev/null 2>&1
+            sleep 3
+            wd_at_cmd "$port" "AT+CFUN=1" 3 >/dev/null 2>&1
             sleep 4
         fi
         ubus call network.interface."$iface" up 2>/dev/null || ifup "$iface" 2>/dev/null
@@ -431,19 +457,11 @@ heal_tier3_cfun_cell_failover() {
         sleep 2
         if [ -c "$port" ]; then
             local apn=$(uci -q get network."$iface".apn || echo "v-internet")
-            if command -v modem_lock_run >/dev/null 2>&1; then
-                modem_lock_run sh -c "echo 'AT+CFUN=4' | atinout - '$port' -" 2>/dev/null
-                sleep 2
-                modem_lock_run sh -c "echo 'AT+CGDCONT=1,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" 2>/dev/null
-                modem_lock_run sh -c "echo 'AT+CGDCONT=3,\"IPV4V6\",\"$apn\"' | atinout - '$port' -" 2>/dev/null
-                modem_lock_run sh -c "echo 'AT+CFUN=1' | atinout - '$port' -" 2>/dev/null
-            elif command -v atinout >/dev/null 2>&1; then
-                echo "AT+CFUN=4" | atinout - "$port" - 2>/dev/null
-                sleep 2
-                echo "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" | atinout - "$port" - 2>/dev/null
-                echo "AT+CGDCONT=3,\"IPV4V6\",\"$apn\"" | atinout - "$port" - 2>/dev/null
-                echo "AT+CFUN=1" | atinout - "$port" - 2>/dev/null
-            fi
+            wd_at_cmd "$port" "AT+CFUN=4" 3 >/dev/null 2>&1
+            sleep 2
+            wd_at_cmd "$port" "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" 3 >/dev/null 2>&1
+            wd_at_cmd "$port" "AT+CGDCONT=3,\"IPV4V6\",\"$apn\"" 3 >/dev/null 2>&1
+            wd_at_cmd "$port" "AT+CFUN=1" 3 >/dev/null 2>&1
         fi
         sleep 2
         ubus call network.interface."$iface" up 2>/dev/null || ifup "$iface" 2>/dev/null
@@ -474,12 +492,13 @@ heal_tier3_cfun_cell_failover() {
         echo "$(date): [Tầng 3 Cấp Cứu] Soft RF Reset không đủ (MBIM stack treo). Kích hoạt Hard Modem Reset qua AT port..."
         local m_type=""
         [ -f /tmp/master_m_type ] && m_type=$(cat /tmp/master_m_type 2>/dev/null)
-        if [ -x /usr/bin/read_pcie_sms.lua ] && [ "${port#/dev/tty}" = "$port" ]; then
-            /usr/bin/read_pcie_sms.lua -p "$port" --at "AT!RESET" >/dev/null 2>&1 || /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CFUN=1,1" >/dev/null 2>&1
-        elif echo "$m_type" | grep -iqE "sierra|1199:"; then
-            modem_lock_run sh -c "echo -e 'AT!RESET\r' | atinout - '$port' -" >/dev/null 2>&1 || modem_lock_run sh -c "echo -e 'AT+CFUN=1,1\r' | atinout - '$port' -" >/dev/null 2>&1
+        [ -z "$m_type" ] && command -v lsusb >/dev/null 2>&1 && m_type=$(lsusb 2>/dev/null)
+        if echo "$m_type" | grep -iqE "sierra|1199:"; then
+            wd_at_cmd "$port" "AT!RESET" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1
+        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
+            wd_at_cmd "$port" "AT+CFUN=15" 3 >/dev/null 2>&1 || wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1
         else
-            modem_lock_run sh -c "echo -e 'AT+CFUN=1,1\r' | atinout - '$port' -" >/dev/null 2>&1
+            wd_at_cmd "$port" "AT+CFUN=1,1" 3 >/dev/null 2>&1
         fi
         sleep 15
     fi
@@ -514,10 +533,8 @@ predictive_bts_cell_lock() {
     [ ! -c "$port" ] && return 0
 
     local cell_info=""
-    if command -v atinout >/dev/null 2>&1; then
-        cell_info=$(echo 'AT+QENG="servingcell"' | atinout - "$port" - 2>/dev/null)
-    elif command -v sms_tool >/dev/null 2>&1; then
-        cell_info=$(sms_tool -d "$port" at 'AT+QENG="servingcell"' 2>/dev/null)
+    if is_quectel_modem; then
+        cell_info=$(wd_at_cmd "$port" 'AT+QENG="servingcell"' 3 2>/dev/null)
     fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [PREDICTIVE_BTS] Check giờ: $cur_hm (Peak: $is_peak)" >> "$LOG_FILE"
@@ -540,13 +557,9 @@ preemptive_5g_handover() {
     local sinr=""
     local rsrp=""
     
-    if [ -c "$port" ]; then
+    if [ -c "$port" ] && is_quectel_modem; then
         local serving_cell=""
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            serving_cell=$(modem_lock_run sh -c "echo 'AT+QENG=\"servingcell\"' | atinout - '$port' -" 2>/dev/null)
-        elif command -v atinout >/dev/null 2>&1; then
-            serving_cell=$(echo 'AT+QENG="servingcell"' | atinout - "$port" - 2>/dev/null)
-        fi
+        serving_cell=$(wd_at_cmd "$port" 'AT+QENG="servingcell"' 3 2>/dev/null)
         sinr=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $NF}' | tr -d ' \r\n')
         rsrp=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $(NF-2)}' | tr -d ' \r\n')
     fi
@@ -591,21 +604,15 @@ switch_dual_sim() {
     if [ -c "$port" ]; then
         if echo "$m_type" | grep -iqE "sierra|1199:"; then
             # Sierra Wireless EM919x/EM7565: AT!UIMS? (0: SIM1, 1: SIM2)
-            if command -v modem_lock_run >/dev/null 2>&1; then
-                cur_slot=$(modem_lock_run sh -c "echo 'AT!UIMS?' | atinout - '$port' -" 2>/dev/null | grep -i "!UIMS:" | awk -F':' '{print $2}' | tr -d ' \r\n')
-            fi
+            cur_slot=$(wd_at_cmd "$port" "AT!UIMS?" 3 2>/dev/null | grep -i "!UIMS:" | awk -F':' '{print $2}' | tr -d ' \r\n')
             [ "$cur_slot" = "0" ] && cur_slot="1"
             [ "$cur_slot" = "1" ] && cur_slot="2"
-        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
+        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
             # Fibocom: AT+GTSETSIM?
-            if command -v modem_lock_run >/dev/null 2>&1; then
-                cur_slot=$(modem_lock_run sh -c "echo 'AT+GTSETSIM?' | atinout - '$port' -" 2>/dev/null | grep -i "+GTSETSIM:" | awk -F':' '{print $2}' | tr -d ' \r\n')
-            fi
+            cur_slot=$(wd_at_cmd "$port" "AT+GTSETSIM?" 3 2>/dev/null | grep -i "+GTSETSIM:" | awk -F':' '{print $2}' | tr -d ' \r\n')
         else
             # Quectel standard: AT+QUIMSLOT?
-            if command -v modem_lock_run >/dev/null 2>&1; then
-                cur_slot=$(modem_lock_run sh -c "echo 'AT+QUIMSLOT?' | atinout - '$port' -" 2>/dev/null | grep -i "+QUIMSLOT:" | awk -F':' '{print $2}' | tr -d ' \r\n')
-            fi
+            cur_slot=$(wd_at_cmd "$port" "AT+QUIMSLOT?" 3 2>/dev/null | grep -i "+QUIMSLOT:" | awk -F':' '{print $2}' | tr -d ' \r\n')
         fi
     fi
     [ -z "$cur_slot" ] && cur_slot="1"
@@ -619,23 +626,11 @@ switch_dual_sim() {
         if echo "$m_type" | grep -iqE "sierra|1199:"; then
             local sierra_slot=0
             [ "$target_slot" = "2" ] && sierra_slot=1
-            if command -v modem_lock_run >/dev/null 2>&1; then
-                modem_lock_run sh -c "echo 'AT!UIMS=$sierra_slot' | atinout - '$port' -" 2>/dev/null || true
-            elif command -v atinout >/dev/null 2>&1; then
-                echo "AT!UIMS=$sierra_slot" | atinout - "$port" - 2>/dev/null || true
-            fi
-        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:"; then
-            if command -v modem_lock_run >/dev/null 2>&1; then
-                modem_lock_run sh -c "echo 'AT+GTSETSIM=$target_slot' | atinout - '$port' -" 2>/dev/null || true
-            elif command -v atinout >/dev/null 2>&1; then
-                echo "AT+GTSETSIM=$target_slot" | atinout - "$port" - 2>/dev/null || true
-            fi
+            wd_at_cmd "$port" "AT!UIMS=$sierra_slot" 3 >/dev/null 2>&1 || true
+        elif echo "$m_type" | grep -iqE "fibocom|1e0e:|2cb7:|0e8d:"; then
+            wd_at_cmd "$port" "AT+GTSETSIM=$target_slot" 3 >/dev/null 2>&1 || true
         else
-            if command -v modem_lock_run >/dev/null 2>&1; then
-                modem_lock_run sh -c "echo 'AT+QUIMSLOT=$target_slot' | atinout - '$port' -" 2>/dev/null || true
-            elif command -v atinout >/dev/null 2>&1; then
-                echo "AT+QUIMSLOT=$target_slot" | atinout - "$port" - 2>/dev/null || true
-            fi
+            wd_at_cmd "$port" "AT+QUIMSLOT=$target_slot" 3 >/dev/null 2>&1 || true
         fi
     fi
 
@@ -732,7 +727,8 @@ if ! flock -n 201; then
     exit 0
 fi
 echo "$MY_PID" > "$PID_FILE"
-trap 'rm -f "$PID_FILE" 2>/dev/null; flock -u 201 2>/dev/null; exec 201>&-; exit 0' EXIT INT TERM
+SLEEP_PID=""
+trap '[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null; rm -f "$PID_FILE" 2>/dev/null; flock -u 201 2>/dev/null; exec 201>&-; exit 0' EXIT INT TERM
 
 FAIL_STREAK=0
 LAST_RECOVER_TS=0
@@ -757,15 +753,14 @@ proactive_rf_health_guard() {
         nr_sinr=$(echo "$raw" | jsonfilter -e '$.nr5g.sinr' 2>/dev/null)
     fi
 
-    # 2. Dự phòng đọc AT+QRSRP cho Quectel (Bỏ qua trên PCIe Sierra để tránh spam AT)
+    # 2. Dự phòng đọc AT+QRSRP chỉ cho Quectel (Bỏ qua trên Fibocom/PCIe Sierra để tránh spam AT)
     local at_port=$(get_at_port)
-    if [ -z "$nr_rsrp" ] && [ -c "$at_port" ] && [ "${at_port#/dev/tty}" != "$at_port" ]; then
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            local rf_out=$(modem_lock_run sh -c "echo -e 'AT+QRSRP\r' | atinout - '$at_port' -" 2>/dev/null)
-            nr_rsrp=$(echo "$rf_out" | grep -i "\+QRSRP:" | cut -d':' -f2 | cut -d',' -f1 | tr -d ' ')
-        fi
+    if [ -z "$nr_rsrp" ] && [ -c "$at_port" ] && [ "${at_port#/dev/tty}" != "$at_port" ] && is_quectel_modem; then
+        local rf_out
+        rf_out=$(wd_at_cmd "$at_port" "AT+QRSRP" 3 2>/dev/null)
+        nr_rsrp=$(echo "$rf_out" | grep -i "\+QRSRP:" | cut -d':' -f2 | cut -d',' -f1 | tr -d ' \r\n')
     fi
-    [ -z "$nr_rsrp" ] && return 0
+    case "$nr_rsrp" in ''|*[!0-9-]*) return 0 ;; esac
 
     if [ -n "$nr_rsrp" ] && [ "$nr_rsrp" -lt 0 ] && [ "$nr_rsrp" -lt -115 ]; then
         local low_rsrp_cnt=$(cat /tmp/low_rsrp_streak 2>/dev/null || echo 0)
@@ -780,8 +775,8 @@ proactive_rf_health_guard() {
             
             if [ -x /usr/bin/modem_cell_lock.sh ]; then
                 /usr/bin/modem_cell_lock.sh lock >/dev/null 2>&1
-            elif [ -c "$at_port" ] && command -v modem_lock_run >/dev/null 2>&1; then
-                modem_lock_run sh -c "echo -e 'AT+QNWPREFCFG=\"nr5g_disable_mode\",0\r' | atinout - '$at_port' -" >/dev/null 2>&1
+            elif [ -c "$at_port" ] && is_quectel_modem; then
+                wd_at_cmd "$at_port" 'AT+QNWPREFCFG="nr5g_disable_mode",0' 3 >/dev/null 2>&1
             fi
         fi
     else
@@ -831,7 +826,10 @@ while true; do
         fi
     fi
 
-    sleep "$SLEEP_INTERVAL"
+    sleep "$SLEEP_INTERVAL" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null || true
+    SLEEP_PID=""
 
     if check_internet_status; then
         FAIL_STREAK=0
@@ -941,7 +939,7 @@ while true; do
             send_tg_alert "🩺 <b>BÁC SĨ 5G: TỰ CHỮA LÀNH THÀNH CÔNG! (Tầng 1)</b>
 ━━━━━━━━━━━━━━━━━━━
 ⚡ <b>Thời gian xử lý:</b> ~${DUR} giây
-🛡️ <b>Phương thức:</b> Sửa DNS Cache & Ghim TCP MSS 1420
+🛡️ <b>Phương thức:</b> Sửa DNS Cache & TCP MSS PMTU Clamping
 🌐 <b>Trạng thái:</b> Đã thông mạng Internet hoàn toàn
 📶 Wi-Fi & LAN nội bộ giữ nguyên kết nối 100%!"
             continue
@@ -1013,7 +1011,7 @@ while true; do
 
         if [ "$pcie_healed" -eq 0 ]; then
             # 1. usbreset nếu có nhị phân
-            local usb_id=$(lsusb 2>/dev/null | grep -iE "1199:|2c7c:|2cb7:|05c6:" | awk '{print $6}' | head -n 1)
+            local usb_id=$(lsusb 2>/dev/null | grep -iE "1199:|2c7c:|2cb7:|0e8d:|05c6:" | awk '{print $6}' | head -n 1)
             [ -z "$usb_id" ] && usb_id="1199:90d3"
             if command -v usbreset >/dev/null 2>&1; then
                 usbreset "$usb_id" >/dev/null 2>&1

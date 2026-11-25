@@ -28,11 +28,16 @@ for arg in "$@"; do
     esac
 done
 
-port=$(cat /tmp/master_sms_port 2>/dev/null)
+META_AT_PORT=""
+[ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+port="$META_AT_PORT"
+[ -z "$port" ] || [ ! -c "$port" ] && port=$(cat /tmp/master_sms_port 2>/dev/null)
 [ -z "$port" ] || [ ! -c "$port" ] && port=$(cat /tmp/custom_at_port 2>/dev/null)
 [ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/wwan0at0" ] && port="/dev/wwan0at0"
-[ -z "$port" ] || [ ! -c "$port" ] && port="/dev/ttyUSB0"
-[ ! -c "$port" ] && [ -c "/dev/ttyUSB2" ] && port="/dev/ttyUSB2"
+[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/ttyUSB2" ] && port="/dev/ttyUSB2"
+[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/ttyUSB1" ] && port="/dev/ttyUSB1"
+[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/ttyUSB0" ] && port="/dev/ttyUSB0"
+[ ! -c "$port" ] && port="/dev/ttyUSB2"
 
 # 1. Xac dinh SIM hien tai (Tu file tam, quectel-cm log hoac modem thuc te; TUYET DOI KHONG gia mao VIP)
 cur_iccid=""
@@ -62,7 +67,7 @@ if [ -z "$cur_iccid" ] && [ -c "$port" ]; then
             [ -z "$cur_iccid" ] && cur_iccid=$(modem_lock_run sms_tool -d "$port" -D at 'AT+ICCID' 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
         fi
         if [ -z "$cur_iccid" ] && command -v atinout >/dev/null 2>&1; then
-            cur_iccid=$(printf 'AT+ICCID\r\n' | modem_lock_run atinout - "$port" - 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
+            cur_iccid=$(printf 'AT+ICCID\r\n' | modem_lock_run timeout 3 atinout - "$port" - 2>/dev/null | grep -oE '[0-9]{18,22}' | head -1)
         fi
     ;; esac
 fi

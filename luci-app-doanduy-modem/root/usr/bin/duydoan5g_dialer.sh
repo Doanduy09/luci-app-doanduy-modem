@@ -394,17 +394,22 @@ safe_at_once() {
                 if command -v stty >/dev/null 2>&1; then
                     stty -F "$port" 115200 raw -echo -echoe -echok -echoctl -echoke -icrnl -onlcr 2>/dev/null || true
                 fi
-                if command -v atinout >/dev/null 2>&1; then
-                    printf '%s\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null && exit 0
+                local out=""
+                if command -v sms_tool >/dev/null 2>&1; then
+                    out=$(timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                 fi
                 if command -v tom_modem >/dev/null 2>&1; then
-                    timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null && exit 0
+                    out=$(timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                 fi
-                if command -v sms_tool >/dev/null 2>&1; then
-                    timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null && exit 0
+                if command -v atinout >/dev/null 2>&1; then
+                    out=$(printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                 fi
                 if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                    timeout 3 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && exit 0
+                    out=$(timeout 3 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                 fi
                 exit 1
             ) 9>/var/lock/modem_at.lock 2>/dev/null
@@ -973,6 +978,19 @@ apply_carrier_ipv6_route_mtu() {
         [ "$v6_mtu" -gt 1500 ] && v6_mtu=1500
     else
         v6_mtu=1360
+    fi
+
+    local cur_if_v6_mtu=""
+    if [ -w "/proc/sys/net/ipv6/conf/${IFNAME}/mtu" ]; then
+        cur_if_v6_mtu=$(cat "/proc/sys/net/ipv6/conf/${IFNAME}/mtu" 2>/dev/null)
+        case "$cur_if_v6_mtu" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ "$cur_if_v6_mtu" -gt "$v6_mtu" ]; then
+                    printf '%s\n' "$v6_mtu" > "/proc/sys/net/ipv6/conf/${IFNAME}/mtu" 2>/dev/null || true
+                fi
+                ;;
+        esac
     fi
 
     cur_rt=$(ip -6 route show dev "$IFNAME" default 2>/dev/null | head -n 1)
