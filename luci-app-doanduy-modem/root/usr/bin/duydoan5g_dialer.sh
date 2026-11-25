@@ -457,15 +457,42 @@ stop_competing_dialers() {
 }
 
 extract_cgpaddr_ipv4() {
-    echo "$1" | tr '," ' '\n' | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && $0 != "0.0.0.0" {print; exit}'
+    printf '%s\n' "$1" | tr -d '\r' | tr '," ' '\n' | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && $0 != "0.0.0.0" {print; exit}'
+}
+
+parse_global_ipv6_tokens() {
+    printf '%s\n' "$1" | tr -d '\r' | tr '," ' '\n' | awk '
+        /^[0-9A-Fa-f:]+:[0-9A-Fa-f:]+$/ && index($0, ":::") == 0 && $0 != "::" {
+            low = tolower($0)
+            if (low !~ /^fe[89ab]/ && low !~ /^ff/ && low !~ /^::/) { print; next }
+        }
+        /^([0-9]{1,3}\.){15}[0-9]{1,3}$/ {
+            n = split($0, o, ".")
+            if (n == 16) {
+                valid = 1; nonzero_hi = 0
+                for (i = 1; i <= 16; i++) {
+                    if (o[i] + 0 > 255) { valid = 0; break }
+                    if (i <= 8 && o[i] + 0 != 0) nonzero_hi = 1
+                }
+                if (valid && nonzero_hi && o[1] + 0 != 255 && !(o[1] + 0 == 254 && o[2] + 0 >= 128 && o[2] + 0 <= 191)) {
+                    printf "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                        o[1],o[2],o[3],o[4],o[5],o[6],o[7],o[8],o[9],o[10],o[11],o[12],o[13],o[14],o[15],o[16]
+                }
+            }
+        }
+    '
 }
 
 extract_cgpaddr_ipv6() {
-    echo "$1" | tr '," ' '\n' | awk '/^[0-9A-Fa-f:]+:[0-9A-Fa-f:]+$/ && $0 != "::" {print; exit}'
+    parse_global_ipv6_tokens "$1" | head -n 1
 }
 
 extract_gtdns_ipv4() {
-    echo "$1" | tr '," ' '\n' | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && $0 != "0.0.0.0" {printf "%s ", $0}'
+    printf '%s\n' "$1" | tr -d '\r' | tr '," ' '\n' | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && $0 != "0.0.0.0" {printf "%s ", $0}'
+}
+
+extract_gtdns_ipv6() {
+    parse_global_ipv6_tokens "$1" | awk '{printf "%s ", $0}'
 }
 
 read_usb_ids_for_netdev() {
@@ -1292,6 +1319,8 @@ run_mtk_pcie_dial() {
 
 ensure_dynamic_dhcpv6() {
     case "$pdptype" in ip|ipv4) return 0 ;; esac
+    [ -w "/proc/sys/net/ipv6/conf/${IFNAME}/accept_ra" ] && echo 2 > "/proc/sys/net/ipv6/conf/${IFNAME}/accept_ra" 2>/dev/null || true
+    [ -w "/proc/sys/net/ipv6/conf/${IFNAME}/autoconf" ] && echo 1 > "/proc/sys/net/ipv6/conf/${IFNAME}/autoconf" 2>/dev/null || true
     local v6_iface="${interface}_6"
     ubus list 2>/dev/null | grep -qx "network.interface.${v6_iface}" && return 0
     json_init
@@ -1306,13 +1335,20 @@ ensure_dynamic_dhcpv6() {
 }
 
 run_fm350_usb_dial() {
-    local cid="$MODEM_PDP_IDX" active_cid="$MODEM_PDP_IDX" cgp v4 v6 gw4 dns4 sig last_sig=""
+    local cid="$MODEM_PDP_IDX" active_cid="$MODEM_PDP_IDX" cgp v4 v6 gw4 gtdns_out dns4 dns6 dns_all sig last_sig=""
     logger -t duydoan5g "Starting FM350 USB static IP dialer on $IFNAME (pdp=$cid, APN=$apn)"
     while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
         at_dial_activate
         detach_bridge_master
         ip link set dev "$IFNAME" arp off 2>/dev/null || true
         ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
+        case "$pdptype" in
+            ip|ipv4) ;;
+            *)
+                [ -w "/proc/sys/net/ipv6/conf/${IFNAME}/accept_ra" ] && echo 2 > "/proc/sys/net/ipv6/conf/${IFNAME}/accept_ra" 2>/dev/null || true
+                [ -w "/proc/sys/net/ipv6/conf/${IFNAME}/autoconf" ] && echo 1 > "/proc/sys/net/ipv6/conf/${IFNAME}/autoconf" 2>/dev/null || true
+                ;;
+        esac
         ip link set dev "$IFNAME" up 2>/dev/null || true
         v4=""; v6=""; active_cid="$cid"
         local t=0
@@ -1335,13 +1371,19 @@ run_fm350_usb_dial() {
             continue
         fi
         gw4=""; [ -n "$v4" ] && { gw4="${v4%.*}.1"; [ "$gw4" = "$v4" ] && gw4="${v4%.*}.2"; }
-        dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")")
-        if [ -z "$dns4" ]; then
+        gtdns_out=$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")
+        if [ -z "$gtdns_out" ]; then
             sleep 1
-            dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")")
+            gtdns_out=$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")
+        fi
+        dns4=$(extract_gtdns_ipv4 "$gtdns_out")
+        dns_all="$dns4"
+        if [ -n "$v6" ]; then
+            dns6=$(extract_gtdns_ipv6 "$gtdns_out")
+            dns_all="$dns4 $dns6"
         fi
         last_sig="${v4}|${gw4}|${v6}"
-        publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
+        publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns_all"
         [ -z "$v6" ] && ensure_dynamic_dhcpv6
         apply_carrier_ipv6_route_mtu ""
         logger -t duydoan5g "FM350 USB connected! IP: $v4, GW: $gw4, DNS: ${dns4:-fallback}, IPv6: ${v6:-dhcpv6}"
@@ -1355,6 +1397,7 @@ run_fm350_usb_dial() {
             clamp_mtu
             [ -z "$v6" ] && apply_carrier_ipv6_route_mtu ""
             cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$active_cid")
+            [ -n "$cgp" ] || continue
             v4=$(extract_cgpaddr_ipv4 "$cgp")
             v6=$(extract_cgpaddr_ipv6 "$cgp")
             if [ -z "$v4" ] && [ -z "$v6" ]; then
@@ -1366,8 +1409,14 @@ run_fm350_usb_dial() {
             gw4=""; [ -n "$v4" ] && { gw4="${v4%.*}.1"; [ "$gw4" = "$v4" ] && gw4="${v4%.*}.2"; }
             sig="${v4}|${gw4}|${v6}"
             if [ "$sig" != "$last_sig" ]; then
-                dns4=$(extract_gtdns_ipv4 "$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")")
-                publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
+                gtdns_out=$(safe_at_once "$AT_PORT" "AT+GTDNS=$active_cid")
+                dns4=$(extract_gtdns_ipv4 "$gtdns_out")
+                dns_all="$dns4"
+                if [ -n "$v6" ]; then
+                    dns6=$(extract_gtdns_ipv6 "$gtdns_out")
+                    dns_all="$dns4 $dns6"
+                fi
+                publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns_all"
                 [ -z "$v6" ] && ensure_dynamic_dhcpv6
                 last_sig="$sig"
             fi

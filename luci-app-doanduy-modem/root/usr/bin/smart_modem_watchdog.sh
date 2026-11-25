@@ -94,14 +94,19 @@ wd_at_cmd() {
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
             else
-                if command -v sms_tool >/dev/null 2>&1; then
-                    out=$(timeout "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
-                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
-                fi
-                if command -v atinout >/dev/null 2>&1; then
-                    out=$(printf '%s\r\n' "$cmd" | timeout "$t" atinout - "$port" - 2>/dev/null)
-                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
-                fi
+                (
+                    flock -x 9 2>/dev/null || true
+                    if command -v sms_tool >/dev/null 2>&1; then
+                        out=$(timeout "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
+                        [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
+                    fi
+                    if command -v atinout >/dev/null 2>&1; then
+                        out=$(printf '%s\r\n' "$cmd" | timeout "$t" atinout - "$port" - 2>/dev/null)
+                        [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
+                    fi
+                    exit 1
+                ) 9>/var/lock/modem_at.lock
+                return $?
             fi
             return 1
             ;;
@@ -253,6 +258,68 @@ check_internet_status() {
     return 1
 }
 
+mono_sec() {
+    awk '{print int($1)}' /proc/uptime 2>/dev/null || date +%s
+}
+
+get_pdp_type_str() {
+    local pdpt
+    pdpt=$(uci -q get network."$1".pdptype 2>/dev/null)
+    case "$pdpt" in
+        ip|ipv4) echo "IP" ;;
+        ipv6) echo "IPV6" ;;
+        *) echo "IPV4V6" ;;
+    esac
+}
+
+fast_probe_online() {
+    local act_iface="$(get_smart_iface)" l3_dev="$(get_smart_device)"
+    if command -v ubus >/dev/null 2>&1; then
+        [ "$(ubus call network.interface."$act_iface" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ] || return 1
+    fi
+    if [ -d "/sys/class/net/$l3_dev" ]; then
+        ping -4 -I "$l3_dev" -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 || ping -4 -I "$l3_dev" -c 1 -W 1 8.8.8.8 >/dev/null 2>&1
+    else
+        ping -4 -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 || ping -4 -c 1 -W 1 8.8.8.8 >/dev/null 2>&1
+    fi
+}
+
+wait_recovery_online() {
+    local max_sec="${1:-25}" now_s deadline
+    LAST_RX_BYTES=0
+    RX_SKIP_STREAK=0
+    now_s=$(mono_sec)
+    deadline=$((now_s + max_sec))
+    RECOVERY_ELAPSED=0
+    while [ "$(mono_sec)" -lt "$deadline" ]; do
+        sleep 1
+        if fast_probe_online && check_internet_status; then
+            RECOVERY_ELAPSED=$(( $(mono_sec) - now_s ))
+            [ "$RECOVERY_ELAPSED" -lt 1 ] && RECOVERY_ELAPSED=1
+            return 0
+        fi
+    done
+    RECOVERY_ELAPSED=$(( $(mono_sec) - now_s ))
+    return 1
+}
+
+is_mbim_proto_active() {
+    local iface="$1" proto="$2" META_MODE="" META_DRV="" META_CTRL_DEV=""
+    [ -f "/tmp/duydoan5g_modem_meta_${iface}" ] && . "/tmp/duydoan5g_modem_meta_${iface}" 2>/dev/null
+    [ -z "$META_MODE" ] && [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    [ "$proto" = "mbim" ] && return 0
+    if [ "$proto" = "duydoan5g" ]; then
+        case "$META_MODE" in
+            mtk_pcie|cm_mbim) return 0 ;;
+            cm_usb) [ "$META_DRV" = "cdc_mbim" ] && return 0 ;;
+        esac
+        case "$META_CTRL_DEV" in *mbim*) return 0 ;; esac
+        [ -z "$META_MODE" ] && [ -c "/dev/wwan0mbim0" ] && return 0
+        return 1
+    fi
+    [ -c "/dev/wwan0mbim0" ] && [ -z "$META_MODE" ]
+}
+
 check_dns_status() {
     if command -v nslookup >/dev/null 2>&1; then
         if nslookup connectivitycheck.gstatic.com 127.0.0.1 >/dev/null 2>&1; then
@@ -353,18 +420,9 @@ warm_reset_wwan_baseband() {
     sleep 5
 
     # 5. Thăm dò và kiểm chứng lấy IP mới
-    local ok=0
-    for w2 in $(seq 1 15); do
-        sleep 2
-        if check_internet_status; then
-            ok=1
-            break
-        fi
-    done
-
-    if [ "$ok" -eq 1 ]; then
+    if wait_recovery_online 30; then
         local new_ip=$(ip -4 addr show "$l3_dev" 2>/dev/null | grep -oE 'inet [0-9.]+' | head -1 | cut -d' ' -f2)
-        echo "$(date): [KHỞI ĐỘNG LẠI CARD WWAN] Tái sinh thành công! IP mới: ${new_ip:-OK}. 100% rác bộ đệm đã được giải phóng sạch sẽ." >> "$LOG_FILE"
+        echo "$(date): [KHỞI ĐỘNG LẠI CARD WWAN] Tái sinh thành công (${RECOVERY_ELAPSED}s)! IP mới: ${new_ip:-OK}. 100% rác bộ đệm đã được giải phóng sạch sẽ." >> "$LOG_FILE"
         return 0
     else
         echo "$(date): [KHỞI ĐỘNG LẠI CARD WWAN] Đang tiếp tục đàm phán kết nối với trạm BTS..." >> "$LOG_FILE"
@@ -379,50 +437,49 @@ heal_tier2_wwan_session() {
     echo "$(date): [Tầng 2] Làm mới phiên mạng WWAN (${iface}, proto=${proto}), Tái gắn kết PDP Context & Lấy lại IP..."
     ip route flush cache 2>/dev/null
 
-    # 1. Fast PDP Re-attach qua AT port:
-    # LƯU Ý CHO MBIM (Sierra EM9190/EM9191 / duydoan5g):
-    # Tuyệt đối KHÔNG gửi AT+CGACT=0,1 khi chạy MBIM vì sẽ làm sập ngầm ngăn xếp netifd/umbim!
-    # Với MBIM: Đồng bộ APN chuẩn và khởi động lại qua ubus netifd.
-    # Với Quectel/Fibocom (qmi/quectel/xmm/dhcp): Tái gắn kết PDP Context thô qua AT.
-    local is_mbim=0
-    [ "$proto" = "mbim" ] || [ "$proto" = "duydoan5g" ] || [ -c "/dev/wwan0mbim0" ] && is_mbim=1
-
-    # Với MBIM / PCIe MHI đang chạy: KHÔNG gửi AT+CGDCONT vì sẽ đá bearer vào trạng thái Deactivating (4)!
-    if [ "$is_mbim" -eq 0 ] && [ -c "$port" ]; then
-        local apn=$(uci -q get network."$iface".apn || echo "v-internet")
-        wd_at_cmd "$port" "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" 3 >/dev/null 2>&1
-        wd_at_cmd "$port" "AT+CGACT=0,1" 3 >/dev/null 2>&1
-        sleep 1
-        wd_at_cmd "$port" "AT+CGACT=1,1" 3 >/dev/null 2>&1
-    fi
-
-    # 2. Làm mới interface qua ubus netifd (Chờ duydoan5g_dialer đóng phiên MBIM sạch)
+    # 1. Hạ interface sạch trước qua netifd (tránh tranh chấp cổng AT với dialer đang chạy)
     for p in $(pgrep -f "umbim.*cdc-wdm" 2>/dev/null); do
         [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
     done
     if command -v ubus >/dev/null 2>&1; then
         ubus call network.interface."$iface" down 2>/dev/null
-        sleep 4
-        ubus call network.interface."$iface" up 2>/dev/null
+        sleep 3
     elif command -v ifdown >/dev/null 2>&1; then
-        ifdown "$iface" 2>/dev/null; sleep 4; ifup "$iface" 2>/dev/null
+        ifdown "$iface" 2>/dev/null
+        sleep 3
+    fi
+
+    # 2. Fast PDP Re-attach qua AT port (chỉ bỏ qua khi modem thật sự chạy MBIM, không ép nhầm cho FM350 USB/QMI/AT+DHCP):
+    local is_mbim=0 META_VENDOR="" META_PLATFORM=""
+    is_mbim_proto_active "$iface" "$proto" && is_mbim=1
+    [ -f "/tmp/duydoan5g_modem_meta_${iface}" ] && . "/tmp/duydoan5g_modem_meta_${iface}" 2>/dev/null
+    [ -z "$META_VENDOR" ] && [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+
+    if [ "$is_mbim" -eq 0 ] && [ -c "$port" ]; then
+        local apn=$(uci -q get network."$iface".apn || echo "v-internet")
+        local pdp_str=$(get_pdp_type_str "$iface")
+        wd_at_cmd "$port" "AT+CGDCONT=1,\"$pdp_str\",\"$apn\"" 3 >/dev/null 2>&1
+        wd_at_cmd "$port" "AT+CGACT=0,1" 3 >/dev/null 2>&1
+        sleep 1
+        wd_at_cmd "$port" "AT+CGACT=1,1" 3 >/dev/null 2>&1
+    fi
+
+    if command -v ubus >/dev/null 2>&1; then
+        ubus call network.interface."$iface" up 2>/dev/null
+    elif command -v ifup >/dev/null 2>&1; then
+        ifup "$iface" 2>/dev/null
     fi
 
     clean_stale_lock "/tmp/modem_healing.lock" 60
     echo "$$" > /tmp/modem_healing.lock
-    # 3. Vòng lặp thăm dò thông minh chờ WWAN nhận lại IP (tối đa 25s)
-    local w_count=0
-    while [ "$w_count" -lt 25 ]; do
-        sleep 1
-        w_count=$((w_count + 1))
-        if check_internet_status; then
-            echo "$(date): [Tầng 2] Đã nhận lại IP 5G mới từ nhà mạng thành công (${w_count}s)!"
-            rm -f /tmp/modem_healing.lock
-            return 0
-        fi
-    done
+    # 3. Vòng lặp thăm dò nhanh theo đồng hồ thực (tối đa 25s, tránh check HTTP nặng gây treo 348s)
+    if wait_recovery_online 25; then
+        echo "$(date): [Tầng 2] Đã nhận lại IP 5G mới từ nhà mạng thành công (${RECOVERY_ELAPSED}s)!"
+        rm -f /tmp/modem_healing.lock
+        return 0
+    fi
     rm -f /tmp/modem_healing.lock
-    echo "$(date): [Tầng 2] Làm mới session chưa nhận IP sau 25s; nhường Tầng 3 xử lý nếu còn mất mạng." >> "$LOG_FILE"
+    echo "$(date): [Tầng 2] Làm mới session chưa nhận IP sau ${RECOVERY_ELAPSED}s; nhường Tầng 3 xử lý nếu còn mất mạng." >> "$LOG_FILE"
     return 1
 }
 
@@ -460,8 +517,10 @@ heal_tier3_cfun_cell_failover() {
     # VỚI MBIM (Sierra EM9190/EM9191 / duydoan5g):
     # Tuyệt đối không gửi CFUN=0 làm sập kênh PCIe MHI / USB descriptors!
     # Sử dụng chuẩn 3GPP AT+CFUN=4 (Airplane mode / Tắt RF) sau đó AT+CFUN=1 (Bật RF)
-    local is_mbim=0
-    [ "$proto" = "mbim" ] || [ "$proto" = "duydoan5g" ] || [ -c "/dev/wwan0mbim0" ] && is_mbim=1
+    local is_mbim=0 META_VENDOR="" META_PLATFORM=""
+    is_mbim_proto_active "$iface" "$proto" && is_mbim=1
+    [ -f "/tmp/duydoan5g_modem_meta_${iface}" ] && . "/tmp/duydoan5g_modem_meta_${iface}" 2>/dev/null
+    [ -z "$META_VENDOR" ] && [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
 
     if [ "$is_mbim" -eq 1 ]; then
         echo "$(date): [Tầng 3] MBIM Safe RF Reset: Hạ session, gửi CFUN 4/1 an toàn..."
@@ -476,15 +535,17 @@ heal_tier3_cfun_cell_failover() {
         fi
         ubus call network.interface."$iface" up 2>/dev/null || ifup "$iface" 2>/dev/null
     else
-        # Với Quectel / Fibocom QMI/ECM: Dùng Airplane mode CFUN 4/1 an toàn thay vì CFUN 0
+        # Với FM350 USB / Quectel QMI/ECM: Dùng Airplane mode CFUN 4/1 an toàn thay vì CFUN 0
         ubus call network.interface."$iface" down 2>/dev/null || ifdown "$iface" 2>/dev/null
         sleep 2
         if [ -c "$port" ]; then
             local apn=$(uci -q get network."$iface".apn || echo "v-internet")
+            local pdp_str=$(get_pdp_type_str "$iface")
             wd_at_cmd "$port" "AT+CFUN=4" 3 >/dev/null 2>&1
             sleep 2
-            wd_at_cmd "$port" "AT+CGDCONT=1,\"IPV4V6\",\"$apn\"" 3 >/dev/null 2>&1
-            wd_at_cmd "$port" "AT+CGDCONT=3,\"IPV4V6\",\"$apn\"" 3 >/dev/null 2>&1
+            wd_at_cmd "$port" "AT+CGDCONT=1,\"$pdp_str\",\"$apn\"" 3 >/dev/null 2>&1
+            [ "$META_VENDOR" = "fibocom" ] && [ "$META_PLATFORM" = "mediatek" ] || \
+                wd_at_cmd "$port" "AT+CGDCONT=3,\"$pdp_str\",\"$apn\"" 3 >/dev/null 2>&1
             wd_at_cmd "$port" "AT+CFUN=1" 3 >/dev/null 2>&1
         fi
         sleep 2
@@ -500,20 +561,14 @@ heal_tier3_cfun_cell_failover() {
 
     clean_stale_lock "/tmp/modem_healing.lock" 60
     echo "$$" > /tmp/modem_healing.lock
-    # Vòng lặp thăm dò thông minh chờ modem đàm phán lại sóng và nhận IP (tối đa 20s)
-    local w_count=0
-    while [ "$w_count" -lt 10 ]; do
-        sleep 2
-        w_count=$((w_count + 1))
-        if check_internet_status; then
-            rm -f /tmp/modem_healing.lock
-            return 0
-        fi
-    done
+    if wait_recovery_online 22; then
+        rm -f /tmp/modem_healing.lock
+        return 0
+    fi
 
-    # Chỉ cho phép AT!RESET trên PCIe MHI khi thất bại nghiêm trọng (FAIL_STREAK >= 15)
-    if [ "${FAIL_STREAK:-0}" -ge 15 ] && [ -c "$port" ]; then
-        echo "$(date): [Tầng 3 Cấp Cứu] Soft RF Reset không đủ (MBIM stack treo). Kích hoạt Hard Modem Reset qua AT port..."
+    # Chỉ cho phép Hard Reset khi thất bại nghiêm trọng (FAIL_STREAK >= 12)
+    if [ "${FAIL_STREAK:-0}" -ge 12 ] && [ -c "$port" ]; then
+        echo "$(date): [Tầng 3 Cấp Cứu] Soft RF Reset không đủ. Kích hoạt Hard Modem Reset qua AT port..."
         local m_type=""
         [ -f /tmp/master_m_type ] && m_type=$(cat /tmp/master_m_type 2>/dev/null)
         [ -z "$m_type" ] && command -v lsusb >/dev/null 2>&1 && m_type=$(lsusb 2>/dev/null)
@@ -530,16 +585,11 @@ heal_tier3_cfun_cell_failover() {
     ubus call network.interface."$iface" up 2>/dev/null || ifup "$iface" 2>/dev/null
     sleep 3
 
-    local w_count2=0
-    while [ "$w_count2" -lt 15 ]; do
-        sleep 2
-        w_count2=$((w_count2 + 1))
-        if check_internet_status; then
-            echo "$(date): [Tầng 3 Cứu Hộ] Hard Modem Reset đã phục hồi kết nối thành công (${w_count2}x2s)!"
-            rm -f /tmp/modem_healing.lock
-            return 0
-        fi
-    done
+    if wait_recovery_online 30; then
+        echo "$(date): [Tầng 3 Cứu Hộ] Hard Modem Reset đã phục hồi kết nối thành công (${RECOVERY_ELAPSED}s)!"
+        rm -f /tmp/modem_healing.lock
+        return 0
+    fi
 
     rm -f /tmp/modem_healing.lock
     return 1
@@ -914,9 +964,13 @@ while true; do
         SILENT_FREEZE_CNT=$(( ${SILENT_FREEZE_CNT:-0} + 1 ))
         if [ "$SILENT_FREEZE_CNT" -ge 5 ]; then
             echo "$(date): [SILENT FREEZE] Xác nhận nghẽn gateway 5 lần liên tiếp (TX tăng nhưng RX=0)! Tự hồi sinh PDP Context..." >> "$LOG_FILE"
-            heal_tier2_wwan_session "$ACT_IFACE"
             SILENT_FREEZE_CNT=0
-            FAIL_STREAK=0
+            if heal_tier2_wwan_session "$ACT_IFACE"; then
+                FAIL_STREAK=0
+                LAST_RECOVER_TS=$(date +%s)
+            else
+                FAIL_STREAK=8
+            fi
             continue
         fi
     else
@@ -975,12 +1029,11 @@ while true; do
         fi
     fi
 
-    # TẦNG 2: LÀM MỚI PHIÊN WWAN (~3.5s)
-    # CHỈ KÍCH HOẠT KHI MẤT MẠNG KÉO DÀI LIÊN TỤC >= 6 LẦN (~1.5 - 2 PHÚT THẬT SỰ TẮT)
-    if [ "$FAIL_STREAK" -ge 6 ] && [ "$FAIL_STREAK" -lt 10 ]; then
-        LAST_RECOVER_TS=$CUR_TS
+    # TẦNG 2: LÀM MỚI PHIÊN WWAN (~25s max, thử 2 nhịp rồi leo thang ngay Tầng 3)
+    if [ "$FAIL_STREAK" -ge 6 ] && [ "$FAIL_STREAK" -lt 8 ]; then
         if heal_tier2_wwan_session "$ACT_IFACE"; then
-            DUR=$(( $(date +%s) - START_HEAL_S ))
+            LAST_RECOVER_TS=$(date +%s)
+            DUR=$(( LAST_RECOVER_TS - START_HEAL_S ))
             echo "$(date): [Tầng 2 Thành Công] Mạng đã hồi phục sau ${DUR}s!" >> "$LOG_FILE"
             rotate_log_if_needed
             FAIL_STREAK=0
@@ -995,10 +1048,10 @@ while true; do
     fi
 
     # TẦNG 3: TÁI SINH SÓNG MODEM & CELL FAILOVER (CHỈ KÍCH HOẠT KHI TẦNG 1 & 2 CHƯA PHỤC HỒI)
-    if [ "$FAIL_STREAK" -ge 10 ]; then
-        LAST_RECOVER_TS=$CUR_TS
+    if [ "$FAIL_STREAK" -ge 8 ]; then
         if heal_tier3_cfun_cell_failover "$ACT_IFACE"; then
-            DUR=$(( $(date +%s) - START_HEAL_S ))
+            LAST_RECOVER_TS=$(date +%s)
+            DUR=$(( LAST_RECOVER_TS - START_HEAL_S ))
             echo "$(date): [Tầng 3 Thành Công] Sóng modem 5G đã hồi sinh sau ${DUR}s!" >> "$LOG_FILE"
             rotate_log_if_needed
             FAIL_STREAK=0
@@ -1006,7 +1059,7 @@ while true; do
             send_tg_alert "🎉 <b>BÁC SĨ 5G: TỰ CHỮA LÀNH THÀNH CÔNG! (Tầng 3)</b>
 ━━━━━━━━━━━━━━━━━━━
 ⚡ <b>Thời gian xử lý:</b> ~${DUR} giây
-🛡️ <b>Phương thức:</b> Chu kỳ Tái sinh sóng Baseband (CFUN 0/1) & Chuyển trạm BTS
+🛡️ <b>Phương thức:</b> Chu kỳ Tái sinh sóng Baseband (CFUN 4/1) & Chuyển trạm BTS
 📡 <b>Chất lượng sóng:</b> ${SIG_INFO}
 📶 <b>Thiết bị:</b> Không cần khởi động lại Router, Wi-Fi 100% Online!"
             continue
@@ -1014,8 +1067,8 @@ while true; do
     fi
 
     # TẦNG 4: HARDWARE USB/PCIE BUS RESET & PHYSICAL RE-ENUMERATION
-    # KÍCH HOẠT KHI MẤT MẠNG KÉO DÀI >= 15 LẦN (~5-6 PHÚT)
-    if [ "$FAIL_STREAK" -ge 15 ]; then
+    # KÍCH HOẠT KHI MẤT MẠNG KÉO DÀI >= 12 LẦN
+    if [ "$FAIL_STREAK" -ge 12 ]; then
         echo "$(date): [Tầng 4 Cứu Hộ Cứng] Cả 3 tầng trước chưa khôi phục. Kích hoạt Hardware Bus Reset toàn diện..." >> "$LOG_FILE"
         rotate_log_if_needed
 
@@ -1061,17 +1114,9 @@ while true; do
         ubus call network.interface."$ACT_IFACE" up 2>/dev/null || ifup "$ACT_IFACE" 2>/dev/null
 
         # 5. Thăm dò phục hồi
-        local t4_ok=0
-        for w4 in $(seq 1 15); do
-            sleep 2
-            if check_internet_status; then
-                t4_ok=1
-                break
-            fi
-        done
-
-        if [ "$t4_ok" -eq 1 ]; then
-            DUR=$(( $(date +%s) - START_HEAL_S ))
+        if wait_recovery_online 30; then
+            LAST_RECOVER_TS=$(date +%s)
+            DUR=$(( LAST_RECOVER_TS - START_HEAL_S ))
             echo "$(date): [Tầng 4 Thành Công] Hardware USB Bus Reset đã khôi phục kết nối thành công sau ${DUR}s!" >> "$LOG_FILE"
             rotate_log_if_needed
             FAIL_STREAK=0
