@@ -28,16 +28,70 @@ for arg in "$@"; do
     esac
 done
 
-META_AT_PORT=""
-[ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
-port="$META_AT_PORT"
-[ -z "$port" ] || [ ! -c "$port" ] && port=$(cat /tmp/master_sms_port 2>/dev/null)
-[ -z "$port" ] || [ ! -c "$port" ] && port=$(cat /tmp/custom_at_port 2>/dev/null)
-[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/wwan0at0" ] && port="/dev/wwan0at0"
-[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/ttyUSB2" ] && port="/dev/ttyUSB2"
-[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/ttyUSB1" ] && port="/dev/ttyUSB1"
-[ -z "$port" ] || [ ! -c "$port" ] && [ -c "/dev/ttyUSB0" ] && port="/dev/ttyUSB0"
-[ ! -c "$port" ] && port="/dev/ttyUSB2"
+probe_at_tier() {
+    local dev="$1" tier="${2:-strong}" resp=""
+    [ -n "$dev" ] && [ -c "$dev" ] || return 1
+    case "$dev" in
+        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
+            [ -x /usr/bin/read_pcie_sms.lua ] && resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+            ;;
+        *)
+            if command -v atinout >/dev/null 2>&1; then
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    resp=$(modem_lock_run timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                else
+                    resp=$(timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                fi
+            fi
+            if [ -z "$resp" ] && [ -x /usr/bin/read_pcie_sms.lua ]; then
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    resp=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                else
+                    resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                fi
+            fi
+            ;;
+    esac
+    printf '%s' "$resp" | grep -qiE '\$GP|\$GN|\$GL|\$BD|Unknown error|\+CGPADDR|ERROR' && return 1
+    if printf '%s' "$resp" | grep -qiE 'Manufacturer:|Model:|Revision:|IMEI:|Quectel|Fibocom|FIBOCOM|FM350|RM5[02]|EM0|EM1|RG5|Sierra|Huawei|HUAWEI|Simcom|SIMCOM|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Foxconn|T99W|DW593|Air724|OpenLuat'; then
+        return 0
+    fi
+    [ "$tier" = "ok" ] && printf '%s' "$resp" | grep -q 'OK' && return 0
+    return 1
+}
+
+probe_renew_port() {
+    local p="" custom_p="" tier=""
+    META_AT_PORT=""
+    [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    custom_p=$(cat /tmp/custom_at_port 2>/dev/null || cat /etc/custom_at_port 2>/dev/null)
+    if [ -n "$custom_p" ] && [ -c "$custom_p" ]; then
+        echo "$custom_p"
+        return 0
+    fi
+    for p in "$META_AT_PORT" "$(cat /tmp/master_sms_port 2>/dev/null)"; do
+        if probe_at_tier "$p" "strong"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    for tier in strong ok; do
+        for p in /dev/wwan0at0 /dev/wwan1at0 /dev/mhi_DUN /dev/mhi_DUN0 /dev/ttyFMI0 /dev/ttyFMI1 /dev/wwan*at* /dev/mhi_DUN* /dev/ttyFMI* \
+                 /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyUSB* /dev/ttyACM*; do
+            if probe_at_tier "$p" "$tier"; then
+                echo "$p" > /tmp/master_sms_port
+                echo "$p"
+                return 0
+            fi
+        done
+    done
+    for p in /dev/wwan0at0 /dev/mhi_DUN /dev/ttyFMI0 /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0; do
+        [ -c "$p" ] && { echo "$p"; return 0; }
+    done
+    echo "/dev/ttyUSB3"
+}
+
+port=$(probe_renew_port)
 
 # 1. Xac dinh SIM hien tai (Tu file tam, quectel-cm log hoac modem thuc te; TUYET DOI KHONG gia mao VIP)
 cur_iccid=""
@@ -201,37 +255,72 @@ touch /tmp/sms_sending.lock
 run_send_sms() {
     local dest="$1"
     local text="$2"
-    if [ -c "/dev/wwan0qmi0" ]; then
+    local out="" rc=1 is_utf8=0 sms_bin=""
+    printf '%s' "$text" | LC_ALL=C grep -q '[^ -~	]' && is_utf8=1
+    if [ "$is_utf8" -eq 0 ] && [ "${#text}" -le 160 ] && [ -c "/dev/wwan0qmi0" ] && command -v uqmi >/dev/null 2>&1; then
         trap 'killall -CONT quectel-CM-M quectel-CM 2>/dev/null; rm -f /tmp/sms_sending.lock' EXIT INT TERM
         killall -STOP quectel-CM-M quectel-CM 2>/dev/null
-        uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$text" --send-message-target "$dest" >/dev/null 2>&1
+        out=$(uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$text" --send-message-target "$dest" 2>&1)
+        rc=$?
         killall -CONT quectel-CM-M quectel-CM 2>/dev/null
         trap - EXIT INT TERM
-        return 0
+        if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -qiE 'error|failed'; then
+            return 0
+        fi
     fi
     case "$port" in
-        /dev/wwan*|/dev/mhi*)
+        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                /usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" >/dev/null 2>&1
-                return $?
+                out=$(/usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
+                rc=$?
+                [ "$rc" -eq 0 ] && return 0
+                log "❌ PCIe SMS ($port) lỗi: $out"
+                return 1
             fi
             ;;
     esac
-    if command -v modem_lock_run >/dev/null 2>&1; then
-        modem_lock_run sms_tool -d "$port" send "$dest" "$text" >/dev/null 2>&1
-    else
-        sms_tool -d "$port" send "$dest" "$text" >/dev/null 2>&1
+    command -v sms_tool_q >/dev/null 2>&1 && sms_bin="sms_tool_q"
+    [ -z "$sms_bin" ] && command -v sms_tool >/dev/null 2>&1 && sms_bin="sms_tool"
+    if [ "$is_utf8" -eq 0 ] && [ "${#text}" -le 160 ] && [ -n "$sms_bin" ]; then
+        if command -v modem_lock_run >/dev/null 2>&1; then
+            out=$(modem_lock_run "$sms_bin" -d "$port" send "$dest" "$text" 2>&1)
+        else
+            out=$("$sms_bin" -d "$port" send "$dest" "$text" 2>&1)
+        fi
+        rc=$?
+        if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qiE 'sucessfully|successfully|\+CMGS:' && ! printf '%s' "$out" | grep -qiE 'not sent|error'; then
+            return 0
+        fi
     fi
+    if [ -x /usr/bin/read_pcie_sms.lua ]; then
+        if command -v modem_lock_run >/dev/null 2>&1; then
+            out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
+        else
+            out=$(/usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
+        fi
+        rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        log "❌ SMS engine ($port) lỗi: $out"
+        return 1
+    fi
+    log "❌ Không gửi được SMS qua $port: $out"
+    return 1
 }
 
-run_send_sms "$renew_dest" "$renew_pkg"
-log "✔️ [Pha 1/4] Đã gửi [${renew_pkg}] tới [${renew_dest}]. Chờ 2 giây..."
+if run_send_sms "$renew_dest" "$renew_pkg"; then
+    log "✔️ [Pha 1/4] Đã gửi [${renew_pkg}] tới [${renew_dest}] qua [$port]. Chờ 2 giây..."
+else
+    log "⚠️ [Pha 1/4] Gửi [${renew_pkg}] tới [${renew_dest}] thất bại qua [$port]!"
+fi
 sleep 2
 
 # Pha 2: Sau 2s gửi Y tới 191
 log "⚡ [Pha 2/4] Gửi tin nhắn xác nhận [Y] tới tổng đài [${renew_dest}]..."
-run_send_sms "$renew_dest" "Y"
-log "✔️ [Pha 2/4] Đã gửi xác nhận [Y] tới [${renew_dest}]. Chờ 5 giây..."
+if run_send_sms "$renew_dest" "Y"; then
+    log "✔️ [Pha 2/4] Đã gửi xác nhận [Y] tới [${renew_dest}] qua [$port]. Chờ 5 giây..."
+else
+    log "⚠️ [Pha 2/4] Gửi xác nhận [Y] thất bại qua [$port]!"
+fi
 sleep 5
 rm -f /tmp/sms_sending.lock
 

@@ -45,18 +45,39 @@ clean_stale_lock() {
 }
 
 get_at_port() {
-    local p="" META_AT_PORT=""
+    local p="" cand="" META_AT_PORT="" resp="" tier=""
     [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
-    [ -n "$META_AT_PORT" ] && [ -c "$META_AT_PORT" ] && p="$META_AT_PORT"
-    [ -z "$p" ] || [ ! -c "$p" ] && [ -f /tmp/master_sms_port ] && p=$(cat /tmp/master_sms_port 2>/dev/null)
-    [ -z "$p" ] || [ ! -c "$p" ] && p=$(cat /tmp/custom_at_port 2>/dev/null)
-    [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/wwan0at0" ] && p="/dev/wwan0at0"
-    [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/mhi_DUN" ] && p="/dev/mhi_DUN"
-    [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB2" ] && p="/dev/ttyUSB2"
-    [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB1" ] && p="/dev/ttyUSB1"
-    [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB0" ] && p="/dev/ttyUSB0"
-    [ -z "$p" ] || [ ! -c "$p" ] && [ -c "/dev/ttyUSB3" ] && p="/dev/ttyUSB3"
-    echo "${p:-/dev/wwan0at0}"
+    for cand in "$META_AT_PORT" "$(cat /tmp/master_sms_port 2>/dev/null)" "$(cat /tmp/custom_at_port 2>/dev/null)"; do
+        [ -n "$cand" ] && [ -c "$cand" ] || continue
+        resp=$(wd_at_cmd "$cand" "ATI" 2)
+        if printf '%s' "$resp" | grep -qiE 'Manufacturer:|Model:|Revision:|IMEI:|Quectel|Fibocom|FIBOCOM|FM350|RM5|EM0|EM1|RG5|Sierra|Huawei|HUAWEI|Simcom|SIMCOM|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Foxconn|Air724|OpenLuat' \
+           && ! printf '%s' "$resp" | grep -qiE '\$GP|\$GN|\$GL|\$BD|Unknown error|\+CGPADDR|ERROR'; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    for tier in strong ok; do
+        for cand in /dev/wwan0at0 /dev/wwan1at0 /dev/mhi_DUN /dev/mhi_DUN0 /dev/ttyFMI0 /dev/ttyFMI1 /dev/wwan*at* /dev/mhi_DUN* /dev/ttyFMI* \
+                    /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyUSB* /dev/ttyACM*; do
+            [ -c "$cand" ] || continue
+            resp=$(wd_at_cmd "$cand" "ATI" 2)
+            printf '%s' "$resp" | grep -qiE '\$GP|\$GN|\$GL|\$BD|Unknown error|\+CGPADDR|ERROR' && continue
+            if printf '%s' "$resp" | grep -qiE 'Manufacturer:|Model:|Revision:|IMEI:|Quectel|Fibocom|FIBOCOM|FM350|RM5|EM0|EM1|RG5|Sierra|Huawei|HUAWEI|Simcom|SIMCOM|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Foxconn|Air724|OpenLuat'; then
+                echo "$cand" > /tmp/master_sms_port 2>/dev/null || true
+                echo "$cand"
+                return 0
+            fi
+            if [ "$tier" = "ok" ] && printf '%s' "$resp" | grep -q 'OK'; then
+                echo "$cand" > /tmp/master_sms_port 2>/dev/null || true
+                echo "$cand"
+                return 0
+            fi
+        done
+    done
+    for cand in /dev/wwan0at0 /dev/mhi_DUN /dev/ttyFMI0 /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0; do
+        [ -c "$cand" ] && { echo "$cand"; return 0; }
+    done
+    echo "/dev/ttyUSB3"
 }
 
 is_quectel_modem() {
@@ -72,9 +93,13 @@ wd_at_cmd() {
     local port="$1" cmd="$2" t="${3:-3}" out=""
     [ -c "$port" ] && [ -n "$cmd" ] || return 1
     case "$port" in
-        /dev/wwan*|/dev/mhi*)
+        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
                 out=$(timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+            fi
+            if command -v tom_modem >/dev/null 2>&1; then
+                out=$(timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
                 [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
             fi
             return 1
@@ -93,6 +118,10 @@ wd_at_cmd() {
                     out=$(printf '%s\r\n' "$cmd" | modem_lock_run timeout "$t" atinout - "$port" - 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
+                if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                    out=$(modem_lock_run timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
             else
                 (
                     flock -x 9 2>/dev/null || true
@@ -102,6 +131,10 @@ wd_at_cmd() {
                     fi
                     if command -v atinout >/dev/null 2>&1; then
                         out=$(printf '%s\r\n' "$cmd" | timeout "$t" atinout - "$port" - 2>/dev/null)
+                        [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
+                    fi
+                    if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                        out=$(timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
                         [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                     fi
                     exit 1

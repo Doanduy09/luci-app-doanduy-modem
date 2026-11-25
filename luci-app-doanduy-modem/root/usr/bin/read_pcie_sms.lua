@@ -15,17 +15,10 @@ end
 local bit = nixio.bit
 local band, bor, lshift, rshift = bit.band, bit.bor, bit.lshift, bit.rshift
 
-local function find_at_port(preferred)
-    if preferred and #preferred > 0 and nixio.fs.stat(preferred, "type") == "chr" then
-        return preferred
-    end
-    for _, p in ipairs({"/dev/wwan0at0", "/dev/mhi_DUN", "/dev/wwan1at0"}) do
-        if nixio.fs.stat(p, "type") == "chr" then return p end
-    end
-    return nil
-end
-
 local function open_at_fd(port)
+    if port:match("^/dev/tty") then
+        os.execute(string.format("stty -F '%s' 115200 raw -echo -echoe -echok -ixon -ixoff -crtscts 2>/dev/null", port))
+    end
     local fd = nixio.open(port, nixio.open_flags("rdwr", "nonblock"))
     if not fd then return nil end
     -- Drain any stale bytes already queued in kernel buffer
@@ -41,16 +34,16 @@ local function read_raw_until(fd, timeout_ms, wait_prompt)
     local buf = {}
     local fds = {{fd = fd, events = nixio.poll_flags("in")}}
     local elapsed = 0
-    local step_ms = 120
+    local step_ms = 100
     while elapsed < timeout_ms do
         local ready = nixio.poll(fds, step_ms)
-        if ready and ready > 0 then
+        if ready == true or (type(ready) == "number" and ready > 0) then
             local chunk = fd:read(4096)
             if chunk and #chunk > 0 then
                 buf[#buf + 1] = chunk
                 local full = table.concat(buf)
                 if wait_prompt and full:find(">") then return full end
-                if full:match("\r?\nOK\r?\n?$") or full:match("^OK\r?\n?$")
+                if full:match("[\r\n]OK[\r\n%s]*$") or full:match("^OK[\r\n%s]*$")
                    or full:find("\nERROR") or full:find("\rERROR")
                    or full:find("+CME ERROR") or full:find("+CMS ERROR") then
                     return full
@@ -65,6 +58,90 @@ end
 local function send_raw_at(fd, cmd, timeout_ms, wait_prompt)
     if not fd:write(cmd .. "\r") then return "" end
     return read_raw_until(fd, timeout_ms, wait_prompt)
+end
+
+local function clear_stuck_prompt(fd)
+    fd:write("\27")
+    nixio.nanosleep(0, 150000000)
+    for _ = 1, 8 do
+        local d = fd:read(4096)
+        if not d or #d == 0 then break end
+    end
+end
+
+local function score_ati_resp(resp)
+    if not resp or #resp == 0 then return 0 end
+    if resp:find("%$GP") or resp:find("%$GN") or resp:find("%$GL") or resp:find("%$BD")
+       or resp:find("Unknown error") or resp:find("%+CGPADDR")
+       or resp:find("ERROR") or resp:find("%+CME ERROR") or resp:find("%+CMS ERROR") then
+        return 0
+    end
+    for _, kw in ipairs({
+        "Manufacturer:", "Model:", "Revision:", "IMEI:",
+        "Quectel", "Fibocom", "FIBOCOM", "FM350", "RM5", "EM0", "EM1", "RG5",
+        "Sierra", "Huawei", "HUAWEI", "Simcom", "SIMCOM", "MeiG", "Neoway",
+        "Gosuncn", "Telit", "Thales", "Cinterion", "Foxconn", "T99W", "DW593", "Air724", "OpenLuat"
+    }) do
+        if resp:find(kw, 1, true) then return 2 end
+    end
+    if resp:find("OK", 1, true) then return 1 end
+    return 0
+end
+
+local function probe_port_ati(port)
+    if not port or #port == 0 or nixio.fs.stat(port, "type") ~= "chr" then
+        return 0
+    end
+    local fd = open_at_fd(port)
+    if not fd then return 0 end
+    local resp = send_raw_at(fd, "ATI", 900)
+    if resp:find(">", 1, true) then
+        clear_stuck_prompt(fd)
+        resp = send_raw_at(fd, "ATI", 900)
+    end
+    fd:close()
+    return score_ati_resp(resp)
+end
+
+local function find_at_port(preferred)
+    if preferred and #preferred > 0 and nixio.fs.stat(preferred, "type") == "chr" then
+        return preferred
+    end
+    local f = io.open("/tmp/master_sms_port", "r")
+    if f then
+        local cached = (f:read("*l") or ""):gsub("%s+", "")
+        f:close()
+        if probe_port_ati(cached) >= 2 then return cached end
+    end
+    local seen = {}
+    local candidates = {
+        "/dev/wwan0at0", "/dev/wwan1at0", "/dev/mhi_DUN", "/dev/mhi_DUN0", "/dev/ttyFMI0", "/dev/ttyFMI1",
+        "/dev/ttyUSB3", "/dev/ttyUSB2", "/dev/ttyUSB1", "/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyACM1"
+    }
+    for _, c in ipairs(candidates) do seen[c] = true end
+    local dir_iter = nixio.fs.dir("/dev")
+    if dir_iter then
+        local extra = {}
+        for name in dir_iter do
+            if name:match("^wwan%d+at%d+$") or name:match("^mhi_DUN%d*$")
+               or name:match("^ttyFMI%d+$") or name:match("^ttyUSB%d+$") or name:match("^ttyACM%d+$") then
+                local path = "/dev/" .. name
+                if not seen[path] then seen[path] = true; extra[#extra + 1] = path end
+            end
+        end
+        table.sort(extra)
+        for _, p in ipairs(extra) do candidates[#candidates + 1] = p end
+    end
+    local ok_fallback, chr_fallback = nil, nil
+    for _, p in ipairs(candidates) do
+        if nixio.fs.stat(p, "type") == "chr" then
+            if not chr_fallback then chr_fallback = p end
+            local s = probe_port_ati(p)
+            if s >= 2 then return p end
+            if s == 1 and not ok_fallback then ok_fallback = p end
+        end
+    end
+    return ok_fallback or chr_fallback
 end
 
 -- GSM-7 default alphabet + common extension subset to UTF-8
@@ -362,8 +439,8 @@ local function read_at_sms(port)
     return true
 end
 
-local function encode_utf8_to_ucs2_hex(s)
-    local hex, i, len = {}, 1, #s
+local function utf8_to_utf16_units(s)
+    local units, i, len = {}, 1, #s
     while i <= len do
         local b1 = s:byte(i)
         local cp = b1
@@ -382,13 +459,27 @@ local function encode_utf8_to_ucs2_hex(s)
         else
             i = i + 1
         end
-        if cp <= 0xFFFF then hex[#hex + 1] = string.format("%04X", cp) end
+        if cp <= 0xFFFF then
+            units[#units + 1] = cp
+        elseif cp <= 0x10FFFF then
+            local v = cp - 0x10000
+            units[#units + 1] = 0xD800 + math.floor(v / 0x400)
+            units[#units + 1] = 0xDC00 + (v % 0x400)
+        end
+    end
+    return units
+end
+
+local function units_to_hex(units, s_idx, e_idx)
+    local hex = {}
+    for k = s_idx, e_idx do
+        hex[#hex + 1] = string.format("%04X", units[k])
     end
     return table.concat(hex)
 end
 
 local function encode_tbcd(number)
-    local clean = number:gsub("^%+", "")
+    local clean = number:gsub("[^%d]", "")
     local digits = {}
     for c in clean:gmatch("%d") do digits[#digits + 1] = c end
     if #digits % 2 == 1 then digits[#digits + 1] = "F" end
@@ -396,52 +487,213 @@ local function encode_tbcd(number)
     for i = 1, #digits, 2 do
         out[#out + 1] = digits[i + 1] .. digits[i]
     end
-    return #clean, (number:sub(1, 1) == "+" and "91" or "81"), table.concat(out)
+    return #clean, (number:match("^%s*%+") and "91" or "81"), table.concat(out)
+end
+
+local function build_ucs2_pdus(dest, msg, no_udh)
+    local units = utf8_to_utf16_units(msg)
+    if #units == 0 then return {} end
+    local da_len, da_type, da_hex = encode_tbcd(dest)
+    local da_field = string.format("%02X%s%s", da_len, da_type, da_hex)
+    if #units <= 70 then
+        local udl = #units * 2
+        return { string.format("001100%s0008B0%02X%s", da_field, udl, units_to_hex(units, 1, #units)) }
+    end
+    local max_u = no_udh and 70 or 67
+    -- Concatenated UCS-2 UDH (max 67 units) or plain 70-unit fallback without splitting surrogates
+    local chunks = {}
+    local idx = 1
+    while idx <= #units do
+        local end_idx = math.min(#units, idx + max_u - 1)
+        if end_idx < #units and units[end_idx] >= 0xD800 and units[end_idx] <= 0xDBFF and end_idx > idx then
+            end_idx = end_idx - 1
+        end
+        chunks[#chunks + 1] = { idx, end_idx }
+        idx = end_idx + 1
+    end
+    local addr = tonumber(tostring(chunks):match("0x(%x+)") or "0", 16) or 0
+    local ref = (os.time() + addr) % 256
+    local total = #chunks
+    local pdus = {}
+    for part = 1, total do
+        local s_idx, e_idx = chunks[part][1], chunks[part][2]
+        if no_udh then
+            local udl = (e_idx - s_idx + 1) * 2
+            pdus[#pdus + 1] = string.format("001100%s0008B0%02X%s", da_field, udl, units_to_hex(units, s_idx, e_idx))
+        else
+            local udl = 6 + (e_idx - s_idx + 1) * 2
+            local udh = string.format("050003%02X%02X%02X", ref, total, part)
+            pdus[#pdus + 1] = string.format("005100%s0008B0%02X%s%s", da_field, udl, udh, units_to_hex(units, s_idx, e_idx))
+        end
+    end
+    return pdus
+end
+
+local function extract_at_error(resp)
+    if not resp or #resp == 0 then return "no response / timeout" end
+    local cms = resp:match("(%+CMS ERROR:[^\r\n]+)")
+    if cms then return cms end
+    local cme = resp:match("(%+CME ERROR:[^\r\n]+)")
+    if cme then return cme end
+    if resp:find("ERROR") then return "AT ERROR" end
+    return resp:gsub("[\r\n]+", " "):sub(1, 120)
+end
+
+local function send_text_sms_fd(fd, dest, msg)
+    send_raw_at(fd, "AT+CMGF=1", 1500)
+    send_raw_at(fd, 'AT+CSCS="GSM"', 1500)
+    local p_resp = send_raw_at(fd, string.format('AT+CMGS="%s"', dest), 4000, true)
+    if not p_resp:find(">") then return false, p_resp end
+    fd:write(msg .. "\26")
+    local res = read_raw_until(fd, 15000)
+    local ok = (res:find("+CMGS:") ~= nil) or (res:find("OK") ~= nil and not res:find("ERROR"))
+    if not ok and #res == 0 then
+        fd:write("\27")
+        read_raw_until(fd, 1000)
+    end
+    return ok, res
+end
+
+local function send_raw_pdu_fd(fd, raw_pdu)
+    local pdu = (raw_pdu or ""):gsub("%s+", ""):upper()
+    if #pdu < 4 or #pdu % 2 ~= 0 or not pdu:match("^[0-9A-F]+$") then
+        return false, "invalid PDU hex"
+    end
+    send_raw_at(fd, "AT+CMGF=0", 1500)
+    local tpdu_len = math.floor((#pdu - 2) / 2)
+    local p_resp = send_raw_at(fd, string.format("AT+CMGS=%d", tpdu_len), 4000, true)
+    if not p_resp:find(">") then return false, p_resp end
+    fd:write(pdu .. "\26")
+    local res = read_raw_until(fd, 15000)
+    local ok = (res:find("+CMGS:") ~= nil) or (res:find("OK") ~= nil and not res:find("ERROR"))
+    if not ok and #res == 0 then
+        fd:write("\27")
+        read_raw_until(fd, 1000)
+    end
+    return ok, res
+end
+
+local function retry_with_cgsms(fd, fn)
+    local cgsms_cur = send_raw_at(fd, "AT+CGSMS?", 1200)
+    local last_res = ""
+    for _, dom in ipairs({"2", "3"}) do
+        if not cgsms_cur:find("+CGSMS:%s*" .. dom) then
+            local set_d = send_raw_at(fd, "AT+CGSMS=" .. dom, 1200)
+            if set_d:find("OK") then
+                local ok, res = fn()
+                last_res = res
+                if ok then return true, res end
+            end
+        end
+    end
+    return false, last_res
+end
+
+local function send_pdu_list(fd, pdus, allow_cgsms_retry)
+    local ok, res = false, ""
+    for idx, pdu in ipairs(pdus) do
+        ok, res = send_raw_pdu_fd(fd, pdu)
+        if not ok and allow_cgsms_retry and idx == 1 then
+            local ok2, res2 = retry_with_cgsms(fd, function() return send_raw_pdu_fd(fd, pdu) end)
+            if ok2 or #res2 > 0 then ok, res = ok2, res2 end
+        end
+        if not ok then break end
+        if idx < #pdus then nixio.nanosleep(0, 350000000) end
+    end
+    return ok, res
 end
 
 local function send_at_sms(port, dest, msg)
-    if not dest or #dest == 0 or not msg or #msg == 0 then return false end
+    dest = (dest or ""):gsub("[^%d%+]", "")
+    if #dest == 0 or not msg or #msg == 0 then
+        io.stderr:write("invalid target or empty message\n")
+        return false
+    end
     local fd = open_at_fd(port)
-    if not fd then return false end
-    local is_ascii = not msg:find("[\128-\255]")
-    local ok = false
-    if is_ascii then
-        send_raw_at(fd, "AT+CMGF=1", 1200)
-        send_raw_at(fd, 'AT+CSCS="GSM"', 1200)
-        local p_resp = send_raw_at(fd, string.format('AT+CMGS="%s"', dest), 3000, true)
-        if p_resp:find(">") then
-            fd:write(msg .. "\26")
-            local res = read_raw_until(fd, 8000)
-            ok = (res:find("OK") ~= nil or res:find("+CMGS:") ~= nil)
-        end
-    else
-        send_raw_at(fd, "AT+CMGF=0", 1200)
-        local da_len, da_type, da_hex = encode_tbcd(dest)
-        local ucs2 = encode_utf8_to_ucs2_hex(msg)
-        local udl = math.floor(#ucs2 / 2)
-        if udl > 140 then udl = 140; ucs2 = ucs2:sub(1, 280) end
-        local pdu = string.format("001100%02X%s%s0008AA%02X%s", da_len, da_type, da_hex, udl, ucs2)
-        local tpdu_len = math.floor((#pdu - 2) / 2)
-        local p_resp = send_raw_at(fd, string.format("AT+CMGS=%d", tpdu_len), 3000, true)
-        if p_resp:find(">") then
-            fd:write(pdu .. "\26")
-            local res = read_raw_until(fd, 8000)
-            ok = (res:find("OK") ~= nil or res:find("+CMGS:") ~= nil)
+    if not fd then
+        io.stderr:write("cannot open port " .. tostring(port) .. "\n")
+        return false
+    end
+    local ate = send_raw_at(fd, "ATE0", 1200)
+    if ate:find(">", 1, true) then
+        clear_stuck_prompt(fd)
+        send_raw_at(fd, "ATE0", 1200)
+    end
+    send_raw_at(fd, "AT+CMEE=2", 1200)
+    local is_short_ascii = (not msg:find("[\128-\255]")) and (#msg <= 160)
+    local ok, res = false, ""
+
+    if is_short_ascii then
+        ok, res = send_text_sms_fd(fd, dest, msg)
+        if not ok then
+            local ok2, res2 = retry_with_cgsms(fd, function() return send_text_sms_fd(fd, dest, msg) end)
+            if ok2 or #res2 > 0 then ok, res = ok2, res2 end
         end
     end
+
+    if not ok then
+        local pdus = build_ucs2_pdus(dest, msg, false)
+        if #pdus == 0 then
+            fd:close()
+            io.stderr:write("empty encoded payload\n")
+            return false
+        end
+        ok, res = send_pdu_list(fd, pdus, true)
+        if not ok and #pdus > 1 then
+            -- Fallback when modem/carrier rejects TP-UDHI 0x51 (e.g. Fibocom FM350-GL +CME ERROR: 38 on short codes)
+            local plain_pdus = build_ucs2_pdus(dest, msg, true)
+            local ok_p, res_p = send_pdu_list(fd, plain_pdus, false)
+            if ok_p or #res_p > 0 then ok, res = ok_p, res_p end
+        end
+    end
+
     fd:close()
-    return ok
+    if ok then
+        local cmgs = res:match("(%+CMGS:[^\r\n]+)") or "OK"
+        io.write("sms sent: " .. cmgs .. "\n")
+        return true
+    end
+    io.stderr:write("sms failed (" .. port .. "): " .. extract_at_error(res) .. "\n")
+    return false
+end
+
+local function send_raw_pdu_cli(port, raw_pdu)
+    local fd = open_at_fd(port)
+    if not fd then
+        io.stderr:write("cannot open port " .. tostring(port) .. "\n")
+        return false
+    end
+    local ate = send_raw_at(fd, "ATE0", 1200)
+    if ate:find(">", 1, true) then
+        clear_stuck_prompt(fd)
+        send_raw_at(fd, "ATE0", 1200)
+    end
+    send_raw_at(fd, "AT+CMEE=2", 1200)
+    local ok, res = send_raw_pdu_fd(fd, raw_pdu)
+    if not ok then
+        local ok2, res2 = retry_with_cgsms(fd, function() return send_raw_pdu_fd(fd, raw_pdu) end)
+        if ok2 or #res2 > 0 then ok, res = ok2, res2 end
+    end
+    fd:close()
+    if ok then
+        local cmgs = res:match("(%+CMGS:[^\r\n]+)") or "OK"
+        io.write("pdu sent: " .. cmgs .. "\n")
+        return true
+    end
+    io.stderr:write("pdu failed (" .. port .. "): " .. extract_at_error(res) .. "\n")
+    return false
 end
 
 -- Parse CLI arguments
 local mode = "read"
-local port_arg, at_cmd, sms_dest, sms_body, del_indices, del_storage
+local port_arg, at_cmd, sms_dest, sms_body, raw_pdu_hex, del_indices, del_storage
 local i = 1
 while i <= #arg do
     local a = arg[i]
     if a == "-p" or a == "-d" then port_arg = arg[i + 1]; i = i + 2
     elseif a == "--at" then mode = "at"; at_cmd = arg[i + 1]; i = i + 2
     elseif a == "--send" then mode = "send"; sms_dest = arg[i + 1]; sms_body = arg[i + 2]; i = i + 3
+    elseif a == "--send-raw-pdu" then mode = "raw_pdu"; raw_pdu_hex = arg[i + 1]; i = i + 2
     elseif a == "--delete" then
         mode = "delete"
         del_indices = arg[i + 1]
@@ -457,7 +709,10 @@ while i <= #arg do
     else i = i + 1 end
 end
 
-local at_port = find_at_port(port_arg)
+local at_port = nil
+if mode ~= "read" or (nixio.fs.stat("/dev/wwan0qmi0", "type") ~= "chr" and nixio.fs.stat("/dev/cdc-wdm0", "type") ~= "chr") then
+    at_port = find_at_port(port_arg)
+end
 
 if mode == "at" then
     if not at_port or not at_cmd then os.exit(1) end
@@ -475,6 +730,9 @@ if mode == "at" then
 elseif mode == "send" then
     if not at_port then os.exit(1) end
     os.exit(send_at_sms(at_port, sms_dest, sms_body) and 0 or 1)
+elseif mode == "raw_pdu" then
+    if not at_port then os.exit(1) end
+    os.exit(send_raw_pdu_cli(at_port, raw_pdu_hex) and 0 or 1)
 elseif mode == "delete" then
     if not at_port or not del_indices then os.exit(1) end
     local fd = open_at_fd(at_port)

@@ -375,7 +375,7 @@ safe_at_once() {
     local port="$1" cmd="$2"
     [ -c "$port" ] && [ -n "$cmd" ] || return 1
     case "$port" in
-        /dev/wwan*|/dev/mhi*)
+        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
                 timeout 4 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && return 0
             fi
@@ -527,6 +527,23 @@ find_usb_root_for_netdev() {
     return 1
 }
 
+find_pci_root_for_netdev() {
+    local base cur parent
+    base=$(readlink -f "/sys/class/net/$IFNAME/device" 2>/dev/null)
+    cur="$base"
+    while [ -n "$cur" ] && [ "$cur" != "/" ]; do
+        if [ -r "$cur/vendor" ] && [ -r "$cur/device" ]; then
+            case "$cur" in
+                */0000:*) echo "$cur"; return 0 ;;
+            esac
+        fi
+        parent="${cur%/*}"
+        [ "$parent" = "$cur" ] && break
+        cur="$parent"
+    done
+    return 1
+}
+
 append_unique_port() {
     local p="$1"
     [ -c "$p" ] || return 0
@@ -540,15 +557,17 @@ find_working_at_port() {
     AT_PORT=""; ATI_INFO=""
     local CAND_PORTS=""
     read_usb_ids_for_netdev || true
-    local usb_root prio_ifnums="" ifnum ifdir tpath p out cgmm
+    local usb_root pci_root prio_ifnums="" ifnum ifdir tpath p out cgmm ok_port="" ok_out=""
     usb_root=$(find_usb_root_for_netdev 2>/dev/null || true)
 
     case "${USB_VID}:${USB_PID}" in
-        0e8d:7126|0e8d:7127) prio_ifnums="04 03" ;;
+        0e8d:7126|0e8d:7127) prio_ifnums="06 03 04" ;;
         2c7c:0457) prio_ifnums="02 07" ;;
-        2c7c:0800|2c7c:0801|2c7c:0900|2c7c:0125|2c7c:0121|2c7c:0306|2c7c:0512|2c7c:0620|2c7c:030b|2c7c:030e|2c7c:0316|2c7c:0435|2c7c:6005) prio_ifnums="02 03" ;;
+        2c7c:0800|2c7c:0900|2c7c:0125|2c7c:0121|2c7c:0306|2c7c:0512|2c7c:0620|2c7c:030b|2c7c:030e|2c7c:0316|2c7c:0435|2c7c:6005) prio_ifnums="02 03" ;;
+        2c7c:0801) prio_ifnums="02 03 04" ;;
         1199:9071|1199:9079|1199:9091|1199:90b1|1199:90d2|1199:90d3) prio_ifnums="02 03" ;;
         2cb7:0104|2cb7:0105|2cb7:0106|2cb7:010a|2cb7:010d|2cb7:0112) prio_ifnums="02 03" ;;
+        413c:81e0|413c:81e4|413c:81e6|413c:8213|413c:8215) prio_ifnums="02 03 04" ;;
         1e0e:9011) prio_ifnums="04 05" ;;
         1782:4e00) prio_ifnums="00 03" ;;
         305a:1421|305a:1404) prio_ifnums="01" ;;
@@ -573,8 +592,14 @@ find_working_at_port() {
             append_unique_port "/dev/${tpath##*/}"
         done
     else
+        pci_root=$(find_pci_root_for_netdev 2>/dev/null || true)
+        if [ -n "$pci_root" ] && [ -d "$pci_root" ]; then
+            for tpath in $(find "$pci_root" -maxdepth 4 \( -name 'wwan*at*' -o -name 'mhi_DUN*' -o -name 'ttyFMI*' \) 2>/dev/null | sort); do
+                append_unique_port "/dev/${tpath##*/}"
+            done
+        fi
         # Global fallback only for PCIe / non-USB modems to avoid USB/PCIe AT cross-talk
-        for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB4 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyFMI0; do
+        for p in /dev/wwan0at0 /dev/wwan0at1 /dev/mhi_DUN /dev/mhi_DUN0 /dev/ttyFMI0 /dev/wwan*at* /dev/mhi_DUN* /dev/ttyFMI* /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB4 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1; do
             append_unique_port "$p"
         done
     fi
@@ -582,19 +607,24 @@ find_working_at_port() {
     for p in $CAND_PORTS; do
         [ -c "$p" ] || continue
         out=$(safe_at_once "$p" "ATI" | head -c 512)
-        if echo "$out" | grep -qE '(^|[[:space:]])OK([[:space:]]|$)|Sierra|Quectel|Fibocom|FIBOCOM|FM350|Huawei|HUAWEI|Simcom|SIMCOM|Meig|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Air724|OpenLuat'; then
+        printf '%s' "$out" | grep -qiE '\$GP|\$GN|\$GL|\$BD|Unknown error|\+CGPADDR|ERROR' && continue
+        if printf '%s' "$out" | grep -qiE 'Manufacturer:|Model:|Revision:|IMEI:|Sierra|Quectel|Fibocom|FIBOCOM|FM350|Huawei|HUAWEI|Simcom|SIMCOM|Meig|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Foxconn|Air724|OpenLuat'; then
             AT_PORT="$p"; ATI_INFO="$out"
-            case "$ATI_INFO" in
-                *Sierra*|*Quectel*|*Fibocom*|*FIBOCOM*|*FM350*|*Huawei*|*HUAWEI*|*Simcom*|*SIMCOM*|*Meig*|*MeiG*|*Neoway*|*Gosuncn*|*Telit*|*Thales*|*Air724*) ;;
-                *)
-                    cgmm=$(safe_at_once "$p" "AT+CGMM" | head -c 256)
-                    [ -n "$cgmm" ] && ATI_INFO="${ATI_INFO} ${cgmm}"
-                    ;;
-            esac
             echo "$AT_PORT" > /tmp/master_sms_port 2>/dev/null || true
             return 0
         fi
+        if [ -z "$ok_port" ] && printf '%s' "$out" | grep -qE '(^|[[:space:]])OK([[:space:]]|$)'; then
+            ok_port="$p"; ok_out="$out"
+        fi
     done
+
+    if [ -n "$ok_port" ]; then
+        AT_PORT="$ok_port"; ATI_INFO="$ok_out"
+        cgmm=$(safe_at_once "$AT_PORT" "AT+CGMM" | head -c 256)
+        [ -n "$cgmm" ] && ATI_INFO="${ATI_INFO} ${cgmm}"
+        echo "$AT_PORT" > /tmp/master_sms_port 2>/dev/null || true
+        return 0
+    fi
     return 1
 }
 
@@ -732,11 +762,15 @@ sync_sim_status() {
 wait_modem_ready() {
     [ -c "$AT_PORT" ] || return 0
     local w=0 cpin_out reg_out cmd
-    while [ "$w" -lt 3 ] && [ "$STOP_REQ" = "0" ]; do
+    while [ "$w" -lt 6 ] && [ "$STOP_REQ" = "0" ]; do
         cpin_out=$(safe_at_once "$AT_PORT" "AT+CPIN?")
         echo "$cpin_out" | grep -qiE '\+CPIN:[[:space:]]*READY' && break
+        if echo "$cpin_out" | grep -qiE 'SIM not inserted|\+CME ERROR:[[:space:]]*10'; then
+            logger -t duydoan5g "SIM missing on $AT_PORT ($cpin_out)"
+            return 0
+        fi
         w=$((w + 1))
-        [ "$w" -lt 3 ] && sleep 2
+        [ "$w" -lt 6 ] && sleep 2
     done
 
     w=0
@@ -765,7 +799,7 @@ write_modem_meta() {
         m_model=$(printf '%s\n' "$ATI_INFO" | tr -d '\r' | awk '
             /^[[:space:]]*Model:[[:space:]]*/ { sub(/^[[:space:]]*Model:[[:space:]]*/, ""); print; exit }
             { line=$0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", line) }
-            line=="" || line=="ATI" || line=="OK" || line=="ERROR" || line~/^Revision:/ || line~/^Manufacturer:/ { next }
+            line=="" || line=="ATI" || line=="OK" || line=="ERROR" || line~/^Revision:/ || line~/^Manufacturer:/ || line~/^(Unknown error|No such|timeout|AT\+|\+CGPADDR|\$GP|\$GN)/ { next }
             tolower(line) ~ /^(quectel|fibocom|huawei|sierra|simcom|meig|neoway|gosuncn|telit|thales|cinterion|openluat)$/ { next }
             { print line; exit }
         ')
@@ -1266,6 +1300,16 @@ run_umbim_fallback() {
     return 0
 }
 
+reexec_on_vanish() {
+    [ "$STOP_REQ" = "0" ] && [ ! -d "/sys/class/net/$IFNAME" ] || return 0
+    proto_init_update "$IFNAME" 0
+    proto_send_update "$interface"
+    rm -f /tmp/master_sms_port
+    logger -t duydoan5g "Interface $IFNAME vanished; re-initializing dialer detection"
+    exec 8>&-
+    exec /usr/bin/duydoan5g_dialer.sh "$interface" "$apn" "$pdptype" "$mtu" "$metric" "$pincode" "$username" "$password" "$auth" "0" "$user_pdp_index" "$force_apn" "$user_device"
+}
+
 run_mtk_pcie_dial() {
     [ -c "$CTRL_DEV" ] || [ -z "$AT_PORT" ] || CTRL_DEV=$(echo "$AT_PORT" | sed 's/at/mbim/g')
     if [ ! -c "$CTRL_DEV" ] || ! command -v umbim >/dev/null 2>&1; then
@@ -1316,6 +1360,7 @@ run_mtk_pcie_dial() {
             run_umbim_fallback || sleep 5
         fi
     done
+    reexec_on_vanish
 }
 
 ensure_dynamic_dhcpv6() {
@@ -1396,7 +1441,10 @@ run_fm350_usb_dial() {
             detach_bridge_master
             ip link set dev "$IFNAME" arp off 2>/dev/null || true
             clamp_mtu
-            [ -z "$v6" ] && apply_carrier_ipv6_route_mtu ""
+            if [ "$pdptype" != "ip" ] && [ "$pdptype" != "ipv4" ] && [ -z "$v6" ]; then
+                command -v rdisc6 >/dev/null 2>&1 && { rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true; }
+                apply_carrier_ipv6_route_mtu ""
+            fi
             cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$active_cid")
             [ -n "$cgp" ] || continue
             v4=$(extract_cgpaddr_ipv4 "$cgp")
@@ -1428,6 +1476,7 @@ run_fm350_usb_dial() {
             sleep 3
         fi
     done
+    reexec_on_vanish
 }
 
 run_at_dhcp_monitor() {
@@ -1502,6 +1551,7 @@ run_at_dhcp_monitor() {
     stop_pid_graceful "$ODHCP6C_PID" "$ODHCP6C_START"
     UDHCPC_PID=""; UDHCPC_START=""
     ODHCP6C_PID=""; ODHCP6C_START=""
+    reexec_on_vanish
 }
 
 rotate_cm_log() {

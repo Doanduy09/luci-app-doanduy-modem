@@ -596,10 +596,20 @@ return view.extend({
                 var tgt = smsTargetInput.value.trim();
                 var msg = smsMsgInput.value.trim();
                 if (!tgt || !msg) { alert('Vui lòng nhập người nhận và nội dung!'); return; }
-                callSendSMS(tgt, msg).then(function() {
-                    ui.addNotification(null, E('p', '✅ Đã gửi tin nhắn đến ' + tgt), 'info');
-                    smsMsgInput.value = '';
+                sendSmsBtn.disabled = true;
+                sendSmsBtn.textContent = '⏳ Đang gửi...';
+                callSendSMS(tgt, msg).then(function(res) {
+                    sendSmsBtn.disabled = false;
+                    sendSmsBtn.textContent = '📨 Gửi Tin Nhắn';
+                    if (res && res.success) {
+                        ui.addNotification(null, E('p', '✅ ' + (res.message || ('Đã gửi tin nhắn đến ' + tgt))), 'info');
+                        smsMsgInput.value = '';
+                    } else {
+                        ui.addNotification(null, E('p', '❌ ' + ((res && res.message) || 'Gửi tin nhắn thất bại!')), 'error');
+                    }
                 }).catch(function(err) {
+                    sendSmsBtn.disabled = false;
+                    sendSmsBtn.textContent = '📨 Gửi Tin Nhắn';
                     ui.addNotification(null, E('p', '❌ Lỗi gửi tin: ' + err), 'error');
                 });
             }
@@ -619,6 +629,12 @@ return view.extend({
             click: function() {
                 inboxContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #2563eb; font-weight: 700;">⏳ Đang gửi tra cước data & đọc tin phản hồi tự động...</div>';
                 callCheckDataBalance().then(function(res) {
+                    if (res && res.success === false) {
+                        var errMsg = res.message || 'Gửi lệnh tra cước thất bại!';
+                        inboxContainer.innerHTML = '<div style="padding: 16px; color: #b91c1c; font-weight: 700;">❌ ' + errMsg + '</div>';
+                        ui.addNotification(null, E('p', '❌ ' + errMsg), 'error');
+                        return;
+                    }
                     callFetchSMS().then(function(rep) {
                         inboxContainer.innerHTML = '';
                         parseAndRenderSMS(rep.inbox || '').forEach(function(n) { inboxContainer.appendChild(n); });

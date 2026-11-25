@@ -35,6 +35,50 @@ get_modem_meta_str() {
     printf '%s' "${mt}|${META_VENDOR}|${META_MODEL}|${META_USB_VID}"
 }
 
+probe_at_tier() {
+    local dev="$1" tier="${2:-strong}" resp=""
+    [ -n "$dev" ] && [ -c "$dev" ] || return 1
+    case "$dev" in
+        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
+            if command -v tom_modem >/dev/null 2>&1; then
+                resp=$(timeout 3 tom_modem -d "$dev" -c ATI 2>/dev/null)
+            fi
+            if [ -z "$resp" ] && [ -x /usr/bin/read_pcie_sms.lua ]; then
+                resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+            fi
+            ;;
+        *)
+            if command -v atinout >/dev/null 2>&1; then
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    resp=$(modem_lock_run timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                else
+                    resp=$(timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                fi
+            fi
+            if [ -z "$resp" ] && command -v sms_tool >/dev/null 2>&1; then
+                resp=$(modem_lock_run sms_tool -d "$dev" -D at "ATI" 2>/dev/null)
+            fi
+            if [ -z "$resp" ] && [ -x /usr/bin/read_pcie_sms.lua ]; then
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    resp=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                else
+                    resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                fi
+            fi
+            ;;
+    esac
+    printf '%s' "$resp" | grep -qiE '\$GP|\$GN|\$GL|\$BD|Unknown error|\+CGPADDR|ERROR' && return 1
+    if printf '%s' "$resp" | grep -qiE 'Manufacturer:|Model:|Revision:|IMEI:|Quectel|Fibocom|FIBOCOM|FM350|RM5[02]|EM0|EM1|RG5|Sierra|Huawei|HUAWEI|Simcom|SIMCOM|MeiG|Neoway|Gosuncn|Telit|Thales|Cinterion|Foxconn|T99W|DW593|Air724|OpenLuat'; then
+        return 0
+    fi
+    [ "$tier" = "ok" ] && printf '%s' "$resp" | grep -q 'OK' && return 0
+    return 1
+}
+
+probe_at_device() {
+    probe_at_tier "$1" "strong"
+}
+
 get_active_modem_port() {
     local custom_p=$(cat /tmp/custom_at_port 2>/dev/null || cat /etc/custom_at_port 2>/dev/null)
     if [ -n "$custom_p" ] && [ -c "$custom_p" ]; then
@@ -43,19 +87,10 @@ get_active_modem_port() {
     fi
 
     local cached_p=$(cat /tmp/master_sms_port 2>/dev/null)
-    if [ -n "$cached_p" ] && [ -c "$cached_p" ]; then
+    if [ -n "$cached_p" ] && [ -c "$cached_p" ] && probe_at_tier "$cached_p" "strong"; then
         echo "$cached_p"
         return 0
     fi
-
-    # Ưu tiên cổng AT PCIe WWAN / MHI (Fibocom FM350-GL / MTK T700 / Qualcomm MHI)
-    for pcie_p in /dev/ttyFMI0 /dev/ttyFMI1 /dev/wwan0at0 /dev/wwan1at0 /dev/mhi_DUN /dev/mhi_BHI; do
-        if [ -c "$pcie_p" ]; then
-            echo "$pcie_p" > /tmp/master_sms_port
-            echo "$pcie_p"
-            return 0
-        fi
-    done
 
     local iface=""
     for i in wwan0 wwan1 usb0; do
@@ -67,54 +102,54 @@ get_active_modem_port() {
         parent_dir=$(cd -P "/sys/class/net/$iface/device/.." 2>/dev/null && pwd)
     fi
 
-    local found_ports=""
+    local cand_ports=" "
+    add_cand_port() {
+        local p="$1"
+        [ -n "$p" ] && [ -c "$p" ] || return 0
+        case "$cand_ports" in
+            *" $p "*) ;;
+            *) cand_ports="${cand_ports}${p} " ;;
+        esac
+    }
+
+    # Ưu tiên cổng AT PCIe WWAN / MHI / FM350
+    for p in /dev/wwan0at0 /dev/wwan1at0 /dev/mhi_DUN /dev/mhi_DUN0 /dev/ttyFMI0 /dev/ttyFMI1 /dev/wwan*at* /dev/mhi_DUN* /dev/ttyFMI*; do
+        add_cand_port "$p"
+    done
+
     if [ -n "$parent_dir" ]; then
         for tty_link in /sys/bus/usb-serial/devices/* /sys/class/tty/ttyACM*; do
             [ -e "$tty_link" ] || continue
             local tty_real=$(cd -P "$tty_link" 2>/dev/null && pwd)
             case "$tty_real" in
                 "$parent_dir"*)
-                    local dev_name=$(basename "$tty_link")
-                    found_ports="$found_ports /dev/$dev_name"
+                    add_cand_port "/dev/$(basename "$tty_link")"
                     ;;
             esac
         done
     fi
 
-    if [ -z "$found_ports" ]; then
-        for p in /dev/ttyFMI0 /dev/ttyFMI1 /dev/wwan0at0 /dev/wwan1at0 /dev/mhi_DUN /dev/ttyUSB2 /dev/ttyUSB3 /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyACM0 /dev/ttyACM1; do
-            [ -c "$p" ] && found_ports="$found_ports $p"
-        done
-    fi
+    for p in /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyUSB* /dev/ttyACM*; do
+        add_cand_port "$p"
+    done
 
-    for p in $found_ports; do
-        if [ -c "$p" ]; then
-            local resp=""
-            case "$p" in
-                /dev/wwan*|/dev/mhi*)
-                    [ -x /usr/bin/read_pcie_sms.lua ] && resp=$(/usr/bin/read_pcie_sms.lua -p "$p" --at "AT" 2>/dev/null)
-                    ;;
-                *)
-                    resp=$(sms_tool -d "$p" -D at "AT" 2>/dev/null || printf "AT\r\n" | timeout 1 atinout - "$p" - 2>/dev/null)
-                    ;;
-            esac
-            if echo "$resp" | grep -q "OK"; then
+    for tier in strong ok; do
+        for p in $cand_ports; do
+            if probe_at_tier "$p" "$tier"; then
                 echo "$p" > /tmp/master_sms_port
                 echo "$p"
                 return 0
             fi
-        fi
+        done
     done
 
-    for p in $found_ports; do
-        if [ -c "$p" ]; then
-            echo "$p" > /tmp/master_sms_port
-            echo "$p"
-            return 0
-        fi
+    for p in $cand_ports; do
+        echo "$p" > /tmp/master_sms_port
+        echo "$p"
+        return 0
     done
 
-    echo "/dev/ttyUSB0"
+    echo "/dev/ttyUSB3"
 }
 
 send_at_direct() {
@@ -123,7 +158,7 @@ send_at_direct() {
     local out=""
 
     case "$p" in
-        /dev/wwan*|/dev/mhi*)
+        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
                 out=$(/usr/bin/read_pcie_sms.lua -p "$p" --at "$cmd" 2>/dev/null)
             fi
@@ -141,9 +176,118 @@ send_at_direct() {
     echo "$out"
 }
 
+_send_sms_on_port() {
+    local cur_port="$1"
+    local target="$2"
+    local msg="$3"
+    local is_utf8="$4"
+    local out="" rc=1
+
+    case "$cur_port" in
+        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                out=$(/usr/bin/read_pcie_sms.lua -p "$cur_port" --send "$target" "$msg" 2>&1)
+                rc=$?
+                [ "$rc" -eq 0 ] && { SMS_SENT_PORT="$cur_port"; return 0; }
+            else
+                SMS_SEND_LAST_OUT="Thiếu engine /usr/bin/read_pcie_sms.lua"
+                return 1
+            fi
+            ;;
+        *)
+            if [ "$is_utf8" -eq 0 ] && [ "${#msg}" -le 160 ]; then
+                local sms_bin=""
+                command -v sms_tool_q >/dev/null 2>&1 && sms_bin="sms_tool_q"
+                [ -z "$sms_bin" ] && command -v sms_tool >/dev/null 2>&1 && sms_bin="sms_tool"
+                if [ -n "$sms_bin" ]; then
+                    touch /tmp/sms_sending.lock
+                    trap 'safe_at_cleanup' EXIT INT TERM
+                    release_ports
+                    out=$(modem_lock_run "$sms_bin" -d "$cur_port" send "$target" "$msg" 2>&1)
+                    rc=$?
+                    restore_ports
+                    rm -f /tmp/sms_sending.lock
+                    trap - EXIT INT TERM
+                    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qiE 'sucessfully|successfully|\+CMGS:' && ! printf '%s' "$out" | grep -qiE 'not sent|error'; then
+                        SMS_SENT_PORT="$cur_port"
+                        return 0
+                    fi
+                fi
+            fi
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                touch /tmp/sms_sending.lock
+                trap 'safe_at_cleanup' EXIT INT TERM
+                release_ports
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$cur_port" --send "$target" "$msg" 2>&1)
+                else
+                    out=$(/usr/bin/read_pcie_sms.lua -p "$cur_port" --send "$target" "$msg" 2>&1)
+                fi
+                rc=$?
+                restore_ports
+                rm -f /tmp/sms_sending.lock
+                trap - EXIT INT TERM
+                if [ "$rc" -eq 0 ]; then
+                    SMS_SENT_PORT="$cur_port"
+                    return 0
+                fi
+            fi
+            ;;
+    esac
+
+    SMS_SEND_LAST_OUT="$out"
+    return 1
+}
+
+do_send_sms() {
+    local port="$1"
+    local raw_target="$2"
+    local msg="$3"
+    local target out="" rc=1 is_utf8=0
+    SMS_SEND_ERR=""
+    SMS_SEND_LAST_OUT=""
+    SMS_SENT_PORT="$port"
+
+    target=$(printf '%s' "$raw_target" | tr -cd '0-9+')
+    if [ -z "$target" ] || [ -z "$msg" ]; then
+        SMS_SEND_ERR="Thiếu số nhận hoặc nội dung tin nhắn"
+        return 1
+    fi
+
+    printf '%s' "$msg" | LC_ALL=C grep -q '[^ -~	]' && is_utf8=1
+
+    if [ "$is_utf8" -eq 0 ] && [ "${#msg}" -le 160 ] && [ -c "/dev/wwan0qmi0" ] && command -v uqmi >/dev/null 2>&1; then
+        trap 'killall -CONT quectel-CM-M quectel-CM 2>/dev/null' EXIT INT TERM
+        killall -STOP quectel-CM-M quectel-CM 2>/dev/null
+        out=$(uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$msg" --send-message-target "$target" 2>&1)
+        rc=$?
+        killall -CONT quectel-CM-M quectel-CM 2>/dev/null
+        trap - EXIT INT TERM
+        if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -qiE 'error|failed'; then
+            SMS_SENT_PORT="/dev/wwan0qmi0"
+            return 0
+        fi
+    fi
+
+    if [ -n "$port" ] && [ -c "$port" ]; then
+        _send_sms_on_port "$port" "$target" "$msg" "$is_utf8" && return 0
+    fi
+
+    # Tự dò lại cổng AT bằng ATI nếu cổng cache bị đổi hoặc chưa nhận diện
+    rm -f /tmp/master_sms_port
+    local reprobed_port=$(get_active_modem_port)
+    if [ -n "$reprobed_port" ] && [ -c "$reprobed_port" ] && [ "$reprobed_port" != "$port" ]; then
+        _send_sms_on_port "$reprobed_port" "$target" "$msg" "$is_utf8" && return 0
+    fi
+
+    SMS_SEND_ERR=$(printf '%s' "$SMS_SEND_LAST_OUT" | tr '\r\n' ' ' | tr -d '"\\' | sed 's/  */ /g; s/^ *//; s/ *$//' | cut -c1-160)
+    [ -z "$SMS_SEND_ERR" ] && SMS_SEND_ERR="Modem không phản hồi trên cổng ${reprobed_port:-$port}"
+    return 1
+}
+
 case "$1" in
     list)
-        echo '{"getSMSInfo":{},"sendSMS":{"target":"string","msg":"string"},"sendAT":{"cmd":"string","port":"string"},"setCustomSchedule":{"datetime":"string"},"getAvailablePorts":{},"setCustomAtPort":{"port":"string"},"fetchSMSNow":{},"deleteSingleSMS":{"indices":"string","storage":"string"},"deleteAllSMS":{},"checkDataBalance":{},"setBandLock":{"mode":"string"},"getBandState":{},"setCustomBands":{"rat":"string","lte_bands":"string","nr_bands":"string"},"getCellInfo":{},"setCellLock":{"action":"string"},"setCardMode":{"mode":"string","iface_name":"string"},"renameInterface":{"new_name":"string"}}'
+        echo '{"getSMSInfo":{},"sendSMS":{"target":"string","msg":"string"},"sendRawPDU":{"pdu":"string"},"sendAT":{"cmd":"string","port":"string"},"setCustomSchedule":{"datetime":"string"},"getAvailablePorts":{},"setCustomAtPort":{"port":"string"},"fetchSMSNow":{},"deleteSingleSMS":{"indices":"string","storage":"string"},"deleteAllSMS":{},"checkDataBalance":{},"setBandLock":{"mode":"string"},"getBandState":{},"setCustomBands":{"rat":"string","lte_bands":"string","nr_bands":"string"},"getCellInfo":{},"setCellLock":{"action":"string"},"setCardMode":{"mode":"string","iface_name":"string"},"renameInterface":{"new_name":"string"}}'
         ;;
     call)
         read -r -t 1 input 2>/dev/null || [ -n "$input" ] || input=""
@@ -364,32 +508,61 @@ case "$1" in
                     "$port" "$act_iface" "$sim_info" "$sim_status" "$epoch" "$is_auth" "$cur_band" "$carrier_preset" "$inbox"
                 ;;
             sendSMS)
-                target=$(echo "$input" | jsonfilter -e '$.target' 2>/dev/null)
-                msg=$(echo "$input" | jsonfilter -e '$.msg' 2>/dev/null)
+                target=$(printf '%s' "$input" | jsonfilter -e '$.target' 2>/dev/null)
+                msg=$(printf '%s' "$input" | jsonfilter -e '$.msg' 2>/dev/null)
                 port=$(get_active_modem_port)
-                if [ -c "/dev/wwan0qmi0" ]; then
-                    trap 'killall -CONT quectel-CM-M quectel-CM 2>/dev/null' EXIT INT TERM
-                    killall -STOP quectel-CM-M quectel-CM 2>/dev/null
-                    uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$msg" --send-message-target "$target" >/dev/null 2>&1
-                    killall -CONT quectel-CM-M quectel-CM 2>/dev/null
-                    trap - EXIT INT TERM
+                if do_send_sms "$port" "$target" "$msg"; then
+                    clean_tgt=$(printf '%s' "$target" | tr -cd '0-9+')
+                    printf '{"success":true,"message":"Đã gửi SMS thành công tới %s qua %s!"}\n' "$clean_tgt" "${SMS_SENT_PORT:-$port}"
                 else
-                    case "$port" in
-                        /dev/wwan*|/dev/mhi*)
-                            [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --send "$target" "$msg" >/dev/null 2>&1
+                    printf '{"success":false,"message":"Gửi SMS thất bại (%s)"}\n' "$SMS_SEND_ERR"
+                fi
+                ;;
+            sendRawPDU)
+                raw_pdu=$(printf '%s' "$input" | jsonfilter -e '$.pdu' 2>/dev/null | tr -cd '0-9A-Fa-f')
+                if [ -z "$raw_pdu" ] || [ "${#raw_pdu}" -lt 4 ] || [ $(( ${#raw_pdu} % 2 )) -ne 0 ]; then
+                    echo '{"success":false,"message":"PDU hex không hợp lệ"}'
+                    exit 0
+                fi
+                port=$(get_active_modem_port)
+                pdu_out="" pdu_rc=1
+                _run_pdu_port() {
+                    local p="$1"
+                    [ -n "$p" ] && [ -c "$p" ] && [ -x /usr/bin/read_pcie_sms.lua ] || return 1
+                    case "$p" in
+                        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
+                            pdu_out=$(/usr/bin/read_pcie_sms.lua -p "$p" --send-raw-pdu "$raw_pdu" 2>&1)
+                            pdu_rc=$?
                             ;;
                         *)
                             touch /tmp/sms_sending.lock
                             trap 'safe_at_cleanup' EXIT INT TERM
                             release_ports
-                            modem_lock_run sms_tool -d "$port" send "$target" "$msg" >/dev/null 2>&1
+                            if command -v modem_lock_run >/dev/null 2>&1; then
+                                pdu_out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$p" --send-raw-pdu "$raw_pdu" 2>&1)
+                            else
+                                pdu_out=$(/usr/bin/read_pcie_sms.lua -p "$p" --send-raw-pdu "$raw_pdu" 2>&1)
+                            fi
+                            pdu_rc=$?
                             restore_ports
                             rm -f /tmp/sms_sending.lock
                             trap - EXIT INT TERM
                             ;;
                     esac
+                    return $pdu_rc
+                }
+                if _run_pdu_port "$port"; then
+                    printf '{"success":true,"message":"Đã gửi Raw PDU thành công qua %s!"}\n' "$port"
+                else
+                    rm -f /tmp/master_sms_port
+                    reprobed=$(get_active_modem_port)
+                    if [ -n "$reprobed" ] && [ "$reprobed" != "$port" ] && _run_pdu_port "$reprobed"; then
+                        printf '{"success":true,"message":"Đã gửi Raw PDU thành công qua %s!"}\n' "$reprobed"
+                    else
+                        err_clean=$(printf '%s' "$pdu_out" | tr '\r\n' ' ' | tr -d '"\\' | sed 's/  */ /g; s/^ *//; s/ *$//' | cut -c1-160)
+                        printf '{"success":false,"message":"Gửi Raw PDU thất bại (%s)"}\n' "${err_clean:-$port}"
+                    fi
                 fi
-                echo '{"success":true,"message":"Gửi SMS thành công!"}'
                 ;;
             setCustomSchedule)
                 # Bảo mật SIM mặc định: Chỉ SIM thuộc danh mục VIP mới được phép đặt lịch gia hạn
@@ -440,27 +613,20 @@ case "$1" in
 EOF
                 echo "$s_dst|$s_body|$carrier_display" > /tmp/carrier_data_preset.txt
 
-                case "$port" in
-                    /dev/wwan*|/dev/mhi*)
-                        [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --send "$s_dst" "$s_body" >/dev/null 2>&1
-                        sleep 5
-                        [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --read >/dev/null 2>&1
-                        ;;
-                    *)
-                        touch /tmp/sms_sending.lock
-                        trap 'safe_at_cleanup' EXIT INT TERM
-                        release_ports
-
-                        modem_lock_run sms_tool -d "$port" send "$s_dst" "$s_body" >/dev/null 2>&1
-                        sleep 6
-
-                        restore_ports
-                        rm -f /tmp/sms_sending.lock
-                        trap - EXIT INT TERM
-                        ;;
-                esac
-
-                printf '{"success":true,"carrier":"%s","dst":"%s"}\n' "$carrier" "$s_dst"
+                if do_send_sms "$port" "$s_dst" "$s_body"; then
+                    case "$port" in
+                        /dev/wwan*|/dev/mhi*)
+                            sleep 5
+                            [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --read >/dev/null 2>&1
+                            ;;
+                        *)
+                            sleep 6
+                            ;;
+                    esac
+                    printf '{"success":true,"carrier":"%s","dst":"%s"}\n' "$carrier" "$s_dst"
+                else
+                    printf '{"success":false,"carrier":"%s","dst":"%s","message":"Gửi lệnh tra cước thất bại (%s)"}\n' "$carrier" "$s_dst" "$SMS_SEND_ERR"
+                fi
                 ;;
             setBandLock)
                 mode=$(echo "$input" | jsonfilter -e '$.mode' 2>/dev/null)
