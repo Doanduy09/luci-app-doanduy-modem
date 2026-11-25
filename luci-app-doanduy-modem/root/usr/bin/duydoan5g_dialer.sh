@@ -1560,6 +1560,7 @@ while [ "$STOP_REQ" = "0" ]; do
             fi
 
             ticks=$((ticks + 1))
+            [ "$is_up" = "1" ] && apply_carrier_ipv6_route_mtu "$gw6"
             [ $((ticks % 60)) -eq 0 ] && rotate_cm_log
             [ "$is_up" = "1" ] && sleep 4 || sleep 1
         done
