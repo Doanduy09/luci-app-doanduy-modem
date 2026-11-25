@@ -468,6 +468,10 @@ return baseclass.extend({
                 if (state.lan_tvs.length > 0) {
                     tvStrip.textContent = '📺 TV LAN đang đồng bộ cùng Voice Hub: ' + state.lan_tvs.map(function(t) { return t.name + ' (' + t.ip + ')'; }).join(' • ');
                 }
+            }).catch(function(err) {
+                hubBadge.style.background = '#fef2f2';
+                hubBadge.style.color = '#b91c1c';
+                hubBadge.textContent = '⚠️ Lỗi kết nối RPCD';
             });
         }
 

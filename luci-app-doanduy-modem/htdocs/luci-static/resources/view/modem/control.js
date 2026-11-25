@@ -4,7 +4,7 @@
 'require rpc';
 'require ui';
 'require poll';
-'require doanduy.smarthome';
+'require doanduy.smarthome as smarthome';
 
 // RPC Declarations
 var callSMSInfo = rpc.declare({ object: 'luci.sms-status', method: 'getSMSInfo', expect: { } });
