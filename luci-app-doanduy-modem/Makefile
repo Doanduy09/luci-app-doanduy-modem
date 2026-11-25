@@ -7,18 +7,19 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-doanduy-modem
-PKG_VERSION:=2.3.0
+PKG_VERSION:=2.4.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_MAINTAINER:=DOANDUY <doanduy09@gmail.com>
 
-LUCI_TITLE:=Quản Trị Modem 5G PCIe & USB, SMS Engine, Auto-Renew, AI Sentinel & Smart Home S06 Pro
+LUCI_TITLE:=Quản Trị Modem 5G PCIe & USB, SMS Engine, Auto-Renew, AI Sentinel & Điều Khiển Nhà
 LUCI_DEPENDS:=+luci-base +rpcd +ubus +jsonfilter +atinout +curl +ca-bundle +lua +lua-cjson +luci-lib-nixio
 LUCI_PKGARCH:=all
 
 define Package/$(PKG_NAME)/conffiles
 /etc/config/doanduy_smarthome.json
+/etc/config/doanduy_smarthome_keys.json
 /etc/duytv_s06_config.json
 /etc/config/sentinel_bots.json
 /etc/config/sentinel_cameras.conf

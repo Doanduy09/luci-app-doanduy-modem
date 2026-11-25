@@ -60,6 +60,7 @@ jobs:
           # Conffiles
           cat << 'EOF' > build_staging/control/conffiles
           /etc/config/doanduy_smarthome.json
+          /etc/config/doanduy_smarthome_keys.json
           /etc/duytv_s06_config.json
           /etc/config/sentinel_bots.json
           /etc/config/sentinel_cameras.conf
@@ -129,5 +130,5 @@ jobs:
             echo "Creating new release $TAG_NAME..."
             gh release create "$TAG_NAME" "$IPK_FILE" \
               --title "LuCI App DoanDuy Modem v${PKG_VER}" \
-              --notes "Release v${PKG_VER}: Smart Home Local LAN (Tuya S06 Pro Universal IR Tab + 11 Auto AC Brands + 3,200+ IRDB Online Search & 1-Tap Learn), plus Modem 5G & AI Sentinel suite."
+              --notes "Release v${PKG_VER}: Smart Home Control Hub Tab (Multi-Controller S06 Pro & ESP32-C3 Voice + Tuya Local Switch + HTTP Relay + Android TV LAN + Universal IRDB Search), plus Modem 5G & AI Sentinel suite."
           fi

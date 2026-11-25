@@ -282,7 +282,7 @@ return view.extend({
             { id: 'tab-btn-sms', key: 'sms', icon: '📬', title: 'Quản Lý SIM & Tin Nhắn SMS' },
             { id: 'tab-btn-modem', key: 'modem', icon: '📶', title: 'Modem 5G, Băng Tần & Lệnh AT' },
             { id: 'tab-btn-sentinel', key: 'sentinel', icon: '🤖', title: 'Telegram, AI & Từ Xa' },
-            { id: 'tab-btn-smarthome', key: 'smarthome', icon: '🏠', title: 'Thiết Bị Thông Minh (S06 Pro)' }
+            { id: 'tab-btn-smarthome', key: 'smarthome', icon: '🏠', title: 'Thiết Bị Điều Khiển Nhà' }
         ];
 
         var tabPanes = {};

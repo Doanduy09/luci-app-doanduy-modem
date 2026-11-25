@@ -1,5 +1,6 @@
 #!/usr/bin/lua
--- DOANDUY Smart Home RPCD Backend for Tuya S06 Pro Local LAN Control & Universal IR Catalog
+-- DOANDUY Smart Home v2.4.0 RPCD Backend
+-- Multi-Controller (Tuya IR S06 Pro + ESP32-C3 Voice) & Multi-Driver (IR AC/Remote, Tuya Switch, HTTP Relay, Android TV LAN)
 package.path = "/usr/lib/lua/?.lua;/usr/lib/lua/?/init.lua;" .. (package.path or "")
 
 local cjson = require("cjson")
@@ -7,11 +8,12 @@ local nixio = require("nixio")
 local ok_tuya, tuya_v35 = pcall(require, "tuya_v35_local")
 local ok_ac, ac_ir = pcall(require, "ac_ir_protocols")
 
-local S06_CFG_FILE = "/etc/duytv_s06_config.json"
-local DEVICES_FILE = "/etc/config/doanduy_smarthome.json"
-local HUB_DEV_FILE = "/etc/duytv_lan_devices.json"
-local IRDB_CACHE   = "/tmp/irdb_index.txt"
-local HUB_HTTP     = "http://127.0.0.1:8996"
+local S06_CFG_FILE  = "/etc/duytv_s06_config.json"
+local DEVICES_FILE  = "/etc/config/doanduy_smarthome.json"
+local KEYS_FILE     = "/etc/config/doanduy_smarthome_keys.json"
+local HUB_DEV_FILE  = "/etc/duytv_lan_devices.json"
+local IRDB_CACHE    = "/tmp/irdb_index.txt"
+local HUB_HTTP      = "http://127.0.0.1:8996"
 
 local function read_file(path)
   local f = io.open(path, "r")
@@ -40,6 +42,12 @@ local function sh_quote(s)
   return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
 end
 
+local function url_encode(s)
+  return (tostring(s or "")):gsub("([^%w%-%._~ /])", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end):gsub(" ", "%%20")
+end
+
 local function http_get_json(url, timeout_s)
   local p = io.popen(string.format("curl -4 -sS --connect-timeout 2 -m %d %s 2>/dev/null", timeout_s or 3, sh_quote(url)))
   if not p then return nil end
@@ -48,6 +56,20 @@ local function http_get_json(url, timeout_s)
   if raw == "" then return nil end
   local ok, dec = pcall(cjson.decode, raw)
   return ok and dec or nil
+end
+
+local function is_lan_http_url(url)
+  if type(url) ~= "string" then return false end
+  local host = url:match("^https?://([^/:]+)")
+  if not host then return false end
+  if host == "127.0.0.1" then return true end
+  if host:match("^192%.168%.%d+%.%d+$") or host:match("^10%.%d+%.%d+%.%d+$") then return true end
+  local a, b = host:match("^(%d+)%.(%d+)%.%d+%.%d+$")
+  if a and b then
+    a = tonumber(a); b = tonumber(b)
+    if a == 172 and b >= 16 and b <= 31 then return true end
+  end
+  return false
 end
 
 local function tcp_open(ip, port, timeout_ms)
@@ -64,14 +86,8 @@ local function tcp_open(ip, port, timeout_ms)
   return (rc and rc > 0 and rev > 0 and err == 0) and true or false
 end
 
-local function url_encode(s)
-  return (tostring(s or "")):gsub("([^%w%-%._~ /])", function(c)
-    return string.format("%%%02X", string.byte(c))
-  end):gsub(" ", "%%20")
-end
-
 -- =============================================================================
--- HUB CONFIG & SAFE PUBLIC VIEW (Zero-Leak: never returns raw local_key)
+-- ZERO-LEAK KEY VAULT & LAN SNAPSHOT
 -- =============================================================================
 
 local function load_s06_cfg()
@@ -97,77 +113,102 @@ local function load_s06_cfg()
   return cfg
 end
 
-local function heal_hub_ip(cfg)
+local function load_key_vault()
+  local raw = read_file(KEYS_FILE)
+  if raw and raw ~= "" then
+    local ok, dec = pcall(cjson.decode, raw)
+    if ok and type(dec) == "table" then return dec end
+  end
+  return {}
+end
+
+local function save_key_vault(kv)
+  write_atomic(KEYS_FILE, cjson.encode(kv), "600")
+end
+
+local function set_entity_key(entity_id, local_key)
+  if not entity_id or entity_id == "" or not local_key or #local_key ~= 16 then return end
+  local kv = load_key_vault()
+  kv[entity_id] = local_key
+  save_key_vault(kv)
+end
+
+local function get_entity_key(entity_id, cfg)
+  local kv = load_key_vault()
+  if kv[entity_id] and #(kv[entity_id]) == 16 then return kv[entity_id] end
+  if entity_id == "s06_default" and cfg and #(cfg.local_key or "") == 16 then
+    return cfg.local_key
+  end
+  return ""
+end
+
+local function read_lan_hosts()
+  local hosts = {}
+  local dl = read_file("/tmp/dhcp.leases") or ""
+  for line in dl:gmatch("[^\r\n]+") do
+    local _, mac, ip, hname = line:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)")
+    if ip and mac and ip:match("^192%.168%.%d+%.%d+$") and ip ~= "192.168.1.1" then
+      hosts[ip] = { ip = ip, mac = mac:lower(), name = (hname ~= "*") and hname or "", online = false }
+    end
+  end
   local arp = read_file("/proc/net/arp") or ""
-  local tgt = trim(cfg.mac or ""):lower()
-  if tgt ~= "" then
-    for line in arp:gmatch("[^\r\n]+") do
-      local ip, _, _, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+%S+%s+%S+%s+([%x:]+)")
-      if ip and mac and mac:lower() == tgt then
-        cfg.ip = ip
-        break
-      end
+  for line in arp:gmatch("[^\r\n]+") do
+    local ip, _, flags, mac = line:match("^(192%.168%.%d+%.%d+)%s+%S+%s+(%S+)%s+([%x:]+)")
+    if ip and mac and mac ~= "00:00:00:00:00:00" and ip ~= "192.168.1.1" then
+      local cur = hosts[ip] or { ip = ip, name = "" }
+      cur.mac = mac:lower()
+      cur.online = (flags == "0x2")
+      hosts[ip] = cur
     end
   end
-end
-
-local function get_live_hub_info(cfg, allow_probe)
-  heal_hub_ip(cfg)
-  local has_key = (#(cfg.local_key or "") == 16)
-  local out = {
-    ip = cfg.ip,
-    mac = cfg.mac,
-    device_id = cfg.device_id,
-    version = cfg.version or "3.5",
-    control_type = tonumber(cfg.control_type) or 1,
-    has_key = has_key,
-    ac_brand = cfg.ac_brand or "lg2",
-    live_ok = false,
-    temp_c = nil,
-    humidity = nil,
-  }
-  if allow_probe then
-    local st = http_get_json(HUB_HTTP .. "/s06/status?probe=1", 3)
-    if type(st) == "table" and st.ip then
-      out.live_ok = st.live_ok and true or false
-      out.ip = st.ip or out.ip
-      out.dps = st.dps
-      if type(st.dps) == "table" then
-        local t = tonumber(st.dps["101"] or st.dps["1"])
-        local h = tonumber(st.dps["102"] or st.dps["2"])
-        if t then out.temp_c = tonumber(string.format("%.1f", (t > 80) and (t / 10.0) or t)) end
-        if h then out.humidity = math.floor(h) end
-      end
-      return out
-    elseif ok_tuya and has_key then
-      local dps = tuya_v35.status(cfg.ip, cfg.device_id, cfg.local_key, 2)
-      if type(dps) == "table" then
-        out.live_ok = true
-        out.dps = dps
-        local t = tonumber(dps["101"] or dps["1"])
-        local h = tonumber(dps["102"] or dps["2"])
-        if t then out.temp_c = tonumber(string.format("%.1f", (t > 80) and (t / 10.0) or t)) end
-        if h then out.humidity = math.floor(h) end
-      end
-    end
-  end
-  return out
+  return hosts
 end
 
 -- =============================================================================
--- SMART DEVICE REGISTRY (/etc/config/doanduy_smarthome.json)
+-- MULTI-CONTROLLER & MULTI-PROTOCOL STORE (v2, auto-migrates v1 cleanly)
 -- =============================================================================
 
-local function seed_default_devices(cfg)
+local function build_default_registry(cfg, lan_hosts)
   local br = cfg.ac_brand or "lg2"
   local label = (ok_ac and ac_ir.get_brand_info(br).label) or "LG Inverter (Chuẩn mới LG2)"
-  return {
+  local ctrls = {
+    {
+      id = "s06_default",
+      kind = "tuya_ir",
+      name = "Cục Hồng Ngoại S06 Pro",
+      room = "Phòng ngủ",
+      ip = cfg.ip or "192.168.1.130",
+      mac = (cfg.mac or ""):lower(),
+      device_id = cfg.device_id or "a3fc144d9c06ae63b5bqj0",
+      control_type = tonumber(cfg.control_type) or 1,
+      is_default = true,
+    }
+  }
+  local esp_idx = 0
+  for ip, h in pairs(lan_hosts) do
+    local hn = (h.name or ""):lower()
+    if hn:find("esp32", 1, true) then
+      esp_idx = esp_idx + 1
+      ctrls[#ctrls + 1] = {
+        id = "esp32_" .. (h.mac:gsub(":", ""):sub(-6)),
+        kind = "esp32_voice",
+        name = "Mạch Giọng Nói ESP32-C3 #" .. tostring(esp_idx),
+        room = (esp_idx == 1) and "Phòng ngủ" or "Phòng khách",
+        ip = ip,
+        mac = h.mac,
+        port = 8995,
+      }
+    end
+  end
+  local devs = {
     {
       id = "ac_default_1",
+      driver = "tuya_ir_ac",
+      type = "ac",
+      controller_id = "s06_default",
       name = "Máy lạnh " .. trim(label:match("^([^%(]+)") or "LG Inverter"),
       room = "Phòng ngủ",
       category = "ac",
-      type = "ac",
       brand = br,
       brand_label = label,
       source = "builtin",
@@ -181,27 +222,97 @@ local function seed_default_devices(cfg)
       buttons = {},
     }
   }
+  return { version = 2, controllers = ctrls, devices = devs }
 end
 
-local function load_devices(cfg)
+local function load_registry(cfg, lan_hosts)
   local raw = read_file(DEVICES_FILE)
+  local kv = load_key_vault()
   if raw and raw ~= "" then
     local ok, dec = pcall(cjson.decode, raw)
     if ok and type(dec) == "table" and type(dec.devices) == "table" then
-      return dec.devices
+      local changed = false
+      if type(dec.controllers) ~= "table" or #dec.controllers == 0 then
+        local def = build_default_registry(cfg, lan_hosts)
+        dec.controllers = def.controllers
+        dec.version = 2
+        changed = true
+      end
+      -- Auto-discover any new ESP32 voice pucks not yet registered
+      local known_macs = {}
+      for _, c in ipairs(dec.controllers) do
+        if c.mac and c.mac ~= "" then known_macs[c.mac:lower()] = true end
+      end
+      for ip, h in pairs(lan_hosts) do
+        local hn = (h.name or ""):lower()
+        if hn:find("esp32", 1, true) and h.mac ~= "" and not known_macs[h.mac:lower()] then
+          known_macs[h.mac:lower()] = true
+          dec.controllers[#dec.controllers + 1] = {
+            id = "esp32_" .. (h.mac:gsub(":", ""):sub(-6)),
+            kind = "esp32_voice",
+            name = "Mạch Giọng Nói (" .. h.name .. ")",
+            room = "Phòng khách",
+            ip = ip,
+            mac = h.mac,
+          }
+          changed = true
+        end
+      end
+      for _, d in ipairs(dec.devices) do
+        d.name = trim(d.name)
+        if not d.driver then
+          d.driver = (d.type == "ac") and "tuya_ir_ac" or "tuya_ir_remote"
+          changed = true
+        end
+        if (d.driver == "tuya_ir_ac" or d.driver == "tuya_ir_remote" or d.driver == "custom_ir") and not d.controller_id then
+          d.controller_id = "s06_default"
+          changed = true
+        end
+        if d.local_key and d.local_key ~= "" then
+          set_entity_key(d.id, d.local_key)
+          d.local_key = nil
+          changed = true
+        end
+      end
+      if changed then write_atomic(DEVICES_FILE, cjson.encode(dec), "600") end
+      return dec
     end
   end
-  local seeded = seed_default_devices(cfg)
-  write_atomic(DEVICES_FILE, cjson.encode({ version = 1, devices = seeded }), "600")
+  local seeded = build_default_registry(cfg, lan_hosts)
+  if #(cfg.local_key or "") == 16 and not kv["s06_default"] then
+    set_entity_key("s06_default", cfg.local_key)
+  end
+  write_atomic(DEVICES_FILE, cjson.encode(seeded), "600")
   return seeded
 end
 
-local function save_devices(devs)
-  write_atomic(DEVICES_FILE, cjson.encode({ version = 1, devices = devs }), "600")
+local function save_registry(reg)
+  write_atomic(DEVICES_FILE, cjson.encode({ version = 2, controllers = reg.controllers or {}, devices = reg.devices or {} }), "600")
+end
+
+local function find_controller(reg, cid)
+  for _, c in ipairs(reg.controllers or {}) do
+    if c.id == cid then return c end
+  end
+  return (reg.controllers or {})[1]
+end
+
+local function heal_controller_ip(ctrl, lan_hosts, cfg)
+  local tgt_mac = trim(ctrl.mac or ""):lower()
+  if tgt_mac ~= "" then
+    for ip, h in pairs(lan_hosts) do
+      if (h.mac or ""):lower() == tgt_mac then
+        ctrl.ip = ip
+        break
+      end
+    end
+  end
+  local lkey = get_entity_key(ctrl.id, cfg)
+  return ctrl.ip, ctrl.device_id, lkey, tonumber(ctrl.control_type) or 1
 end
 
 -- =============================================================================
--- BUILTIN CATALOG (11 AC Brands + Popular TVs, Fans, Audio, Custom IR)
+-- BUILTIN CATALOG (11 AC Brands + TV, Fan, Audio, Custom IR)
 -- =============================================================================
 
 local function build_catalog()
@@ -213,6 +324,7 @@ local function build_catalog()
           id = "ac_" .. b.id,
           source = "builtin",
           category = "ac",
+          driver = "tuya_ir_ac",
           type = "ac",
           brand = b.id,
           name = "Máy lạnh " .. b.label,
@@ -358,7 +470,7 @@ local function build_catalog()
       id = "custom_ir", category = "other", brand = "Tự định nghĩa", name = "Thiết Bị Hồng Ngoại Bất Kỳ (Đèn / Rèm / Đầu Thu / Lọc Khí)",
       subtitle = "Tạo thẻ điều khiển riêng & học phím 1 chạm từ remote thật qua S06 Pro",
       search = "khac thiet bi den rem may loc khong khi dau thu custom",
-      type = "custom_ir",
+      driver = "custom_ir", type = "custom_ir",
       buttons = {
         { id="power", label="Bật / Tắt" },
         { id="mode", label="Chế độ" },
@@ -371,6 +483,7 @@ local function build_catalog()
   for _, item in ipairs(ir_presets) do
     item.source = "builtin"
     item.type = item.type or "ir_remote"
+    item.driver = item.driver or "tuya_ir_remote"
     cat[#cat + 1] = item
   end
   return cat
@@ -381,14 +494,13 @@ local BUILTIN_BY_ID = {}
 for _, it in ipairs(BUILTIN_CATALOG) do BUILTIN_BY_ID[it.id] = it end
 
 -- =============================================================================
--- ONLINE PROBONOPD/IRDB CATALOG (3,200+ IR REMOTES, PARSED ON DEMAND)
+-- ONLINE PROBONOPD/IRDB CATALOG
 -- =============================================================================
 
 local function ensure_irdb_index()
   local raw = read_file(IRDB_CACHE)
   if raw and #raw > 1000 then return raw end
-  local cmd = "curl -4 -sSL --connect-timeout 3 -m 6 'https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/index' 2>/dev/null"
-  local p = io.popen(cmd)
+  local p = io.popen("curl -4 -sSL --connect-timeout 3 -m 6 'https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/index' 2>/dev/null")
   if not p then return nil end
   raw = p:read("*a") or ""
   p:close()
@@ -443,8 +555,7 @@ local function fetch_irdb_csv_buttons(irdb_path)
   for _, pat in ipairs(prio_pats) do
     for idx, b in ipairs(all) do
       if not used[idx] and b.label:lower():find(pat) then
-        used[idx] = true
-        chosen[#chosen + 1] = b
+        used[idx] = true; chosen[#chosen + 1] = b
         if #chosen >= 24 then break end
       end
     end
@@ -452,9 +563,7 @@ local function fetch_irdb_csv_buttons(irdb_path)
   end
   for idx, b in ipairs(all) do
     if #chosen >= 24 then break end
-    if not used[idx] then
-      chosen[#chosen + 1] = b
-    end
+    if not used[idx] then chosen[#chosen + 1] = b end
   end
   for idx, b in ipairs(chosen) do
     local ll = b.label:lower()
@@ -477,10 +586,10 @@ local function infer_irdb_category(cat_str)
 end
 
 -- =============================================================================
--- SYNC WITH VOICE HUB (127.0.0.1:8996)
+-- VOICE HUB SYNC & PUBLIC VIEW SANITIZER (Zero-Leak)
 -- =============================================================================
 
-local function sync_cfg_to_hub(patch)
+local function sync_primary_cfg(patch)
   local cfg = load_s06_cfg()
   for k, v in pairs(patch) do cfg[k] = v end
   write_atomic(S06_CFG_FILE, cjson.encode(cfg), "600")
@@ -489,8 +598,67 @@ local function sync_cfg_to_hub(patch)
   end
 end
 
+local function read_lan_tvs()
+  local tvs = {}
+  local raw = read_file(HUB_DEV_FILE)
+  if raw and raw ~= "" then
+    local ok, dec = pcall(cjson.decode, raw)
+    if ok and type(dec) == "table" then
+      for _, tv in ipairs(dec) do
+        tvs[#tvs + 1] = { id = tv.id, name = tv.name, brand = tv.brand, ip = tv.ip }
+      end
+    end
+  end
+  return tvs
+end
+
+local function build_public_controllers(reg, cfg, lan_hosts, probe_primary)
+  local kv = load_key_vault()
+  local hub_st = probe_primary and http_get_json(HUB_HTTP .. "/s06/status?probe=1", 2) or nil
+  local out = {}
+  for _, c in ipairs(reg.controllers or {}) do
+    local ip = c.ip or ""
+    local mac = (c.mac or ""):lower()
+    local h_entry = (ip ~= "" and lan_hosts[ip]) or nil
+    if not h_entry and mac ~= "" then
+      for hip, h in pairs(lan_hosts) do
+        if (h.mac or ""):lower() == mac then ip = hip; h_entry = h; break end
+      end
+    end
+    local has_key = (kv[c.id] and #kv[c.id] == 16) or (c.id == "s06_default" and #(cfg.local_key or "") == 16)
+    local item = {
+      id = c.id,
+      kind = c.kind or "tuya_ir",
+      name = c.name or c.id,
+      room = c.room or "Phòng khách",
+      ip = ip,
+      mac = mac,
+      device_id = c.device_id or "",
+      control_type = tonumber(c.control_type) or 1,
+      has_key = has_key and true or false,
+      online = (h_entry and h_entry.online) and true or false,
+      live_ok = (h_entry and h_entry.online) and true or false,
+      is_default = c.is_default and true or false,
+    }
+    if c.id == "s06_default" and type(hub_st) == "table" and hub_st.ip then
+      item.ip = hub_st.ip
+      item.live_ok = hub_st.live_ok and true or false
+      item.online = item.live_ok or item.online
+      item.ac_brand = hub_st.ac_brand
+      if type(hub_st.dps) == "table" then
+        local t = tonumber(hub_st.dps["101"] or hub_st.dps["1"])
+        local hum = tonumber(hub_st.dps["102"] or hub_st.dps["2"])
+        if t then item.temp_c = tonumber(string.format("%.1f", (t > 80) and (t / 10.0) or t)) end
+        if hum then item.humidity = math.floor(hum) end
+      end
+    end
+    out[#out + 1] = item
+  end
+  return out, (type(hub_st) == "table")
+end
+
 -- =============================================================================
--- RPCD HANDLERS
+-- RPCD DISPATCH
 -- =============================================================================
 
 local function read_stdin_json()
@@ -510,9 +678,11 @@ if cmd == "list" then
     status = {},
     scanHubs = {},
     saveHubConfig = { ip = "string", mac = "string", device_id = "string", local_key = "string", control_type = 0 },
+    saveController = { id = "string", kind = "string", name = "string", room = "string", ip = "string", mac = "string", device_id = "string", local_key = "string", control_type = 0 },
+    removeController = { id = "string" },
     searchCatalog = { query = "string", category = "string", include_online = true },
-    testCatalogItem = { catalog_id = "string", irdb_path = "string", dry_run = true },
-    addDevice = { catalog_id = "string", irdb_path = "string", name = "string", room = "string" },
+    testCatalogItem = { catalog_id = "string", irdb_path = "string", controller_id = "string", dry_run = true },
+    addDevice = { driver = "string", catalog_id = "string", irdb_path = "string", controller_id = "string", name = "string", room = "string", category = "string", ip = "string", mac = "string", device_id = "string", local_key = "string", dp = "string", on_url = "string", off_url = "string", tv_id = "string" },
     removeDevice = { id = "string" },
     controlDevice = { id = "string", op = "string", value = "string", button = "string", dry_run = true },
     learnButton = { id = "string", button = "string", label = "string" },
@@ -524,56 +694,57 @@ if cmd == "call" then
   local method = arg[2]
   local params = read_stdin_json()
   local cfg = load_s06_cfg()
-  local devs = load_devices(cfg)
+  local lan_hosts = read_lan_hosts()
+  local reg = load_registry(cfg, lan_hosts)
 
   if method == "status" then
-    local hub = get_live_hub_info(cfg, true)
-    local tvs = {}
-    local raw_tvs = read_file(HUB_DEV_FILE)
-    if raw_tvs and raw_tvs ~= "" then
-      local ok, tlist = pcall(cjson.decode, raw_tvs)
-      if ok and type(tlist) == "table" then
-        for _, tv in ipairs(tlist) do
-          tvs[#tvs + 1] = { id = tv.id, name = tv.name, brand = tv.brand, ip = tv.ip }
-        end
-      end
+    local ctrls, voice_ok = build_public_controllers(reg, cfg, lan_hosts, true)
+    local primary = ctrls[1] or {}
+    local rooms_seen = {}
+    local rooms = {}
+    local function add_room(r)
+      r = trim(r)
+      if r ~= "" and not rooms_seen[r] then rooms_seen[r] = true; rooms[#rooms + 1] = r end
     end
-    out_json({ ok = true, hub = hub, devices = devs, lan_tvs = tvs })
+    for _, c in ipairs(ctrls) do add_room(c.room) end
+    for _, d in ipairs(reg.devices or {}) do add_room(d.room) end
+    out_json({
+      ok = true,
+      hub = primary,
+      controllers = ctrls,
+      devices = reg.devices or {},
+      lan_tvs = read_lan_tvs(),
+      rooms = rooms,
+      voice_hub_ok = voice_ok,
+    })
 
   elseif method == "scanHubs" then
-    local host_map = {}
-    local dl = read_file("/tmp/dhcp.leases") or ""
-    for line in dl:gmatch("[^\r\n]+") do
-      local _, mac, ip, hname = line:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)")
-      if ip and mac and ip:match("^192%.168%.%d+%.%d+$") and ip ~= "192.168.1.1" then
-        host_map[ip] = { ip = ip, mac = mac:lower(), name = (hname ~= "*") and hname or "" }
-      end
+    if cfg.ip and cfg.ip ~= "" and not lan_hosts[cfg.ip] then
+      lan_hosts[cfg.ip] = { ip = cfg.ip, mac = (cfg.mac or ""):lower(), name = "S06 Pro", online = true }
     end
-    local arp = read_file("/proc/net/arp") or ""
-    for line in arp:gmatch("[^\r\n]+") do
-      local ip, _, _, mac = line:match("^(192%.168%.%d+%.%d+)%s+%S+%s+%S+%s+([%x:]+)")
-      if ip and mac and mac ~= "00:00:00:00:00:00" and ip ~= "192.168.1.1" then
-        local cur = host_map[ip] or { ip = ip, name = "" }
-        cur.mac = mac:lower()
-        host_map[ip] = cur
-      end
-    end
-    if cfg.ip and cfg.ip ~= "" then
-      local cur = host_map[cfg.ip] or { ip = cfg.ip, mac = (cfg.mac or ""):lower(), name = "S06 Pro (Đã lưu)" }
-      host_map[cfg.ip] = cur
-    end
-    local candidates = {}
-    for ip, h in pairs(host_map) do
-      if tcp_open(ip, 6668, 220) then
-        candidates[#candidates + 1] = {
-          ip = ip,
-          mac = h.mac or "",
-          name = (h.name and h.name ~= "") and h.name or ("Tuya IR Hub (" .. ip .. ")"),
+    local tuya_devs, esp_nodes = {}, {}
+    for ip, h in pairs(lan_hosts) do
+      local hn = (h.name or ""):lower()
+      if hn:find("esp32", 1, true) then
+        esp_nodes[#esp_nodes + 1] = {
+          ip = ip, mac = h.mac or "", name = h.name, kind = "esp32_voice",
+          online = h.online and true or false,
+        }
+      elseif tcp_open(ip, 6668, 200) then
+        tuya_devs[#tuya_devs + 1] = {
+          ip = ip, mac = h.mac or "", kind = "tuya_ir",
+          name = (h.name and h.name ~= "") and h.name or ("Tuya LAN (" .. ip .. ")"),
           is_current = (ip == cfg.ip),
         }
       end
     end
-    out_json({ ok = true, hubs = candidates, current = get_live_hub_info(cfg, false) })
+    out_json({
+      ok = true,
+      hubs = tuya_devs,
+      tuya_devices = tuya_devs,
+      esp32_nodes = esp_nodes,
+      lan_tvs = read_lan_tvs(),
+    })
 
   elseif method == "saveHubConfig" then
     local ip = trim(params.ip)
@@ -586,16 +757,92 @@ if cmd == "call" then
     if mac:match("^[%x:]+$") then patch.mac = mac end
     if did ~= "" then patch.device_id = did end
     if lk ~= "" then
-      if #lk ~= 16 then
-        out_json({ ok = false, message = "Local Key Tuya phải đủ đúng 16 ký tự" })
-        return
-      end
+      if #lk ~= 16 then out_json({ ok = false, message = "Local Key Tuya phải đủ đúng 16 ký tự" }); return end
       patch.local_key = lk
+      set_entity_key("s06_default", lk)
     end
     if ct and (ct == 1 or ct == 2) then patch.control_type = ct end
-    sync_cfg_to_hub(patch)
-    local fresh = load_s06_cfg()
-    out_json({ ok = true, message = "Đã lưu cấu hình Hub S06 Pro (chmod 600)", hub = get_live_hub_info(fresh, true) })
+    sync_primary_cfg(patch)
+    local c0 = find_controller(reg, "s06_default")
+    if c0 then
+      if patch.ip then c0.ip = patch.ip end
+      if patch.mac then c0.mac = patch.mac end
+      if patch.device_id then c0.device_id = patch.device_id end
+      if patch.control_type then c0.control_type = patch.control_type end
+      save_registry(reg)
+    end
+    out_json({ ok = true, message = "Đã lưu cấu hình S06 Pro (chmod 600)" })
+
+  elseif method == "saveController" then
+    local cid = trim(params.id)
+    local kind = trim(params.kind)
+    if kind == "" then kind = "tuya_ir" end
+    local name = trim(params.name)
+    local room = trim(params.room)
+    local ip = trim(params.ip)
+    local mac = trim(params.mac):lower()
+    local did = trim(params.device_id)
+    local lk = trim(params.local_key)
+    local ct = tonumber(params.control_type) or 1
+    if lk ~= "" and #lk ~= 16 then
+      out_json({ ok = false, message = "Local Key Tuya phải đủ đúng 16 ký tự" })
+      return
+    end
+    if cid == "" then
+      cid = ((kind == "esp32_voice") and "esp32_" or "s06_") .. tostring(os.time()) .. "_" .. tostring(#(reg.controllers or {}) + 1)
+    end
+    local existing = nil
+    for _, c in ipairs(reg.controllers or {}) do if c.id == cid then existing = c; break end end
+    if existing then
+      if name ~= "" then existing.name = name end
+      if room ~= "" then existing.room = room end
+      if ip:match("^%d+%.%d+%.%d+%.%d+$") then existing.ip = ip end
+      if mac ~= "" then existing.mac = mac end
+      if did ~= "" then existing.device_id = did end
+      existing.control_type = ct
+    else
+      if not ip:match("^%d+%.%d+%.%d+%.%d+$") then
+        out_json({ ok = false, message = "Cần nhập địa chỉ IP LAN hợp lệ" })
+        return
+      end
+      reg.controllers[#reg.controllers + 1] = {
+        id = cid,
+        kind = kind,
+        name = (name ~= "") and name or ((kind == "esp32_voice") and "Mạch Giọng Nói ESP32" or "Cục Hồng Ngoại S06"),
+        room = (room ~= "") and room or "Phòng khách",
+        ip = ip,
+        mac = mac,
+        device_id = did,
+        control_type = ct,
+      }
+    end
+    if lk ~= "" then set_entity_key(cid, lk) end
+    if cid == "s06_default" then
+      local patch = {}
+      if ip:match("^%d+%.%d+%.%d+%.%d+$") then patch.ip = ip end
+      if mac ~= "" then patch.mac = mac end
+      if did ~= "" then patch.device_id = did end
+      if lk ~= "" then patch.local_key = lk end
+      patch.control_type = ct
+      sync_primary_cfg(patch)
+    end
+    save_registry(reg)
+    local ctrls = build_public_controllers(reg, load_s06_cfg(), lan_hosts, false)
+    out_json({ ok = true, message = "Đã lưu bộ điều khiển!", controllers = ctrls })
+
+  elseif method == "removeController" then
+    local cid = trim(params.id)
+    if cid == "s06_default" then
+      out_json({ ok = false, message = "Không thể xóa cục S06 Pro mặc định" })
+      return
+    end
+    local kept, removed = {}, false
+    for _, c in ipairs(reg.controllers or {}) do
+      if c.id == cid then removed = true else kept[#kept + 1] = c end
+    end
+    reg.controllers = kept
+    save_registry(reg)
+    out_json({ ok = removed, message = removed and "Đã xóa bộ điều khiển" or "Không tìm thấy" })
 
   elseif method == "searchCatalog" then
     local q = trim(params.query or ""):lower()
@@ -616,13 +863,9 @@ if cmd == "call" then
           end
           if match then
             results[#results + 1] = {
-              id = it.id,
-              source = "builtin",
-              category = it.category,
-              type = it.type,
-              brand = it.brand,
-              name = it.name,
-              subtitle = it.subtitle,
+              id = it.id, source = "builtin", category = it.category,
+              driver = it.driver, type = it.type, brand = it.brand,
+              name = it.name, subtitle = it.subtitle,
               button_count = it.buttons and #it.buttons or nil,
             }
           end
@@ -646,13 +889,9 @@ if cmd == "call" then
               local inferred = infer_irdb_category(b_cat)
               if cat_filter == "all" or cat_filter == "irdb" or inferred == cat_filter then
                 results[#results + 1] = {
-                  id = "irdb:" .. line,
-                  irdb_path = line,
-                  source = "irdb",
-                  category = inferred,
-                  type = "ir_remote",
-                  brand = b_brand,
-                  name = b_brand .. " — " .. b_cat:gsub("_", " "),
+                  id = "irdb:" .. line, irdb_path = line, source = "irdb",
+                  category = inferred, driver = "tuya_ir_remote", type = "ir_remote",
+                  brand = b_brand, name = b_brand .. " — " .. b_cat:gsub("_", " "),
                   subtitle = "Kho Online IRDB (" .. (b_model or "") .. ")",
                 }
                 online_cnt = online_cnt + 1
@@ -663,12 +902,13 @@ if cmd == "call" then
         end
       end
     end
-
     out_json({ ok = true, results = results, online_cached = (read_file(IRDB_CACHE) ~= nil) })
 
   elseif method == "testCatalogItem" then
     local cid = trim(params.catalog_id)
     local ipath = trim(params.irdb_path)
+    local ctrl_id = trim(params.controller_id)
+    if ctrl_id == "" then ctrl_id = "s06_default" end
     local dry = (params.dry_run == true)
     local pkt, label_tested
 
@@ -689,69 +929,122 @@ if cmd == "call" then
     elseif ipath ~= "" then
       local btns, err = fetch_irdb_csv_buttons(ipath)
       if not btns then
-        out_json({ ok = false, message = "Không tải được hoặc chưa hỗ trợ chuẩn IR của file này: " .. tostring(err) })
+        out_json({ ok = false, message = "Không tải được hoặc chưa hỗ trợ chuẩn IR file này: " .. tostring(err) })
         return
       end
-      local b = btns[1]
-      pkt = ac_ir.encode_generic(b.proto, b.dev, b.sub, b.fn)
-      label_tested = ipath .. " — " .. b.label
+      pkt = ac_ir.encode_generic(btns[1].proto, btns[1].dev, btns[1].sub, btns[1].fn)
+      label_tested = ipath .. " — " .. btns[1].label
     end
 
     if not pkt then
-      out_json({ ok = false, message = "Mẫu này dùng chế độ Học phím thủ công — hãy Thêm rồi bấm Học từng nút bằng remote thật!" })
+      out_json({ ok = false, message = "Mẫu này dùng Học phím — hãy Thêm rồi bấm Học từng nút bằng remote thật!" })
       return
     end
     if dry then
       out_json({ ok = true, dry_run = true, tested = label_tested, protocol = pkt.protocol, head_len = #pkt.head, key_len = #pkt.key })
       return
     end
-    if not ok_tuya or #(cfg.local_key or "") ~= 16 then
-      out_json({ ok = false, message = "S06 Pro chưa có Local Key 16 ký tự" })
+    local ctrl = find_controller(reg, ctrl_id)
+    if not ctrl then out_json({ ok = false, message = "Không tìm thấy cục phát S06" }); return end
+    local hip, hdid, hlkey, hct = heal_controller_ip(ctrl, lan_hosts, cfg)
+    if not ok_tuya or #hlkey ~= 16 then
+      out_json({ ok = false, message = "Cục phát [" .. ctrl.name .. "] chưa có Local Key 16 ký tự" })
       return
     end
-    heal_hub_ip(cfg)
-    local ok, err = tuya_v35.send_head_key(cfg.ip, cfg.device_id, cfg.local_key, pkt.head, pkt.key, cfg.control_type)
-    out_json({ ok = ok and true or false, message = ok and ("Đã bắn thử sóng [" .. label_tested .. "] (" .. pkt.protocol .. ") qua S06 Pro!") or ("Lỗi gửi: " .. tostring(err)) })
+    local ok, err = tuya_v35.send_head_key(hip, hdid, hlkey, pkt.head, pkt.key, hct)
+    out_json({ ok = ok and true or false, message = ok and ("Đã bắn thử [" .. label_tested .. "] qua " .. ctrl.name .. "!") or ("Lỗi gửi: " .. tostring(err)) })
 
   elseif method == "addDevice" then
+    local drv = trim(params.driver)
     local cid = trim(params.catalog_id)
     local ipath = trim(params.irdb_path)
+    local ctrl_id = trim(params.controller_id)
+    if ctrl_id == "" then ctrl_id = "s06_default" end
     local custom_name = trim(params.name)
     local room = trim(params.room)
     if room == "" then room = "Phòng khách" end
     local new_dev
 
-    if cid ~= "" and BUILTIN_BY_ID[cid] then
+    if drv == "tuya_switch" then
+      local ip = trim(params.ip)
+      local did = trim(params.device_id)
+      local lk = trim(params.local_key)
+      local dp = trim(params.dp)
+      if dp == "" then dp = "1" end
+      local cat = trim(params.category)
+      if cat == "" then cat = "light" end
+      if not ip:match("^%d+%.%d+%.%d+%.%d+$") or did == "" or #lk ~= 16 then
+        out_json({ ok = false, message = "Công tắc Tuya Wi-Fi cần IP LAN hợp lệ, Device ID và Local Key đúng 16 ký tự!" })
+        return
+      end
+      local uid = "tsw_" .. tostring(os.time()) .. "_" .. tostring(#(reg.devices or {}) + 1)
+      set_entity_key(uid, lk)
+      new_dev = {
+        id = uid, driver = "tuya_switch", type = "switch",
+        name = (custom_name ~= "") and custom_name or ("Công tắc Đèn/Quạt (" .. ip .. ")"),
+        room = room, category = cat, brand = "Tuya Wi-Fi",
+        ip = ip, mac = trim(params.mac):lower(), device_id = did, dp = dp,
+        has_key = true, state = { on = false }, buttons = {},
+      }
+    elseif drv == "http_relay" then
+      local on_url = trim(params.on_url)
+      local off_url = trim(params.off_url)
+      local cat = trim(params.category)
+      if cat == "" then cat = "light" end
+      if not is_lan_http_url(on_url) or (off_url ~= "" and not is_lan_http_url(off_url)) then
+        out_json({ ok = false, message = "URL Relay chỉ chấp nhận địa chỉ mạng LAN nội bộ (http://192.168.x.x/... hoặc 10.x/172.16.x)" })
+        return
+      end
+      local uid = "hrel_" .. tostring(os.time()) .. "_" .. tostring(#(reg.devices or {}) + 1)
+      new_dev = {
+        id = uid, driver = "http_relay", type = "switch",
+        name = (custom_name ~= "") and custom_name or "Công tắc HTTP Relay LAN",
+        room = room, category = cat, brand = "HTTP / Tasmota / ESP32",
+        on_url = on_url, off_url = (off_url ~= "") and off_url or on_url,
+        state = { on = false }, buttons = {},
+      }
+    elseif drv == "android_tv" then
+      local tv_id = trim(params.tv_id)
+      local tv_found = nil
+      for _, t in ipairs(read_lan_tvs()) do if t.id == tv_id then tv_found = t; break end end
+      if not tv_found then
+        out_json({ ok = false, message = "Không tìm thấy TV LAN id: " .. tv_id })
+        return
+      end
+      local uid = "atv_" .. tv_found.id
+      for _, d in ipairs(reg.devices or {}) do
+        if d.id == uid then out_json({ ok = false, message = tv_found.name .. " đã có sẵn trong danh sách!" }); return end
+      end
+      new_dev = {
+        id = uid, driver = "android_tv", type = "android_tv",
+        name = (custom_name ~= "") and custom_name or tv_found.name,
+        room = room, category = "tv", brand = tv_found.brand or "Android TV",
+        ip = tv_found.ip, tv_id = tv_found.id, buttons = {},
+      }
+    elseif cid ~= "" and BUILTIN_BY_ID[cid] then
       local it = BUILTIN_BY_ID[cid]
-      local did = cid .. "_" .. tostring(os.time()) .. "_" .. tostring(#devs + 1)
+      local did = cid .. "_" .. tostring(os.time()) .. "_" .. tostring(#(reg.devices or {}) + 1)
       if it.type == "ac" then
         new_dev = {
-          id = did,
+          id = did, driver = "tuya_ir_ac", type = "ac", controller_id = ctrl_id,
           name = (custom_name ~= "") and custom_name or it.name,
-          room = room,
-          category = "ac",
-          type = "ac",
-          brand = it.brand,
+          room = room, category = "ac", brand = it.brand,
           brand_label = ok_ac and ac_ir.get_brand_info(it.brand).label or it.brand,
           source = "builtin",
           state = { power = false, temp = 26, mode = "cool", fan = "auto", swing = false },
           buttons = {},
         }
-        sync_cfg_to_hub({ ac_brand = it.brand })
+        if ctrl_id == "s06_default" then sync_primary_cfg({ ac_brand = it.brand }) end
       else
         local btns = {}
         for _, b in ipairs(it.buttons or {}) do
           btns[#btns + 1] = { id = b.id, label = b.label, proto = b.proto, dev = b.dev, sub = b.sub, fn = b.fn }
         end
         new_dev = {
-          id = did,
+          id = did, driver = it.driver or "tuya_ir_remote", type = it.type, controller_id = ctrl_id,
           name = (custom_name ~= "") and custom_name or it.name,
-          room = room,
-          category = it.category,
-          type = it.type,
-          brand = it.brand,
-          source = "builtin",
-          buttons = btns,
+          room = room, category = it.category, brand = it.brand,
+          source = "builtin", buttons = btns,
         }
       end
     elseif ipath ~= "" then
@@ -761,35 +1054,32 @@ if cmd == "call" then
         return
       end
       local b_brand, b_cat = ipath:match("^([^/]+)/([^/]+)/")
-      local did = "irdb_" .. tostring(os.time()) .. "_" .. tostring(#devs + 1)
+      local did = "irdb_" .. tostring(os.time()) .. "_" .. tostring(#(reg.devices or {}) + 1)
       new_dev = {
-        id = did,
+        id = did, driver = "tuya_ir_remote", type = "ir_remote", controller_id = ctrl_id,
         name = (custom_name ~= "") and custom_name or ((b_brand or "IR") .. " " .. (b_cat or "Remote"):gsub("_", " ")),
-        room = room,
-        category = infer_irdb_category(b_cat),
-        type = "ir_remote",
-        brand = b_brand or "IRDB",
-        source = "irdb",
-        irdb_path = ipath,
-        buttons = btns,
+        room = room, category = infer_irdb_category(b_cat),
+        brand = b_brand or "IRDB", source = "irdb", irdb_path = ipath, buttons = btns,
       }
     else
-      out_json({ ok = false, message = "Thiếu catalog_id hoặc irdb_path" })
+      out_json({ ok = false, message = "Thiếu thông tin thiết bị cần thêm" })
       return
     end
 
-    devs[#devs + 1] = new_dev
-    save_devices(devs)
-    out_json({ ok = true, message = "Đã thêm thiết bị: " .. new_dev.name, device = new_dev, devices = devs })
+    reg.devices[#reg.devices + 1] = new_dev
+    save_registry(reg)
+    out_json({ ok = true, message = "Đã thêm: " .. new_dev.name, device = new_dev, devices = reg.devices })
 
   elseif method == "removeDevice" then
     local did = trim(params.id)
-    local kept = {}
-    local removed = false
-    for _, d in ipairs(devs) do
+    local kept, removed = {}, false
+    for _, d in ipairs(reg.devices or {}) do
       if d.id == did then removed = true else kept[#kept + 1] = d end
     end
-    save_devices(kept)
+    reg.devices = kept
+    save_registry(reg)
+    local kv = load_key_vault()
+    if kv[did] then kv[did] = nil; save_key_vault(kv) end
     out_json({ ok = removed, message = removed and "Đã xóa thiết bị" or "Không tìm thấy thiết bị", devices = kept })
 
   elseif method == "controlDevice" then
@@ -800,16 +1090,57 @@ if cmd == "call" then
     local dry = (params.dry_run == true)
 
     local target = nil
-    for _, d in ipairs(devs) do if d.id == did then target = d; break end end
+    for _, d in ipairs(reg.devices or {}) do if d.id == did then target = d; break end end
     if not target then out_json({ ok = false, message = "Không tìm thấy thiết bị" }); return end
+    local drv = target.driver or ((target.type == "ac") and "tuya_ir_ac" or "tuya_ir_remote")
 
-    if not dry and (not ok_tuya or #(cfg.local_key or "") ~= 16) then
-      out_json({ ok = false, message = "S06 Pro chưa có Local Key 16 ký tự" })
-      return
-    end
-    heal_hub_ip(cfg)
+    if drv == "tuya_switch" then
+      local st = target.state or { on = false }
+      local nxt = (op == "on") and true or ((op == "off") and false or (not st.on))
+      local dp = tostring(target.dp or "1")
+      local lkey = get_entity_key(target.id, cfg)
+      if not dry and (not ok_tuya or #lkey ~= 16) then
+        out_json({ ok = false, message = "Công tắc Tuya chưa đủ Local Key 16 ký tự" })
+        return
+      end
+      local ok, err = true, nil
+      if not dry then
+        ok, err = tuya_v35.set_dps(target.ip, target.device_id, lkey, { [dp] = nxt }, 3)
+      end
+      if ok then st.on = nxt; target.state = st; save_registry(reg) end
+      out_json({ ok = ok and true or false, dry_run = dry, device = target, message = ok and (target.name .. (nxt and " → ĐÃ BẬT" or " → ĐÃ TẮT")) or ("Lỗi Tuya Switch: " .. tostring(err)) })
 
-    if target.type == "ac" and ok_ac then
+    elseif drv == "http_relay" then
+      local st = target.state or { on = false }
+      local nxt = (op == "on") and true or ((op == "off") and false or (not st.on))
+      local u = nxt and target.on_url or (target.off_url or target.on_url)
+      if not is_lan_http_url(u) then out_json({ ok = false, message = "URL Relay LAN không hợp lệ" }); return end
+      if not dry then
+        os.execute(string.format("curl -4 -sS --connect-timeout 2 -m 3 %s >/dev/null 2>&1", sh_quote(u)))
+      end
+      st.on = nxt; target.state = st; save_registry(reg)
+      out_json({ ok = true, dry_run = dry, device = target, message = target.name .. (nxt and " → ĐÃ BẬT" or " → ĐÃ TẮT") })
+
+    elseif drv == "android_tv" then
+      local ok_call = false
+      if dry then
+        ok_call = true
+      elseif op == "cmd" and val ~= "" then
+        local r = http_get_json(HUB_HTTP .. "/command?text=" .. url_encode(val) .. "&device=" .. url_encode(target.tv_id or ""), 4)
+        ok_call = (type(r) == "table" and r.status == "ok")
+      elseif op == "key" and btn_id ~= "" then
+        local r = http_get_json(HUB_HTTP .. "/remote_key?key=" .. url_encode(btn_id) .. "&device=" .. url_encode(target.tv_id or ""), 4)
+        ok_call = (type(r) == "table" and r.status == "ok")
+      end
+      out_json({ ok = ok_call, dry_run = dry, device = target, message = ok_call and ("Đã gửi lệnh tới " .. target.name) or ("TV hoặc Voice Hub chưa phản hồi") })
+
+    elseif drv == "tuya_ir_ac" and ok_ac then
+      local ctrl = find_controller(reg, target.controller_id or "s06_default")
+      local hip, hdid, hlkey, hct = heal_controller_ip(ctrl or { id="s06_default", ip=cfg.ip, mac=cfg.mac, device_id=cfg.device_id, control_type=cfg.control_type }, lan_hosts, cfg)
+      if not dry and (not ok_tuya or #hlkey ~= 16) then
+        out_json({ ok = false, message = "Cục S06 chưa có Local Key 16 ký tự" })
+        return
+      end
       local st = target.state or { power = false, temp = 26, mode = "cool", fan = "auto", swing = false }
       local prev_pwr = st.power and true or false
       local enc_op = "set"
@@ -825,8 +1156,8 @@ if cmd == "call" then
         target.brand = ac_ir.next_variant(target.brand)
         target.brand_label = ac_ir.get_brand_info(target.brand).label
         target.state = st
-        save_devices(devs)
-        sync_cfg_to_hub({ ac_brand = target.brand })
+        save_registry(reg)
+        if (target.controller_id or "s06_default") == "s06_default" then sync_primary_cfg({ ac_brand = target.brand }) end
         out_json({ ok = true, message = "Đã đổi mã sang: " .. target.brand_label, device = target })
         return
       end
@@ -835,44 +1166,43 @@ if cmd == "call" then
       if not pkt then out_json({ ok = false, message = "Lỗi mã hóa AC brand: " .. tostring(target.brand) }); return end
       local ok, err = true, nil
       if not dry then
-        ok, err = tuya_v35.send_head_key(cfg.ip, cfg.device_id, cfg.local_key, pkt.head, pkt.key, cfg.control_type)
+        ok, err = tuya_v35.send_head_key(hip, hdid, hlkey, pkt.head, pkt.key, hct)
       end
       if ok then
         target.state = st
-        save_devices(devs)
-        sync_cfg_to_hub({ ac_brand = target.brand, ac_temp = st.temp, ac_mode = st.mode, ac_fan = st.fan, ac_power = st.power, ac_swing = st.swing })
+        save_registry(reg)
+        if (target.controller_id or "s06_default") == "s06_default" then
+          sync_primary_cfg({ ac_brand = target.brand, ac_temp = st.temp, ac_mode = st.mode, ac_fan = st.fan, ac_power = st.power, ac_swing = st.swing })
+        end
       end
       out_json({
-        ok = ok and true or false,
-        dry_run = dry,
-        protocol = pkt.protocol,
-        head_len = #pkt.head,
-        key_len = #pkt.key,
-        message = ok and ("Đã gửi lệnh " .. target.name .. " (" .. tostring(st.temp) .. "°C • " .. tostring(st.mode) .. ")") or ("Lỗi S06: " .. tostring(err)),
+        ok = ok and true or false, dry_run = dry, protocol = pkt.protocol, head_len = #pkt.head, key_len = #pkt.key,
+        message = ok and ("Đã gửi " .. target.name .. " (" .. tostring(st.temp) .. "°C • " .. tostring(st.mode) .. ")") or ("Lỗi S06: " .. tostring(err)),
         device = target,
       })
+
     else
-      local b_found = nil
-      for _, b in ipairs(target.buttons or {}) do
-        if b.id == btn_id then b_found = b; break end
+      local ctrl = find_controller(reg, target.controller_id or "s06_default")
+      local hip, hdid, hlkey, hct = heal_controller_ip(ctrl or { id="s06_default", ip=cfg.ip, mac=cfg.mac, device_id=cfg.device_id, control_type=cfg.control_type }, lan_hosts, cfg)
+      if not dry and (not ok_tuya or #hlkey ~= 16) then
+        out_json({ ok = false, message = "Cục S06 chưa có Local Key 16 ký tự" })
+        return
       end
+      local b_found = nil
+      for _, b in ipairs(target.buttons or {}) do if b.id == btn_id then b_found = b; break end end
       if not b_found then out_json({ ok = false, message = "Không tìm thấy nút: " .. btn_id }); return end
       if b_found.base64 and b_found.base64 ~= "" then
         local ok, err = true, nil
-        if not dry then
-          ok, err = tuya_v35.send_ir(cfg.ip, cfg.device_id, cfg.local_key, b_found.base64, cfg.control_type)
-        end
-        out_json({ ok = ok and true or false, dry_run = dry, mode = "learned", message = ok and ("Đã bấm nút [" .. b_found.label .. "] (Mã đã học)") or ("Lỗi S06: " .. tostring(err)) })
+        if not dry then ok, err = tuya_v35.send_ir(hip, hdid, hlkey, b_found.base64, hct) end
+        out_json({ ok = ok and true or false, dry_run = dry, mode = "learned", message = ok and ("Đã bấm [" .. b_found.label .. "] (Mã đã học)") or ("Lỗi S06: " .. tostring(err)) })
       elseif b_found.proto and ok_ac and ac_ir.supports_generic(b_found.proto) then
         local pkt = ac_ir.encode_generic(b_found.proto, b_found.dev, b_found.sub, b_found.fn)
         if not pkt then out_json({ ok = false, message = "Lỗi encode " .. tostring(b_found.proto) }); return end
         local ok, err = true, nil
-        if not dry then
-          ok, err = tuya_v35.send_head_key(cfg.ip, cfg.device_id, cfg.local_key, pkt.head, pkt.key, cfg.control_type)
-        end
-        out_json({ ok = ok and true or false, dry_run = dry, mode = pkt.protocol, head_len = #pkt.head, key_len = #pkt.key, message = ok and ("Đã bấm nút [" .. b_found.label .. "] (" .. pkt.protocol .. ")") or ("Lỗi S06: " .. tostring(err)) })
+        if not dry then ok, err = tuya_v35.send_head_key(hip, hdid, hlkey, pkt.head, pkt.key, hct) end
+        out_json({ ok = ok and true or false, dry_run = dry, mode = pkt.protocol, head_len = #pkt.head, key_len = #pkt.key, message = ok and ("Đã bấm [" .. b_found.label .. "] (" .. pkt.protocol .. ")") or ("Lỗi S06: " .. tostring(err)) })
       else
-        out_json({ ok = false, need_learn = true, message = "Nút [" .. b_found.label .. "] chưa có mã IR — hãy bật Chế độ Học Phím rồi bấm vào nút này!" })
+        out_json({ ok = false, need_learn = true, message = "Nút [" .. b_found.label .. "] chưa có mã IR — bật Chế độ Học Phím rồi bấm nút này!" })
       end
     end
 
@@ -880,20 +1210,19 @@ if cmd == "call" then
     local did = trim(params.id)
     local btn_id = trim(params.button)
     local btn_label = trim(params.label)
-    if not ok_tuya or #(cfg.local_key or "") ~= 16 then
-      out_json({ ok = false, message = "S06 Pro chưa có Local Key 16 ký tự" })
+    local target = nil
+    for _, d in ipairs(reg.devices or {}) do if d.id == did then target = d; break end end
+    if not target then out_json({ ok = false, message = "Không tìm thấy thiết bị" }); return end
+    local ctrl = find_controller(reg, target.controller_id or "s06_default")
+    local hip, hdid, hlkey, hct = heal_controller_ip(ctrl or { id="s06_default", ip=cfg.ip, mac=cfg.mac, device_id=cfg.device_id, control_type=cfg.control_type }, lan_hosts, cfg)
+    if not ok_tuya or #hlkey ~= 16 then
+      out_json({ ok = false, message = "Cục S06 chưa có Local Key 16 ký tự" })
       return
     end
-    local target = nil
-    for _, d in ipairs(devs) do if d.id == did then target = d; break end end
-    if not target then out_json({ ok = false, message = "Không tìm thấy thiết bị" }); return end
-    if btn_id == "" then
-      btn_id = "custom_" .. tostring(os.time())
-    end
-    heal_hub_ip(cfg)
-    local code, ct_or_err = tuya_v35.learn_ir(cfg.ip, cfg.device_id, cfg.local_key, 12, cfg.control_type)
+    if btn_id == "" then btn_id = "custom_" .. tostring(os.time()) end
+    local code = tuya_v35.learn_ir(hip, hdid, hlkey, 12, hct)
     if not code then
-      out_json({ ok = false, message = "Hết 12s chưa nhận được tín hiệu remote (" .. tostring(ct_or_err) .. "). Hãy chĩa sát remote vào S06 Pro và thử lại." })
+      out_json({ ok = false, message = "Hết 12s chưa nhận tín hiệu remote. Hãy chĩa sát vào S06 Pro và thử lại." })
       return
     end
     target.buttons = target.buttons or {}
@@ -908,8 +1237,7 @@ if cmd == "call" then
     if not updated then
       target.buttons[#target.buttons + 1] = { id = btn_id, label = (btn_label ~= "") and btn_label or btn_id, base64 = code }
     end
-    save_devices(devs)
-
+    save_registry(reg)
     if target.category == "fan" then
       local voice_map = { power = "fan_power", speed_up = "fan_speed_up", speed_down = "fan_speed_down", swing = "fan_swing", timer = "fan_timer" }
       local vk = voice_map[btn_id]

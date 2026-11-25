@@ -554,6 +554,16 @@ local function build_control_json(dps_tbl)
   return string.format('{"protocol":5,"t":%d,"data":{"dps":{%s}}}', os.time(), concat(parts, ","))
 end
 
+function M.set_dps(ip, dev_id, local_key, dps_tbl, timeout_s)
+  if type(dps_tbl) ~= "table" then return false, "invalid_dps" end
+  local ctx, err = M.connect(ip, dev_id, local_key, timeout_s or 3)
+  if not ctx then return false, err end
+  send_cmd(ctx, M.CMD_CONTROL_NEW, build_control_json(dps_tbl))
+  local dps, derr = recv_dps(ctx, 1)
+  ctx.sock:close()
+  return true, dps or derr
+end
+
 function M.detect_control_type(ip, dev_id, local_key)
   local ctx, err = M.connect(ip, dev_id, local_key, 3)
   if not ctx then return 0, err end
