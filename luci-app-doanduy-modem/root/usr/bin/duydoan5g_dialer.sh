@@ -1020,14 +1020,15 @@ apply_carrier_ipv6_route_mtu() {
         esac
     fi
 
+    if [ -z "$gw6" ]; then
+        gw6=$(ip -6 route show dev "$IFNAME" 2>/dev/null | awk '/via /{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' | head -n 1)
+        [ -n "$gw6" ] || return 0
+        ip -6 route show dev "$IFNAME" 2>/dev/null | grep -q '^default .* proto static' && return 0
+    fi
+
     cur_rt=$(ip -6 route show dev "$IFNAME" default 2>/dev/null | head -n 1)
     if [ -z "$cur_rt" ] || ! printf '%s' "$cur_rt" | grep -q "mtu ${v6_mtu}"; then
-        if [ -n "$gw6" ]; then
-            ip -6 route replace default via "$gw6" dev "$IFNAME" metric "$metric" mtu "$v6_mtu" 2>/dev/null || \
-                ip -6 route replace default dev "$IFNAME" metric "$metric" mtu "$v6_mtu" 2>/dev/null || true
-        else
-            ip -6 route replace default dev "$IFNAME" metric "$metric" mtu "$v6_mtu" 2>/dev/null || true
-        fi
+        ip -6 route replace default via "$gw6" dev "$IFNAME" metric "$metric" mtu "$v6_mtu" 2>/dev/null || true
     fi
 }
 
@@ -1338,7 +1339,6 @@ run_fm350_usb_dial() {
     local cid="$MODEM_PDP_IDX" active_cid="$MODEM_PDP_IDX" cgp v4 v6 gw4 gtdns_out dns4 dns6 dns_all sig last_sig=""
     logger -t duydoan5g "Starting FM350 USB static IP dialer on $IFNAME (pdp=$cid, APN=$apn)"
     while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
-        at_dial_activate
         detach_bridge_master
         ip link set dev "$IFNAME" arp off 2>/dev/null || true
         ip link set dev "$IFNAME" mtu "$mtu" 2>/dev/null || true
@@ -1350,6 +1350,7 @@ run_fm350_usb_dial() {
                 ;;
         esac
         ip link set dev "$IFNAME" up 2>/dev/null || true
+        at_dial_activate
         v4=""; v6=""; active_cid="$cid"
         local t=0
         while [ "$t" -lt 4 ] && [ "$STOP_REQ" = "0" ]; do
