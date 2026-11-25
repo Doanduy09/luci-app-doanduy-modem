@@ -127,5 +127,5 @@ jobs:
             echo "Creating new release $TAG_NAME..."
             gh release create "$TAG_NAME" "$IPK_FILE" \
               --title "LuCI App DoanDuy Modem v${PKG_VER}" \
-              --notes "Release v${PKG_VER}: WWAN Data-Path Turbo (RPS/XPS/IRQ pinning/GRO/txqueuelen/WWAN power guard), 5G High-BDP Sysctl, RX-bytes traffic-aware Watchdog & SIMCom vendor fix, Dual-Stack IPv4 TTL + IPv6 HopLimit, Multi-Vendor Band Lock (Fibocom AT+GTACT, Quectel SA+NSA, Sierra), and Fibocom Thermal + CA Telemetry."
+              --notes "Release v${PKG_VER}: Manual Band Picker Checkbox + RAT Selector (5G+4G / 5G SA / 4G LTE / Auto) via AT+GTACT & AT+QNWPREFCFG, Live Serving Cell Info Card, plus v2.1.0 WWAN Data-Path Turbo & Dual-Stack TTL/HopLimit."
           fi

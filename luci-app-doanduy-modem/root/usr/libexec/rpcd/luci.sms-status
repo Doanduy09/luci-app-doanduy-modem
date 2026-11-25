@@ -143,7 +143,7 @@ send_at_direct() {
 
 case "$1" in
     list)
-        echo '{"getSMSInfo":{},"sendSMS":{"target":"string","msg":"string"},"sendAT":{"cmd":"string","port":"string"},"setCustomSchedule":{"datetime":"string"},"getAvailablePorts":{},"setCustomAtPort":{"port":"string"},"fetchSMSNow":{},"deleteSingleSMS":{"indices":"string","storage":"string"},"deleteAllSMS":{},"checkDataBalance":{},"setBandLock":{"mode":"string"},"getCellInfo":{},"setCellLock":{"action":"string"},"setCardMode":{"mode":"string","iface_name":"string"},"renameInterface":{"new_name":"string"}}'
+        echo '{"getSMSInfo":{},"sendSMS":{"target":"string","msg":"string"},"sendAT":{"cmd":"string","port":"string"},"setCustomSchedule":{"datetime":"string"},"getAvailablePorts":{},"setCustomAtPort":{"port":"string"},"fetchSMSNow":{},"deleteSingleSMS":{"indices":"string","storage":"string"},"deleteAllSMS":{},"checkDataBalance":{},"setBandLock":{"mode":"string"},"getBandState":{},"setCustomBands":{"rat":"string","lte_bands":"string","nr_bands":"string"},"getCellInfo":{},"setCellLock":{"action":"string"},"setCardMode":{"mode":"string","iface_name":"string"},"renameInterface":{"new_name":"string"}}'
         ;;
     call)
         read -r -t 1 input 2>/dev/null || [ -n "$input" ] || input=""
@@ -602,6 +602,198 @@ EOF
                     fi
                 fi
                 printf '{"success":true,"message":"%s","mode":"%s"}\n' "$msg" "$save_mode"
+                ;;
+            getBandState)
+                port=$(get_active_modem_port)
+                saved_mode=$(cat /etc/config/band_lock_mode 2>/dev/null || echo "auto")
+                if is_sierra_modem; then
+                    vendor="sierra"
+                elif is_fibocom_modem; then
+                    vendor="fibocom"
+                else
+                    vendor="quectel"
+                fi
+                if [ ! -c "$port" ]; then
+                    printf '{"success":false,"vendor":"%s","message":"Không tìm thấy cổng AT Modem!"}\n' "$vendor"
+                    exit 0
+                fi
+
+                rat="auto"; lte_bands=""; nr_bands=""; supports_custom="true"
+                if [ "$vendor" = "fibocom" ]; then
+                    gt_out=$(send_at_direct "$port" "AT+GTACT?" | tr -d '\r')
+                    gt_line=$(printf '%s\n' "$gt_out" | grep '+GTACT:' | head -n 1 | sed 's/.*+GTACT:[[:space:]]*//')
+                    if [ -z "$gt_line" ]; then
+                        printf '{"success":false,"vendor":"fibocom","message":"Modem Fibocom không phản hồi AT+GTACT? trên %s!"}\n' "$port"
+                        exit 0
+                    fi
+                    rat_num=$(printf '%s' "$gt_line" | cut -d',' -f1 | tr -cd '0-9')
+                    case "$rat_num" in
+                        17) rat="lte_nr" ;;
+                        14) rat="nr_only" ;;
+                        2)  rat="lte_only" ;;
+                        *)  rat="auto" ;;
+                    esac
+                    lte_bands=$(printf '%s' "$gt_line" | awk -F',' '{for(i=4;i<=NF;i++){gsub(/[^0-9]/,"",$i); if($i!=""){v=$i+0; if(v>=100 && v<500) print v-100}}}' | sort -nu | tr '\n' ',' | sed 's/,$//')
+                    nr_bands=$(printf '%s' "$gt_line" | awk -F',' '{for(i=4;i<=NF;i++){gsub(/[^0-9]/,"",$i); if($i!=""){v=$i+0; if(v>=5000 && v<6000) print v-5000; else if(v>=500 && v<1000) print v-500}}}' | sort -nu | tr '\n' ',' | sed 's/,$//')
+                elif [ "$vendor" = "sierra" ]; then
+                    supports_custom="false"
+                    sr_out=$(send_at_direct "$port" "AT!SELRAT?" | tr -d '\r')
+                    if printf '%s' "$sr_out" | grep -qiE '0F|LTE and NR5G'; then
+                        rat="lte_nr"
+                    elif printf '%s' "$sr_out" | grep -qiE '04|06|LTE Only'; then
+                        rat="lte_only"
+                    elif printf '%s' "$sr_out" | grep -qiE '11|NR5G Only'; then
+                        rat="nr_only"
+                    else
+                        rat="auto"
+                    fi
+                else
+                    mp_out=$(send_at_direct "$port" 'AT+QNWPREFCFG="mode_pref"' | tr -d '\r')
+                    mp_line=$(printf '%s\n' "$mp_out" | grep -i '"mode_pref"' | head -n 1)
+                    if printf '%s' "$mp_line" | grep -q 'LTE' && printf '%s' "$mp_line" | grep -q 'NR5G'; then
+                        rat="lte_nr"
+                    elif printf '%s' "$mp_line" | grep -q 'NR5G'; then
+                        rat="nr_only"
+                    elif printf '%s' "$mp_line" | grep -q 'LTE'; then
+                        rat="lte_only"
+                    else
+                        rat="auto"
+                    fi
+                    lb_out=$(send_at_direct "$port" 'AT+QNWPREFCFG="lte_band"' | tr -d '\r')
+                    lte_bands=$(printf '%s\n' "$lb_out" | grep -i '"lte_band"' | head -n 1 | cut -d',' -f2- | tr ':,' '\n' | tr -cd '0-9\n' | grep -E '^[0-9]+$' | sort -nu | tr '\n' ',' | sed 's/,$//')
+                    nb_out=$(send_at_direct "$port" 'AT+QNWPREFCFG="nr5g_band"' | tr -d '\r')
+                    nr_raw=$(printf '%s\n' "$nb_out" | grep -i '"nr5g_band"' | head -n 1 | cut -d',' -f2-)
+                    if ! printf '%s' "$nr_raw" | grep -qE '[0-9]'; then
+                        nb_out=$(send_at_direct "$port" 'AT+QNWPREFCFG="nsa_nr5g_band"' | tr -d '\r')
+                        nr_raw=$(printf '%s\n' "$nb_out" | grep -i '"nsa_nr5g_band"' | head -n 1 | cut -d',' -f2-)
+                    fi
+                    nr_bands=$(printf '%s' "$nr_raw" | tr ':,' '\n' | tr -cd '0-9\n' | grep -E '^[0-9]+$' | sort -nu | tr '\n' ',' | sed 's/,$//')
+                fi
+                printf '{"success":true,"vendor":"%s","rat":"%s","lte_bands":"%s","nr_bands":"%s","saved_mode":"%s","supports_custom":%s}\n' \
+                    "$vendor" "$rat" "$lte_bands" "$nr_bands" "$saved_mode" "$supports_custom"
+                ;;
+            setCustomBands)
+                rat=$(printf '%s' "$input" | jsonfilter -e '$.rat' 2>/dev/null | tr -cd 'a-z_')
+                lte_in=$(printf '%s' "$input" | jsonfilter -e '$.lte_bands' 2>/dev/null)
+                nr_in=$(printf '%s' "$input" | jsonfilter -e '$.nr_bands' 2>/dev/null)
+                case "$rat" in
+                    auto|lte_nr|nr_only|lte_only) ;;
+                    *) rat="lte_nr" ;;
+                esac
+                lte_bands=$(printf '%s' "$lte_in" | tr ',:' '\n' | tr -cd '0-9\n' | awk '$1>=1 && $1<=256 {print $1+0}' | sort -nu | tr '\n' ',' | sed 's/,$//')
+                nr_bands=$(printf '%s' "$nr_in" | tr ',:' '\n' | tr -cd '0-9\n' | awk '$1>=1 && $1<=256 {print $1+0}' | sort -nu | tr '\n' ',' | sed 's/,$//')
+
+                port=$(get_active_modem_port)
+                if [ ! -c "$port" ]; then
+                    echo '{"success":false,"message":"Không tìm thấy cổng AT Modem!"}'
+                    exit 0
+                fi
+
+                if is_sierra_modem; then
+                    send_at_direct "$port" 'AT!ENTERCND="A710"' >/dev/null 2>&1
+                    case "$rat" in
+                        lte_nr)
+                            send_at_direct "$port" 'AT!SELRAT=0F' >/dev/null 2>&1
+                            send_at_direct "$port" 'AT!SELACQ=NR5G,LTE' >/dev/null 2>&1
+                            rat_lbl="5G + 4G (LTE+NR5G)"
+                            ;;
+                        lte_only)
+                            send_at_direct "$port" 'AT!SELRAT=04' >/dev/null 2>&1
+                            rat_lbl="Chỉ 4G LTE"
+                            ;;
+                        nr_only)
+                            send_at_direct "$port" 'AT!SELRAT=11' >/dev/null 2>&1
+                            rat_lbl="Chỉ 5G NR"
+                            ;;
+                        *)
+                            send_at_direct "$port" 'AT!SELRAT=00' >/dev/null 2>&1
+                            send_at_direct "$port" 'AT!SELACQ=LTE,NR5G,WCDMA' >/dev/null 2>&1
+                            rat_lbl="Tự động (Auto)"
+                            ;;
+                    esac
+                    echo "custom_rat:${rat}" > /etc/config/band_lock_mode
+                    echo "custom_rat:${rat}" > /tmp/band_lock_mode
+                    printf '{"success":true,"message":"Sierra EM9190: Đã chuyển chế độ mạng [%s] (Sierra không dùng khóa từng band rời qua AT).","rat":"%s"}\n' "$rat_lbl" "$rat"
+                    exit 0
+                fi
+
+                if [ "$rat" = "lte_only" ] && [ -z "$lte_bands" ]; then
+                    echo '{"success":false,"message":"Vui lòng chọn ít nhất 1 băng tần 4G LTE!"}'
+                    exit 0
+                elif [ "$rat" = "nr_only" ] && [ -z "$nr_bands" ]; then
+                    echo '{"success":false,"message":"Vui lòng chọn ít nhất 1 băng tần 5G NR!"}'
+                    exit 0
+                elif [ "$rat" = "lte_nr" ] && [ -z "$lte_bands" ] && [ -z "$nr_bands" ]; then
+                    echo '{"success":false,"message":"Vui lòng chọn ít nhất 1 băng tần LTE hoặc 5G NR!"}'
+                    exit 0
+                fi
+
+                if is_fibocom_modem; then
+                    gt_chk=$(send_at_direct "$port" "AT+GTACT?")
+                    if [ -z "$gt_chk" ] || { printf '%s' "$gt_chk" | grep -qi "ERROR" && ! printf '%s' "$gt_chk" | grep -q "+GTACT:"; }; then
+                        echo '{"success":false,"message":"Modem Fibocom không phản hồi AT+GTACT trên cổng AT hiện tại!"}'
+                        exit 0
+                    fi
+                    lte_enc=$(printf '%s' "$lte_bands" | tr ',' '\n' | awk '$1>=1 {printf "%d\n", $1+100}' | tr '\n' ',' | sed 's/,$//')
+                    nr_enc=$(printf '%s' "$nr_bands" | tr ',' '\n' | awk '$1>=1 {printf "%d\n", ($1<10 ? $1+500 : $1+5000)}' | tr '\n' ',' | sed 's/,$//')
+                    all_enc="${lte_enc}${lte_enc:+${nr_enc:+,}}${nr_enc}"
+                    case "$rat" in
+                        lte_nr)   gt_cmd="AT+GTACT=17,6,3,${all_enc}" ;;
+                        nr_only)  gt_cmd="AT+GTACT=14,6,,${nr_enc}" ;;
+                        lte_only) gt_cmd="AT+GTACT=2,3,,${lte_enc}" ;;
+                        *)
+                            if [ -n "$all_enc" ]; then
+                                gt_cmd="AT+GTACT=20,6,3,${all_enc}"
+                            else
+                                gt_cmd="AT+GTACT=20,6,3"
+                            fi
+                            ;;
+                    esac
+                    gt_res=$(send_at_direct "$port" "$gt_cmd")
+                    if [ -z "$gt_res" ] || printf '%s' "$gt_res" | grep -qi "ERROR"; then
+                        printf '{"success":false,"message":"Modem Fibocom từ chối lệnh %s!"}\n' "$gt_cmd"
+                        exit 0
+                    fi
+                else
+                    case "$rat" in
+                        lte_nr)   q_mp="LTE:NR5G" ;;
+                        nr_only)  q_mp="NR5G" ;;
+                        lte_only) q_mp="LTE" ;;
+                        *)        q_mp="AUTO" ;;
+                    esac
+                    q_res=$(send_at_direct "$port" "AT+QNWPREFCFG=\"mode_pref\",${q_mp}")
+                    if printf '%s' "$q_res" | grep -qi "ERROR"; then
+                        printf '{"success":false,"message":"Modem Quectel từ chối mode_pref=%s!"}\n' "$q_mp"
+                        exit 0
+                    fi
+                    if [ "$rat" != "nr_only" ] && [ -n "$lte_bands" ]; then
+                        lte_col=$(printf '%s' "$lte_bands" | tr ',' ':')
+                        q_res=$(send_at_direct "$port" "AT+QNWPREFCFG=\"lte_band\",${lte_col}")
+                        if printf '%s' "$q_res" | grep -qi "ERROR"; then
+                            printf '{"success":false,"message":"Modem Quectel từ chối LTE band (%s)!"}\n' "$lte_bands"
+                            exit 0
+                        fi
+                    fi
+                    if [ "$rat" != "lte_only" ] && [ -n "$nr_bands" ]; then
+                        nr_col=$(printf '%s' "$nr_bands" | tr ',' ':')
+                        send_at_direct "$port" "AT+QNWPREFCFG=\"nr5g_band\",${nr_col}" >/dev/null 2>&1
+                        q_res=$(send_at_direct "$port" "AT+QNWPREFCFG=\"nsa_nr5g_band\",${nr_col}")
+                        if printf '%s' "$q_res" | grep -qi "ERROR"; then
+                            printf '{"success":false,"message":"Modem Quectel từ chối 5G NR band (%s)!"}\n' "$nr_bands"
+                            exit 0
+                        fi
+                    fi
+                fi
+
+                if [ "$rat" = "auto" ] && [ -z "$lte_bands" ] && [ -z "$nr_bands" ]; then
+                    echo "auto" > /etc/config/band_lock_mode
+                    rm -f /tmp/band_lock_mode 2>/dev/null
+                else
+                    printf 'custom:%s:%s:%s\n' "$rat" "$lte_bands" "$nr_bands" > /etc/config/band_lock_mode
+                    printf 'custom:%s:%s:%s\n' "$rat" "$lte_bands" "$nr_bands" > /tmp/band_lock_mode
+                fi
+                printf '{"success":true,"message":"Đã khóa băng tần tùy chọn! Chế độ: %s | LTE: [%s] | 5G NR: [%s]","rat":"%s","lte_bands":"%s","nr_bands":"%s"}\n' \
+                    "$rat" "${lte_bands:-All}" "${nr_bands:-All}" "$rat" "$lte_bands" "$nr_bands"
                 ;;
             getCellInfo)
                 port=$(get_active_modem_port)

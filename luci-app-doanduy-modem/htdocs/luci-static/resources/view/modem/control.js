@@ -18,6 +18,8 @@ var callCheckDataBalance = rpc.declare({ object: 'luci.sms-status', method: 'che
 var callSetBandLock = rpc.declare({ object: 'luci.sms-status', method: 'setBandLock', params: ['mode'] });
 var callGetCellInfo = rpc.declare({ object: 'luci.sms-status', method: 'getCellInfo', expect: { } });
 var callSetCellLock = rpc.declare({ object: 'luci.sms-status', method: 'setCellLock', params: ['action'], expect: { } });
+var callGetBandState = rpc.declare({ object: 'luci.sms-status', method: 'getBandState', expect: { } });
+var callSetCustomBands = rpc.declare({ object: 'luci.sms-status', method: 'setCustomBands', params: ['rat', 'lte_bands', 'nr_bands'], expect: { } });
 var callSetCustomSchedule = rpc.declare({ object: 'luci.sms-status', method: 'setCustomSchedule', params: ['datetime'] });
 var callSimGetState = rpc.declare({ object: 'doanduy.sim', method: 'getState', expect: { } });
 var callSimSaveTime = rpc.declare({ object: 'doanduy.sim', method: 'saveTime', params: ['time'], expect: { } });
@@ -908,13 +910,215 @@ return view.extend({
             style: 'font-weight: 750; font-size: 12.5px; padding: 6px 16px; border-radius: 6px;',
             click: function() {
                 var bm = bandPresetSelect.value;
+                applyBandBtn.textContent = '⏳ Đang áp dụng...';
                 callSetBandLock(bm).then(function(r) {
-                    ui.addNotification(null, E('p', r.message || '✅ Đã áp dụng cấu hình băng tần!'), 'info');
+                    applyBandBtn.textContent = '🔒 Khóa Băng Tần Nhanh';
+                    ui.addNotification(null, E('p', (r && r.message) || '✅ Đã áp dụng cấu hình băng tần!'), (r && r.success === false) ? 'error' : 'info');
                 }).catch(function(err) {
+                    applyBandBtn.textContent = '🔒 Khóa Băng Tần Nhanh';
                     ui.addNotification(null, E('p', '❌ Lỗi khóa băng tần: ' + err), 'error');
                 });
             }
-        }, '🔒 Khóa Băng Tần');
+        }, '🔒 Khóa Băng Tần Nhanh');
+
+        // 5.1. Manual Band Picker & RAT Selector (Option 1 - v2.2.0)
+        var lteBandDefs = [
+            { id: '1', label: 'B1 (2100)' },
+            { id: '3', label: 'B3 (1800)' },
+            { id: '7', label: 'B7 (2600)' },
+            { id: '8', label: 'B8 (900)' },
+            { id: '28', label: 'B28 (700)' },
+            { id: '40', label: 'B40 (2300)' },
+            { id: '41', label: 'B41 (2600)' }
+        ];
+        var nrBandDefs = [
+            { id: '28', label: 'n28 (700)' },
+            { id: '41', label: 'n41 (2600)' },
+            { id: '77', label: 'n77 (3700)' },
+            { id: '78', label: 'n78 (3500)' }
+        ];
+        var lteBandChecks = {};
+        var nrBandChecks = {};
+
+        var ratModeSelect = E('select', { class: 'cbi-input-select', style: 'min-width: 260px; height: 36px; font-weight: 700; border-radius: 6px;' }, [
+            E('option', { value: 'lte_nr' }, '⚡ 5G + 4G (NSA/SA - Khuyên dùng)'),
+            E('option', { value: 'auto' }, '🔄 Tự Động (Auto 5G/4G/3G)'),
+            E('option', { value: 'nr_only' }, '🚀 Chỉ 5G SA (NR5G Only)'),
+            E('option', { value: 'lte_only' }, '📶 Chỉ 4G LTE (Né 5G yếu)')
+        ]);
+
+        function makeBandPill(bandObj, mapObj, accentBg, accentBorder, accentColor) {
+            var cb = E('input', { type: 'checkbox', style: 'margin: 0; width: 15px; height: 15px; cursor: pointer;' });
+            mapObj[bandObj.id] = cb;
+            return E('label', {
+                style: 'display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border-radius: 6px; font-size: 12.5px; font-weight: 700; cursor: pointer; background: ' + accentBg + '; border: 1.5px solid ' + accentBorder + '; color: ' + accentColor + '; user-select: none;'
+            }, [ cb, bandObj.label ]);
+        }
+
+        var lteBandWrap = E('div', { style: 'display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px;' },
+            lteBandDefs.map(function(b) { return makeBandPill(b, lteBandChecks, '#eff6ff', '#bfdbfe', '#1e40af'); })
+        );
+        var nrBandWrap = E('div', { style: 'display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;' },
+            nrBandDefs.map(function(b) { return makeBandPill(b, nrBandChecks, '#f0fdf4', '#86efac', '#166534'); })
+        );
+        var bandStateInfo = E('div', { style: 'font-size: 12px; color: #475569; margin-bottom: 10px; font-weight: 600;' },
+            '💡 Nhấn "Đọc Band Hiện Tại" để đồng bộ băng tần đang mở từ card WWAN, rồi tick chọn các band muốn ép.'
+        );
+
+        var readBandBtn = E('button', {
+            class: 'btn cbi-button',
+            style: 'font-weight: 700; font-size: 12px; padding: 6px 12px; border-radius: 6px; background: #ffffff; border: 1px solid #cbd5e1; cursor: pointer;',
+            click: function() {
+                readBandBtn.textContent = '⏳ Đang đọc...';
+                callGetBandState().then(function(st) {
+                    readBandBtn.textContent = '🔍 Đọc Band Hiện Tại';
+                    if (!st || st.success === false) {
+                        bandStateInfo.textContent = '⚠️ ' + ((st && st.message) || 'Không đọc được trạng thái band từ modem.');
+                        return;
+                    }
+                    if (st.rat) ratModeSelect.value = st.rat;
+                    var lteSet = (st.lte_bands || '').split(',').filter(Boolean);
+                    var nrSet = (st.nr_bands || '').split(',').filter(Boolean);
+                    Object.keys(lteBandChecks).forEach(function(k) { lteBandChecks[k].checked = (lteSet.indexOf(k) !== -1); });
+                    Object.keys(nrBandChecks).forEach(function(k) { nrBandChecks[k].checked = (nrSet.indexOf(k) !== -1); });
+                    bandStateInfo.textContent = '📡 Modem [' + (st.vendor || 'auto').toUpperCase() + '] • Chế độ: ' + (st.rat || 'auto') +
+                        ' • LTE: [' + (st.lte_bands || 'Auto') + '] • 5G NR: [' + (st.nr_bands || 'Auto') + ']' +
+                        (st.supports_custom === false ? ' (Sierra chỉ hỗ trợ đổi RAT)' : '');
+                }).catch(function(err) {
+                    readBandBtn.textContent = '🔍 Đọc Band Hiện Tại';
+                    bandStateInfo.textContent = '❌ Lỗi đọc band: ' + err;
+                });
+            }
+        }, '🔍 Đọc Band Hiện Tại');
+
+        var applyCustomBandBtn = E('button', {
+            class: 'btn cbi-button cbi-button-action',
+            style: 'font-weight: 750; font-size: 12.5px; padding: 6px 16px; border-radius: 6px;',
+            click: function() {
+                var rat = ratModeSelect.value;
+                var lteSel = Object.keys(lteBandChecks).filter(function(k) { return lteBandChecks[k].checked; });
+                var nrSel = Object.keys(nrBandChecks).filter(function(k) { return nrBandChecks[k].checked; });
+                if (rat === 'lte_only' && lteSel.length === 0) {
+                    alert('Chế độ Chỉ 4G LTE yêu cầu chọn ít nhất 1 băng tần LTE!');
+                    return;
+                }
+                if (rat === 'nr_only' && nrSel.length === 0) {
+                    alert('Chế độ Chỉ 5G SA yêu cầu chọn ít nhất 1 băng tần 5G NR!');
+                    return;
+                }
+                if (rat === 'lte_nr' && lteSel.length === 0 && nrSel.length === 0) {
+                    alert('Vui lòng chọn ít nhất 1 băng tần LTE hoặc 5G NR (hoặc nhấn Mở Khóa Toàn Bộ)!');
+                    return;
+                }
+                applyCustomBandBtn.textContent = '⏳ Đang khóa...';
+                callSetCustomBands(rat, lteSel.join(','), nrSel.join(',')).then(function(r) {
+                    applyCustomBandBtn.textContent = '✅ Áp Dụng Band Tự Chọn';
+                    var ok = !(r && r.success === false);
+                    ui.addNotification(null, E('p', (r && r.message) || 'Đã cập nhật băng tần tùy chọn!'), ok ? 'info' : 'error');
+                    if (ok) bandStateInfo.textContent = '✅ ' + r.message;
+                }).catch(function(err) {
+                    applyCustomBandBtn.textContent = '✅ Áp Dụng Band Tự Chọn';
+                    ui.addNotification(null, E('p', '❌ Lỗi áp dụng band: ' + err), 'error');
+                });
+            }
+        }, '✅ Áp Dụng Band Tự Chọn');
+
+        var resetAllBandBtn = E('button', {
+            class: 'btn cbi-button',
+            style: 'font-weight: 700; font-size: 12px; padding: 6px 12px; border-radius: 6px; background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; cursor: pointer;',
+            click: function() {
+                resetAllBandBtn.textContent = '⏳ Đang mở...';
+                callSetBandLock('reset_all').then(function(r) {
+                    resetAllBandBtn.textContent = '🔄 Mở Khóa Toàn Bộ';
+                    ratModeSelect.value = 'auto';
+                    Object.keys(lteBandChecks).forEach(function(k) { lteBandChecks[k].checked = false; });
+                    Object.keys(nrBandChecks).forEach(function(k) { nrBandChecks[k].checked = false; });
+                    ui.addNotification(null, E('p', (r && r.message) || 'Đã khôi phục toàn bộ băng tần!'), (r && r.success === false) ? 'error' : 'info');
+                }).catch(function(err) {
+                    resetAllBandBtn.textContent = '🔄 Mở Khóa Toàn Bộ';
+                    ui.addNotification(null, E('p', '❌ Lỗi: ' + err), 'error');
+                });
+            }
+        }, '🔄 Mở Khóa Toàn Bộ');
+
+        // 5.2. Live Serving Cell Telemetry Card (tận dụng callGetCellInfo sẵn có)
+        var cellGridBox = E('div', {});
+        function renderCellGrid(ci) {
+            ci = ci || {};
+            cellGridBox.innerHTML = '';
+            var lockStateBadge = ci.is_cell_locked ? E('span', {
+                style: 'display: inline-block; padding: 3px 9px; border-radius: 6px; font-size: 11.5px; font-weight: 750; background: #fef3c7; color: #92400e; border: 1px solid #fde68a; margin-bottom: 10px;'
+            }, '📌 Đang khóa Cell: ' + (ci.locked_details || 'Active')) : null;
+            if (lockStateBadge) cellGridBox.appendChild(lockStateBadge);
+
+            cellGridBox.appendChild(E('div', { style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px;' }, [
+                E('div', { style: 'background: #ffffff; border: 1px solid #dbeafe; border-radius: 8px; padding: 10px 12px;' }, [
+                    E('div', { style: 'font-weight: 800; font-size: 12.5px; color: #1d4ed8; margin-bottom: 4px;' }, '📶 4G LTE Serving Cell (' + (ci.carrier_name || 'N/A') + ')'),
+                    E('div', { style: 'font-size: 12px; color: #334155; font-family: monospace; line-height: 1.6;' },
+                        'Band: B' + (ci.lte_band || '--') + ' | PCI: ' + (ci.lte_pci || '--') + '\n' +
+                        'EARFCN: ' + (ci.lte_earfcn || '--') + ' | Cell ID: ' + (ci.lte_cellid || '--') + '\n' +
+                        'RSRP: ' + (ci.lte_rsrp || '--') + ' dBm | SINR: ' + (ci.lte_sinr || '--') + ' dB'
+                    )
+                ]),
+                E('div', { style: 'background: #ffffff; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px 12px;' }, [
+                    E('div', { style: 'font-weight: 800; font-size: 12.5px; color: #15803d; margin-bottom: 4px;' }, '🚀 5G NR Serving Cell'),
+                    E('div', { style: 'font-size: 12px; color: #334155; font-family: monospace; line-height: 1.6;' },
+                        'Band: n' + (ci.nr_band || '--') + ' | PCI: ' + (ci.nr_pci || '--') + '\n' +
+                        'NR-ARFCN: ' + (ci.nr_arfcn || '--') + '\n' +
+                        'SS-RSRP: ' + (ci.nr_rsrp || '--') + ' dBm | SS-SINR: ' + (ci.nr_sinr || '--') + ' dB'
+                    )
+                ])
+            ]));
+        }
+        renderCellGrid(cellRes);
+
+        var refreshCellBtn = E('button', {
+            class: 'btn cbi-button',
+            style: 'font-weight: 700; font-size: 12px; padding: 6px 12px; border-radius: 6px; background: #ffffff; border: 1px solid #cbd5e1; cursor: pointer;',
+            click: function() {
+                refreshCellBtn.textContent = '⏳ Đang quét...';
+                callGetCellInfo().then(function(ci) {
+                    refreshCellBtn.textContent = '🔄 Làm Mới Cell';
+                    renderCellGrid(ci);
+                }).catch(function(err) {
+                    refreshCellBtn.textContent = '🔄 Làm Mới Cell';
+                    ui.addNotification(null, E('p', '❌ Lỗi đọc thông số Cell: ' + err), 'error');
+                });
+            }
+        }, '🔄 Làm Mới Cell');
+
+        var cellActionChildren = [ refreshCellBtn ];
+        if (cellRes && cellRes.supports_cell_lock === true) {
+            cellActionChildren.push(E('button', {
+                class: 'btn cbi-button cbi-button-action',
+                style: 'font-weight: 700; font-size: 12px; padding: 6px 12px; border-radius: 6px;',
+                click: function() {
+                    if (!confirm('Khóa cứng vào trạm BTS đang bắt? Lưu ý: nếu trạm bảo trì có thể mất sóng tới khi bấm Mở Khóa.')) return;
+                    callSetCellLock('lock').then(function(r) {
+                        ui.addNotification(null, E('p', (r && r.message) || 'Đã khóa trạm BTS!'), (r && r.success === false) ? 'error' : 'info');
+                        callGetCellInfo().then(renderCellGrid).catch(function() {});
+                    });
+                }
+            }, '📌 Khóa Trạm BTS (Quectel)'));
+            cellActionChildren.push(E('button', {
+                class: 'btn cbi-button',
+                style: 'font-weight: 700; font-size: 12px; padding: 6px 12px; border-radius: 6px; background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa;',
+                click: function() {
+                    callSetCellLock('unlock').then(function(r) {
+                        ui.addNotification(null, E('p', (r && r.message) || 'Đã mở khóa trạm BTS!'), (r && r.success === false) ? 'error' : 'info');
+                        callGetCellInfo().then(renderCellGrid).catch(function() {});
+                    });
+                }
+            }, '🔓 Mở Khóa Trạm'));
+        } else {
+            cellActionChildren.push(E('span', { style: 'font-size: 12px; color: #64748b;' }, '• Card Fibocom/Sierra dùng Chọn Băng Tần Thủ Công phía trên để tối ưu trạm an toàn, không gây kẹt cell.'));
+        }
+
+        var cellInfoSection = E('div', { style: 'border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; background: #fafafa; margin-bottom: 16px;' }, [
+            E('div', { style: 'font-weight: 800; font-size: 14px; margin-bottom: 10px; color: #1e293b;' }, '📡 Thông Số Trạm BTS & Sóng 4G/5G Trực Tiếp:'),
+            cellGridBox,
+            E('div', { style: 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px;' }, cellActionChildren)
+        ]);
 
         var atCmdInput = E('input', {
             type: 'text',
@@ -1007,8 +1211,22 @@ return view.extend({
             E('div', { style: 'border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; background: #fafafa; margin-bottom: 16px;' }, [
                 E('div', { style: 'font-weight: 800; font-size: 14px; margin-bottom: 6px; color: #1e293b;' }, '⚡ Khóa Băng Tần 5G/4G Tối Ưu Tốc Độ:'),
                 bandPresetSelect,
-                applyBandBtn
+                applyBandBtn,
+                E('div', { style: 'border-top: 1px dashed #cbd5e1; margin: 14px 0 12px 0; padding-top: 12px;' }, [
+                    E('div', { style: 'font-weight: 800; font-size: 13.5px; margin-bottom: 8px; color: #0f172a;' }, '🎛️ Chọn Chế Độ Mạng & Băng Tần Thủ Công (Band Picker):'),
+                    E('div', { style: 'display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;' }, [
+                        E('span', { style: 'font-size: 12.5px; font-weight: 700; color: #334155;' }, 'Chế độ RAT:'),
+                        ratModeSelect
+                    ]),
+                    E('div', { style: 'font-size: 12px; font-weight: 750; color: #1e40af; margin-bottom: 5px;' }, '4G LTE Bands:'),
+                    lteBandWrap,
+                    E('div', { style: 'font-size: 12px; font-weight: 750; color: #166534; margin-bottom: 5px;' }, '5G NR Bands:'),
+                    nrBandWrap,
+                    bandStateInfo,
+                    E('div', { style: 'display: flex; gap: 8px; flex-wrap: wrap;' }, [ readBandBtn, applyCustomBandBtn, resetAllBandBtn ])
+                ])
             ]),
+            cellInfoSection,
             atTerminalSection
         ]);
         tabPanes['modem'] = modemTabContent;
