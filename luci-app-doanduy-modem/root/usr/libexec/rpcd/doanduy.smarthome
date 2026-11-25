@@ -1,0 +1,926 @@
+#!/usr/bin/lua
+-- DOANDUY Smart Home RPCD Backend for Tuya S06 Pro Local LAN Control & Universal IR Catalog
+package.path = "/usr/lib/lua/?.lua;/usr/lib/lua/?/init.lua;" .. (package.path or "")
+
+local cjson = require("cjson")
+local nixio = require("nixio")
+local ok_tuya, tuya_v35 = pcall(require, "tuya_v35_local")
+local ok_ac, ac_ir = pcall(require, "ac_ir_protocols")
+
+local S06_CFG_FILE = "/etc/duytv_s06_config.json"
+local DEVICES_FILE = "/etc/config/doanduy_smarthome.json"
+local HUB_DEV_FILE = "/etc/duytv_lan_devices.json"
+local IRDB_CACHE   = "/tmp/irdb_index.txt"
+local HUB_HTTP     = "http://127.0.0.1:8996"
+
+local function read_file(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local d = f:read("*a")
+  f:close()
+  return d
+end
+
+local function write_atomic(path, content, mode)
+  local dir = path:match("^(.+)/[^/]+$")
+  if dir then os.execute("mkdir -p '" .. dir:gsub("'", "'\\''") .. "' >/dev/null 2>&1") end
+  local tmp = path .. ".tmp"
+  local f = assert(io.open(tmp, "wb"))
+  f:write(content)
+  f:close()
+  os.rename(tmp, path)
+  if mode then os.execute("chmod " .. mode .. " '" .. path:gsub("'", "'\\''") .. "' >/dev/null 2>&1") end
+end
+
+local function trim(s)
+  return (tostring(s or "")):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function sh_quote(s)
+  return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function http_get_json(url, timeout_s)
+  local p = io.popen(string.format("curl -4 -sS --connect-timeout 2 -m %d %s 2>/dev/null", timeout_s or 3, sh_quote(url)))
+  if not p then return nil end
+  local raw = p:read("*a") or ""
+  p:close()
+  if raw == "" then return nil end
+  local ok, dec = pcall(cjson.decode, raw)
+  return ok and dec or nil
+end
+
+local function tcp_open(ip, port, timeout_ms)
+  local s = nixio.socket("inet", "stream")
+  if not s then return false end
+  s:setblocking(false)
+  local ok = s:connect(ip, port)
+  if ok then s:close(); return true end
+  local fds = {{ fd = s, events = nixio.poll_flags("out") }}
+  local rc = nixio.poll(fds, timeout_ms or 180)
+  local err = s:getopt("socket", "error")
+  local rev = fds[1].revents or 0
+  s:close()
+  return (rc and rc > 0 and rev > 0 and err == 0) and true or false
+end
+
+local function url_encode(s)
+  return (tostring(s or "")):gsub("([^%w%-%._~ /])", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end):gsub(" ", "%%20")
+end
+
+-- =============================================================================
+-- HUB CONFIG & SAFE PUBLIC VIEW (Zero-Leak: never returns raw local_key)
+-- =============================================================================
+
+local function load_s06_cfg()
+  local cfg = {
+    ip = "192.168.1.130",
+    mac = "20:f1:b2:fa:76:27",
+    device_id = "a3fc144d9c06ae63b5bqj0",
+    version = "3.5",
+    local_key = "",
+    control_type = 1,
+    ac_brand = "lg2",
+    ac_temp = 26,
+    ir_codes = {},
+  }
+  local raw = read_file(S06_CFG_FILE)
+  if raw and raw ~= "" then
+    local ok, dec = pcall(cjson.decode, raw)
+    if ok and type(dec) == "table" then
+      for k, v in pairs(dec) do cfg[k] = v end
+    end
+  end
+  if type(cfg.ir_codes) ~= "table" then cfg.ir_codes = {} end
+  return cfg
+end
+
+local function heal_hub_ip(cfg)
+  local arp = read_file("/proc/net/arp") or ""
+  local tgt = trim(cfg.mac or ""):lower()
+  if tgt ~= "" then
+    for line in arp:gmatch("[^\r\n]+") do
+      local ip, _, _, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+%S+%s+%S+%s+([%x:]+)")
+      if ip and mac and mac:lower() == tgt then
+        cfg.ip = ip
+        break
+      end
+    end
+  end
+end
+
+local function get_live_hub_info(cfg, allow_probe)
+  heal_hub_ip(cfg)
+  local has_key = (#(cfg.local_key or "") == 16)
+  local out = {
+    ip = cfg.ip,
+    mac = cfg.mac,
+    device_id = cfg.device_id,
+    version = cfg.version or "3.5",
+    control_type = tonumber(cfg.control_type) or 1,
+    has_key = has_key,
+    ac_brand = cfg.ac_brand or "lg2",
+    live_ok = false,
+    temp_c = nil,
+    humidity = nil,
+  }
+  if allow_probe then
+    local st = http_get_json(HUB_HTTP .. "/s06/status?probe=1", 3)
+    if type(st) == "table" and st.ip then
+      out.live_ok = st.live_ok and true or false
+      out.ip = st.ip or out.ip
+      out.dps = st.dps
+      if type(st.dps) == "table" then
+        local t = tonumber(st.dps["101"] or st.dps["1"])
+        local h = tonumber(st.dps["102"] or st.dps["2"])
+        if t then out.temp_c = tonumber(string.format("%.1f", (t > 80) and (t / 10.0) or t)) end
+        if h then out.humidity = math.floor(h) end
+      end
+      return out
+    elseif ok_tuya and has_key then
+      local dps = tuya_v35.status(cfg.ip, cfg.device_id, cfg.local_key, 2)
+      if type(dps) == "table" then
+        out.live_ok = true
+        out.dps = dps
+        local t = tonumber(dps["101"] or dps["1"])
+        local h = tonumber(dps["102"] or dps["2"])
+        if t then out.temp_c = tonumber(string.format("%.1f", (t > 80) and (t / 10.0) or t)) end
+        if h then out.humidity = math.floor(h) end
+      end
+    end
+  end
+  return out
+end
+
+-- =============================================================================
+-- SMART DEVICE REGISTRY (/etc/config/doanduy_smarthome.json)
+-- =============================================================================
+
+local function seed_default_devices(cfg)
+  local br = cfg.ac_brand or "lg2"
+  local label = (ok_ac and ac_ir.get_brand_info(br).label) or "LG Inverter (Chuẩn mới LG2)"
+  return {
+    {
+      id = "ac_default_1",
+      name = "Máy lạnh " .. trim(label:match("^([^%(]+)") or "LG Inverter"),
+      room = "Phòng ngủ",
+      category = "ac",
+      type = "ac",
+      brand = br,
+      brand_label = label,
+      source = "builtin",
+      state = {
+        power = cfg.ac_power and true or false,
+        temp = tonumber(cfg.ac_temp) or 26,
+        mode = cfg.ac_mode or "cool",
+        fan = cfg.ac_fan or "auto",
+        swing = cfg.ac_swing and true or false,
+      },
+      buttons = {},
+    }
+  }
+end
+
+local function load_devices(cfg)
+  local raw = read_file(DEVICES_FILE)
+  if raw and raw ~= "" then
+    local ok, dec = pcall(cjson.decode, raw)
+    if ok and type(dec) == "table" and type(dec.devices) == "table" then
+      return dec.devices
+    end
+  end
+  local seeded = seed_default_devices(cfg)
+  write_atomic(DEVICES_FILE, cjson.encode({ version = 1, devices = seeded }), "600")
+  return seeded
+end
+
+local function save_devices(devs)
+  write_atomic(DEVICES_FILE, cjson.encode({ version = 1, devices = devs }), "600")
+end
+
+-- =============================================================================
+-- BUILTIN CATALOG (11 AC Brands + Popular TVs, Fans, Audio, Custom IR)
+-- =============================================================================
+
+local function build_catalog()
+  local cat = {}
+  if ok_ac then
+    for _, b in ipairs(ac_ir.BRANDS) do
+      if b.id ~= "manual" then
+        cat[#cat + 1] = {
+          id = "ac_" .. b.id,
+          source = "builtin",
+          category = "ac",
+          type = "ac",
+          brand = b.id,
+          name = "Máy lạnh " .. b.label,
+          subtitle = "Tự động 100% (16–30°C, chế độ, gió, đảo gió) — Không cần học remote",
+          search = ("may lanh dieu hoa ac " .. b.id .. " " .. b.label .. " " .. table.concat(b.aliases or {}, " ")):lower(),
+        }
+      end
+    end
+  end
+
+  local ir_presets = {
+    {
+      id = "tv_lg", category = "tv", brand = "LG", name = "Tivi LG (WebOS / Smart TV)",
+      subtitle = "NEC1 • Nguồn, Âm lượng, Kênh, Home, Back, Điều hướng",
+      search = "tivi tv lg webos nec1 remote",
+      buttons = {
+        { id="power", label="Nguồn", proto="NEC1", dev=4, sub=-1, fn=8 },
+        { id="vol_up", label="Âm +", proto="NEC1", dev=4, sub=-1, fn=2 },
+        { id="vol_down", label="Âm -", proto="NEC1", dev=4, sub=-1, fn=3 },
+        { id="mute", label="Tắt tiếng", proto="NEC1", dev=4, sub=-1, fn=9 },
+        { id="ch_up", label="Kênh +", proto="NEC1", dev=4, sub=-1, fn=0 },
+        { id="ch_down", label="Kênh -", proto="NEC1", dev=4, sub=-1, fn=1 },
+        { id="input", label="Ngõ vào", proto="NEC1", dev=4, sub=-1, fn=11 },
+        { id="home", label="Home", proto="NEC1", dev=4, sub=-1, fn=67 },
+        { id="up", label="▲", proto="NEC1", dev=4, sub=-1, fn=64 },
+        { id="down", label="▼", proto="NEC1", dev=4, sub=-1, fn=65 },
+        { id="left", label="◀", proto="NEC1", dev=4, sub=-1, fn=7 },
+        { id="right", label="▶", proto="NEC1", dev=4, sub=-1, fn=6 },
+        { id="ok", label="OK", proto="NEC1", dev=4, sub=-1, fn=68 },
+        { id="back", label="Back", proto="NEC1", dev=4, sub=-1, fn=40 },
+      },
+    },
+    {
+      id = "tv_samsung", category = "tv", brand = "Samsung", name = "Tivi Samsung (Tizen / Crystal / QLED)",
+      subtitle = "NECx2 • Nguồn, Âm lượng, Kênh, Home, Back, Điều hướng",
+      search = "tivi tv samsung tizen qled crystal necx2 remote",
+      buttons = {
+        { id="power", label="Nguồn", proto="NECx2", dev=7, sub=7, fn=2 },
+        { id="vol_up", label="Âm +", proto="NECx2", dev=7, sub=7, fn=7 },
+        { id="vol_down", label="Âm -", proto="NECx2", dev=7, sub=7, fn=11 },
+        { id="mute", label="Tắt tiếng", proto="NECx2", dev=7, sub=7, fn=15 },
+        { id="ch_up", label="Kênh +", proto="NECx2", dev=7, sub=7, fn=18 },
+        { id="ch_down", label="Kênh -", proto="NECx2", dev=7, sub=7, fn=16 },
+        { id="input", label="Source", proto="NECx2", dev=7, sub=7, fn=1 },
+        { id="home", label="Home", proto="NECx2", dev=7, sub=7, fn=121 },
+        { id="up", label="▲", proto="NECx2", dev=7, sub=7, fn=96 },
+        { id="down", label="▼", proto="NECx2", dev=7, sub=7, fn=97 },
+        { id="left", label="◀", proto="NECx2", dev=7, sub=7, fn=101 },
+        { id="right", label="▶", proto="NECx2", dev=7, sub=7, fn=98 },
+        { id="ok", label="OK", proto="NECx2", dev=7, sub=7, fn=104 },
+        { id="back", label="Back", proto="NECx2", dev=7, sub=7, fn=88 },
+      },
+    },
+    {
+      id = "tv_sony", category = "tv", brand = "Sony", name = "Tivi Sony (Bravia / Android TV)",
+      subtitle = "Sony12 • Nguồn, Âm lượng, Kênh, Ngõ vào",
+      search = "tivi tv sony bravia android sony12",
+      buttons = {
+        { id="power", label="Nguồn", proto="Sony12", dev=1, sub=-1, fn=21 },
+        { id="vol_up", label="Âm +", proto="Sony12", dev=1, sub=-1, fn=18 },
+        { id="vol_down", label="Âm -", proto="Sony12", dev=1, sub=-1, fn=19 },
+        { id="mute", label="Tắt tiếng", proto="Sony12", dev=1, sub=-1, fn=20 },
+        { id="ch_up", label="Kênh +", proto="Sony12", dev=1, sub=-1, fn=16 },
+        { id="ch_down", label="Kênh -", proto="Sony12", dev=1, sub=-1, fn=17 },
+        { id="input", label="Input", proto="Sony12", dev=1, sub=-1, fn=37 },
+      },
+    },
+    {
+      id = "tv_toshiba", category = "tv", brand = "Toshiba", name = "Tivi Toshiba (NEC1 64)",
+      subtitle = "NEC1 • Nguồn, Âm lượng, Kênh, Input",
+      search = "tivi tv toshiba nec1",
+      buttons = {
+        { id="power", label="Nguồn", proto="NEC1", dev=64, sub=-1, fn=18 },
+        { id="vol_up", label="Âm +", proto="NEC1", dev=64, sub=-1, fn=26 },
+        { id="vol_down", label="Âm -", proto="NEC1", dev=64, sub=-1, fn=30 },
+        { id="mute", label="Tắt tiếng", proto="NEC1", dev=64, sub=-1, fn=16 },
+        { id="ch_up", label="Kênh +", proto="NEC1", dev=64, sub=-1, fn=27 },
+        { id="ch_down", label="Kênh -", proto="NEC1", dev=64, sub=-1, fn=31 },
+        { id="input", label="Input", proto="NEC1", dev=64, sub=-1, fn=15 },
+      },
+    },
+    {
+      id = "fan_mitsubishi", category = "fan", brand = "Mitsubishi", name = "Quạt Mitsubishi Electric (Cây / Treo / Trần)",
+      subtitle = "Bộ nút quạt chuẩn + Hỗ trợ bấm Học 1 chạm S06 Pro & Voice ESP32",
+      search = "quat fan mitsubishi mit su cay treo tran",
+      buttons = {
+        { id="power", label="Bật / Tắt Quạt", proto="NEC1", dev=224, sub=-1, fn=1 },
+        { id="speed_up", label="Tăng gió (+)", proto="NEC1", dev=224, sub=-1, fn=2 },
+        { id="speed_down", label="Giảm gió (-)", proto="NEC1", dev=224, sub=-1, fn=3 },
+        { id="swing", label="Đảo gió (Swing)", proto="NEC1", dev=224, sub=-1, fn=4 },
+        { id="timer", label="Hẹn giờ", proto="NEC1", dev=224, sub=-1, fn=5 },
+        { id="rhythm", label="Gió tự nhiên", proto="NEC1", dev=224, sub=-1, fn=6 },
+      },
+    },
+    {
+      id = "fan_panasonic", category = "fan", brand = "Panasonic", name = "Quạt Panasonic / KDK (Cây / Trần)",
+      subtitle = "Đồng bộ lệnh giọng nói ESP32-C3 (Bấm Học bằng S06 Pro 1 lần)",
+      search = "quat fan panasonic kdk cay tran",
+      buttons = {
+        { id="power", label="Bật / Tắt Quạt" },
+        { id="speed_up", label="Tăng gió (+)" },
+        { id="speed_down", label="Giảm gió (-)" },
+        { id="swing", label="Đảo gió" },
+        { id="timer", label="Hẹn giờ" },
+      },
+    },
+    {
+      id = "fan_senko", category = "fan", brand = "Senko / Asia / Toshiba / Hatari", name = "Quạt Senko / Asia / Toshiba / Hatari / Xiaomi",
+      subtitle = "Đồng bộ lệnh giọng nói ESP32-C3 (Bấm Học bằng S06 Pro 1 lần)",
+      search = "quat fan senko asia hatari toshiba xiaomi kangaru vinawind dung treo",
+      buttons = {
+        { id="power", label="Bật / Tắt Quạt" },
+        { id="speed_up", label="Tốc độ / Mạnh (+)" },
+        { id="speed_down", label="Giảm gió (-)" },
+        { id="swing", label="Đảo / Túc năng" },
+        { id="timer", label="Hẹn giờ" },
+      },
+    },
+    {
+      id = "audio_sony", category = "audio", brand = "Sony", name = "Loa / Soundbar / Amply Sony",
+      subtitle = "Sony12 • Nguồn, Âm lượng +, Âm lượng -, Tắt tiếng",
+      search = "loa soundbar amply sony audio sony12",
+      buttons = {
+        { id="power", label="Nguồn", proto="Sony12", dev=16, sub=-1, fn=21 },
+        { id="vol_up", label="Âm +", proto="Sony12", dev=16, sub=-1, fn=18 },
+        { id="vol_down", label="Âm -", proto="Sony12", dev=16, sub=-1, fn=19 },
+        { id="mute", label="Tắt tiếng", proto="Sony12", dev=16, sub=-1, fn=20 },
+      },
+    },
+    {
+      id = "audio_lg_samsung", category = "audio", brand = "LG / Samsung", name = "Loa Soundbar LG / Samsung / JBL",
+      subtitle = "NEC1/NECx2 + Hỗ trợ Học phím linh hoạt S06 Pro",
+      search = "loa soundbar lg samsung jbl karaoke",
+      buttons = {
+        { id="power", label="Nguồn", proto="NEC1", dev=4, sub=-1, fn=8 },
+        { id="vol_up", label="Âm +", proto="NEC1", dev=4, sub=-1, fn=2 },
+        { id="vol_down", label="Âm -", proto="NEC1", dev=4, sub=-1, fn=3 },
+        { id="mute", label="Tắt tiếng", proto="NEC1", dev=4, sub=-1, fn=9 },
+        { id="input", label="Bluetooth / Input" },
+      },
+    },
+    {
+      id = "custom_ir", category = "other", brand = "Tự định nghĩa", name = "Thiết Bị Hồng Ngoại Bất Kỳ (Đèn / Rèm / Đầu Thu / Lọc Khí)",
+      subtitle = "Tạo thẻ điều khiển riêng & học phím 1 chạm từ remote thật qua S06 Pro",
+      search = "khac thiet bi den rem may loc khong khi dau thu custom",
+      type = "custom_ir",
+      buttons = {
+        { id="power", label="Bật / Tắt" },
+        { id="mode", label="Chế độ" },
+        { id="up", label="Tăng (+)" },
+        { id="down", label="Giảm (-)" },
+      },
+    },
+  }
+
+  for _, item in ipairs(ir_presets) do
+    item.source = "builtin"
+    item.type = item.type or "ir_remote"
+    cat[#cat + 1] = item
+  end
+  return cat
+end
+
+local BUILTIN_CATALOG = build_catalog()
+local BUILTIN_BY_ID = {}
+for _, it in ipairs(BUILTIN_CATALOG) do BUILTIN_BY_ID[it.id] = it end
+
+-- =============================================================================
+-- ONLINE PROBONOPD/IRDB CATALOG (3,200+ IR REMOTES, PARSED ON DEMAND)
+-- =============================================================================
+
+local function ensure_irdb_index()
+  local raw = read_file(IRDB_CACHE)
+  if raw and #raw > 1000 then return raw end
+  local cmd = "curl -4 -sSL --connect-timeout 3 -m 6 'https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/index' 2>/dev/null"
+  local p = io.popen(cmd)
+  if not p then return nil end
+  raw = p:read("*a") or ""
+  p:close()
+  if #raw > 1000 then
+    write_atomic(IRDB_CACHE, raw, "644")
+    return raw
+  end
+  return nil
+end
+
+local function is_valid_irdb_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  if path:find("%.%.", 1, true) then return false end
+  return path:match("^[A-Za-z0-9_. ,/+%-]+%.csv$") ~= nil
+end
+
+local function fetch_irdb_csv_buttons(irdb_path)
+  if not is_valid_irdb_path(irdb_path) then return nil, "invalid_irdb_path" end
+  local url = "https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/" .. url_encode(irdb_path)
+  local p = io.popen(string.format("curl -4 -sSL --connect-timeout 3 -m 6 %s 2>/dev/null", sh_quote(url)))
+  if not p then return nil, "curl_failed" end
+  local csv = p:read("*a") or ""
+  p:close()
+  if csv == "" or not csv:find("functionname", 1, true) then return nil, "empty_or_invalid_csv" end
+
+  local seen_sig = {}
+  local all = {}
+  for line in csv:gmatch("[^\r\n]+") do
+    if not line:match("^functionname,") then
+      local fname, proto, dev, sub, fn = line:match("^([^,]+),([^,]+),([%-]?%d+),([%-]?%d+),([%-]?%d+)")
+      if fname and proto and ok_ac and ac_ir.supports_generic(proto) then
+        local sig = proto .. ":" .. dev .. ":" .. sub .. ":" .. fn
+        if not seen_sig[sig] then
+          seen_sig[sig] = true
+          all[#all + 1] = {
+            id = "btn_" .. tostring(#all + 1),
+            label = trim(fname),
+            proto = trim(proto),
+            dev = tonumber(dev),
+            sub = tonumber(sub),
+            fn = tonumber(fn),
+          }
+        end
+      end
+    end
+  end
+  if #all == 0 then return nil, "no_supported_protocol_buttons" end
+
+  local prio_pats = {"power","standby","vol","mute","channel","ch%+","ch%-","input","source","menu","ok","select","enter","up","down","left","right","back","exit","play","pause","speed","swing","timer"}
+  local chosen = {}
+  local used = {}
+  for _, pat in ipairs(prio_pats) do
+    for idx, b in ipairs(all) do
+      if not used[idx] and b.label:lower():find(pat) then
+        used[idx] = true
+        chosen[#chosen + 1] = b
+        if #chosen >= 24 then break end
+      end
+    end
+    if #chosen >= 24 then break end
+  end
+  for idx, b in ipairs(all) do
+    if #chosen >= 24 then break end
+    if not used[idx] then
+      chosen[#chosen + 1] = b
+    end
+  end
+  for idx, b in ipairs(chosen) do
+    local ll = b.label:lower()
+    if ll:find("power") and not ll:find("off") then b.id = "power"
+    elseif ll:find("vol.*%+") or ll == "vol+" then b.id = "vol_up"
+    elseif ll:find("vol.*%-") or ll == "vol-" then b.id = "vol_down"
+    elseif ll:find("mute") then b.id = "mute"
+    else b.id = "k_" .. tostring(idx) end
+  end
+  return chosen
+end
+
+local function infer_irdb_category(cat_str)
+  local c = (cat_str or ""):lower()
+  if c:find("tv") or c:find("tele") or c:find("projector") then return "tv" end
+  if c:find("fan") then return "fan" end
+  if c:find("audio") or c:find("amp") or c:find("receiver") or c:find("sound") or c:find("speaker") or c:find("cd") then return "audio" end
+  if c:find("air") or c:find("ac") then return "ac" end
+  return "other"
+end
+
+-- =============================================================================
+-- SYNC WITH VOICE HUB (127.0.0.1:8996)
+-- =============================================================================
+
+local function sync_cfg_to_hub(patch)
+  local cfg = load_s06_cfg()
+  for k, v in pairs(patch) do cfg[k] = v end
+  write_atomic(S06_CFG_FILE, cjson.encode(cfg), "600")
+  if patch.ac_brand then
+    http_get_json(HUB_HTTP .. "/s06/brand?brand=" .. url_encode(patch.ac_brand), 2)
+  end
+end
+
+-- =============================================================================
+-- RPCD HANDLERS
+-- =============================================================================
+
+local function read_stdin_json()
+  local raw = io.read("*a") or ""
+  if raw == "" then return {} end
+  local ok, dec = pcall(cjson.decode, raw)
+  return (ok and type(dec) == "table") and dec or {}
+end
+
+local function out_json(tbl)
+  io.write(cjson.encode(tbl))
+end
+
+local cmd = arg[1]
+if cmd == "list" then
+  out_json({
+    status = {},
+    scanHubs = {},
+    saveHubConfig = { ip = "string", mac = "string", device_id = "string", local_key = "string", control_type = 0 },
+    searchCatalog = { query = "string", category = "string", include_online = true },
+    testCatalogItem = { catalog_id = "string", irdb_path = "string", dry_run = true },
+    addDevice = { catalog_id = "string", irdb_path = "string", name = "string", room = "string" },
+    removeDevice = { id = "string" },
+    controlDevice = { id = "string", op = "string", value = "string", button = "string", dry_run = true },
+    learnButton = { id = "string", button = "string", label = "string" },
+  })
+  return
+end
+
+if cmd == "call" then
+  local method = arg[2]
+  local params = read_stdin_json()
+  local cfg = load_s06_cfg()
+  local devs = load_devices(cfg)
+
+  if method == "status" then
+    local hub = get_live_hub_info(cfg, true)
+    local tvs = {}
+    local raw_tvs = read_file(HUB_DEV_FILE)
+    if raw_tvs and raw_tvs ~= "" then
+      local ok, tlist = pcall(cjson.decode, raw_tvs)
+      if ok and type(tlist) == "table" then
+        for _, tv in ipairs(tlist) do
+          tvs[#tvs + 1] = { id = tv.id, name = tv.name, brand = tv.brand, ip = tv.ip }
+        end
+      end
+    end
+    out_json({ ok = true, hub = hub, devices = devs, lan_tvs = tvs })
+
+  elseif method == "scanHubs" then
+    local host_map = {}
+    local dl = read_file("/tmp/dhcp.leases") or ""
+    for line in dl:gmatch("[^\r\n]+") do
+      local _, mac, ip, hname = line:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)")
+      if ip and mac and ip:match("^192%.168%.%d+%.%d+$") and ip ~= "192.168.1.1" then
+        host_map[ip] = { ip = ip, mac = mac:lower(), name = (hname ~= "*") and hname or "" }
+      end
+    end
+    local arp = read_file("/proc/net/arp") or ""
+    for line in arp:gmatch("[^\r\n]+") do
+      local ip, _, _, mac = line:match("^(192%.168%.%d+%.%d+)%s+%S+%s+%S+%s+([%x:]+)")
+      if ip and mac and mac ~= "00:00:00:00:00:00" and ip ~= "192.168.1.1" then
+        local cur = host_map[ip] or { ip = ip, name = "" }
+        cur.mac = mac:lower()
+        host_map[ip] = cur
+      end
+    end
+    if cfg.ip and cfg.ip ~= "" then
+      local cur = host_map[cfg.ip] or { ip = cfg.ip, mac = (cfg.mac or ""):lower(), name = "S06 Pro (Đã lưu)" }
+      host_map[cfg.ip] = cur
+    end
+    local candidates = {}
+    for ip, h in pairs(host_map) do
+      if tcp_open(ip, 6668, 220) then
+        candidates[#candidates + 1] = {
+          ip = ip,
+          mac = h.mac or "",
+          name = (h.name and h.name ~= "") and h.name or ("Tuya IR Hub (" .. ip .. ")"),
+          is_current = (ip == cfg.ip),
+        }
+      end
+    end
+    out_json({ ok = true, hubs = candidates, current = get_live_hub_info(cfg, false) })
+
+  elseif method == "saveHubConfig" then
+    local ip = trim(params.ip)
+    local mac = trim(params.mac):lower()
+    local did = trim(params.device_id)
+    local lk = trim(params.local_key)
+    local ct = tonumber(params.control_type)
+    local patch = {}
+    if ip:match("^%d+%.%d+%.%d+%.%d+$") then patch.ip = ip end
+    if mac:match("^[%x:]+$") then patch.mac = mac end
+    if did ~= "" then patch.device_id = did end
+    if lk ~= "" then
+      if #lk ~= 16 then
+        out_json({ ok = false, message = "Local Key Tuya phải đủ đúng 16 ký tự" })
+        return
+      end
+      patch.local_key = lk
+    end
+    if ct and (ct == 1 or ct == 2) then patch.control_type = ct end
+    sync_cfg_to_hub(patch)
+    local fresh = load_s06_cfg()
+    out_json({ ok = true, message = "Đã lưu cấu hình Hub S06 Pro (chmod 600)", hub = get_live_hub_info(fresh, true) })
+
+  elseif method == "searchCatalog" then
+    local q = trim(params.query or ""):lower()
+    local cat_filter = trim(params.category or "all"):lower()
+    local include_online = (params.include_online == true or cat_filter == "irdb")
+    local tokens = {}
+    for tok in q:gmatch("%S+") do tokens[#tokens + 1] = tok end
+
+    local results = {}
+    if cat_filter ~= "irdb" then
+      for _, it in ipairs(BUILTIN_CATALOG) do
+        if cat_filter == "all" or it.category == cat_filter then
+          local match = true
+          for _, tk in ipairs(tokens) do
+            if not it.search:find(tk, 1, true) and not it.name:lower():find(tk, 1, true) then
+              match = false; break
+            end
+          end
+          if match then
+            results[#results + 1] = {
+              id = it.id,
+              source = "builtin",
+              category = it.category,
+              type = it.type,
+              brand = it.brand,
+              name = it.name,
+              subtitle = it.subtitle,
+              button_count = it.buttons and #it.buttons or nil,
+            }
+          end
+        end
+      end
+    end
+
+    if include_online or (#tokens > 0 and #results < 5) then
+      local idx = ensure_irdb_index()
+      if idx then
+        local online_cnt = 0
+        for line in idx:gmatch("[^\r\n]+") do
+          local low = line:lower()
+          local match = true
+          for _, tk in ipairs(tokens) do
+            if not low:find(tk, 1, true) then match = false; break end
+          end
+          if match then
+            local b_brand, b_cat, b_model = line:match("^([^/]+)/([^/]+)/(.+)%.csv$")
+            if b_brand and b_cat then
+              local inferred = infer_irdb_category(b_cat)
+              if cat_filter == "all" or cat_filter == "irdb" or inferred == cat_filter then
+                results[#results + 1] = {
+                  id = "irdb:" .. line,
+                  irdb_path = line,
+                  source = "irdb",
+                  category = inferred,
+                  type = "ir_remote",
+                  brand = b_brand,
+                  name = b_brand .. " — " .. b_cat:gsub("_", " "),
+                  subtitle = "Kho Online IRDB (" .. (b_model or "") .. ")",
+                }
+                online_cnt = online_cnt + 1
+                if online_cnt >= 25 or #results >= 40 then break end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    out_json({ ok = true, results = results, online_cached = (read_file(IRDB_CACHE) ~= nil) })
+
+  elseif method == "testCatalogItem" then
+    local cid = trim(params.catalog_id)
+    local ipath = trim(params.irdb_path)
+    local dry = (params.dry_run == true)
+    local pkt, label_tested
+
+    if cid ~= "" and BUILTIN_BY_ID[cid] then
+      local item = BUILTIN_BY_ID[cid]
+      if item.type == "ac" and ok_ac then
+        pkt = ac_ir.encode(item.brand, { power = true, temp = 26, mode = "cool", fan = "auto", swing = false }, "on")
+        label_tested = item.name .. " (Bật 26°C)"
+      elseif item.buttons then
+        for _, b in ipairs(item.buttons) do
+          if b.proto and ok_ac and ac_ir.supports_generic(b.proto) then
+            pkt = ac_ir.encode_generic(b.proto, b.dev, b.sub, b.fn)
+            label_tested = item.name .. " — " .. b.label
+            break
+          end
+        end
+      end
+    elseif ipath ~= "" then
+      local btns, err = fetch_irdb_csv_buttons(ipath)
+      if not btns then
+        out_json({ ok = false, message = "Không tải được hoặc chưa hỗ trợ chuẩn IR của file này: " .. tostring(err) })
+        return
+      end
+      local b = btns[1]
+      pkt = ac_ir.encode_generic(b.proto, b.dev, b.sub, b.fn)
+      label_tested = ipath .. " — " .. b.label
+    end
+
+    if not pkt then
+      out_json({ ok = false, message = "Mẫu này dùng chế độ Học phím thủ công — hãy Thêm rồi bấm Học từng nút bằng remote thật!" })
+      return
+    end
+    if dry then
+      out_json({ ok = true, dry_run = true, tested = label_tested, protocol = pkt.protocol, head_len = #pkt.head, key_len = #pkt.key })
+      return
+    end
+    if not ok_tuya or #(cfg.local_key or "") ~= 16 then
+      out_json({ ok = false, message = "S06 Pro chưa có Local Key 16 ký tự" })
+      return
+    end
+    heal_hub_ip(cfg)
+    local ok, err = tuya_v35.send_head_key(cfg.ip, cfg.device_id, cfg.local_key, pkt.head, pkt.key, cfg.control_type)
+    out_json({ ok = ok and true or false, message = ok and ("Đã bắn thử sóng [" .. label_tested .. "] (" .. pkt.protocol .. ") qua S06 Pro!") or ("Lỗi gửi: " .. tostring(err)) })
+
+  elseif method == "addDevice" then
+    local cid = trim(params.catalog_id)
+    local ipath = trim(params.irdb_path)
+    local custom_name = trim(params.name)
+    local room = trim(params.room)
+    if room == "" then room = "Phòng khách" end
+    local new_dev
+
+    if cid ~= "" and BUILTIN_BY_ID[cid] then
+      local it = BUILTIN_BY_ID[cid]
+      local did = cid .. "_" .. tostring(os.time()) .. "_" .. tostring(#devs + 1)
+      if it.type == "ac" then
+        new_dev = {
+          id = did,
+          name = (custom_name ~= "") and custom_name or it.name,
+          room = room,
+          category = "ac",
+          type = "ac",
+          brand = it.brand,
+          brand_label = ok_ac and ac_ir.get_brand_info(it.brand).label or it.brand,
+          source = "builtin",
+          state = { power = false, temp = 26, mode = "cool", fan = "auto", swing = false },
+          buttons = {},
+        }
+        sync_cfg_to_hub({ ac_brand = it.brand })
+      else
+        local btns = {}
+        for _, b in ipairs(it.buttons or {}) do
+          btns[#btns + 1] = { id = b.id, label = b.label, proto = b.proto, dev = b.dev, sub = b.sub, fn = b.fn }
+        end
+        new_dev = {
+          id = did,
+          name = (custom_name ~= "") and custom_name or it.name,
+          room = room,
+          category = it.category,
+          type = it.type,
+          brand = it.brand,
+          source = "builtin",
+          buttons = btns,
+        }
+      end
+    elseif ipath ~= "" then
+      local btns, err = fetch_irdb_csv_buttons(ipath)
+      if not btns then
+        out_json({ ok = false, message = "Không thêm được từ IRDB: " .. tostring(err) })
+        return
+      end
+      local b_brand, b_cat = ipath:match("^([^/]+)/([^/]+)/")
+      local did = "irdb_" .. tostring(os.time()) .. "_" .. tostring(#devs + 1)
+      new_dev = {
+        id = did,
+        name = (custom_name ~= "") and custom_name or ((b_brand or "IR") .. " " .. (b_cat or "Remote"):gsub("_", " ")),
+        room = room,
+        category = infer_irdb_category(b_cat),
+        type = "ir_remote",
+        brand = b_brand or "IRDB",
+        source = "irdb",
+        irdb_path = ipath,
+        buttons = btns,
+      }
+    else
+      out_json({ ok = false, message = "Thiếu catalog_id hoặc irdb_path" })
+      return
+    end
+
+    devs[#devs + 1] = new_dev
+    save_devices(devs)
+    out_json({ ok = true, message = "Đã thêm thiết bị: " .. new_dev.name, device = new_dev, devices = devs })
+
+  elseif method == "removeDevice" then
+    local did = trim(params.id)
+    local kept = {}
+    local removed = false
+    for _, d in ipairs(devs) do
+      if d.id == did then removed = true else kept[#kept + 1] = d end
+    end
+    save_devices(kept)
+    out_json({ ok = removed, message = removed and "Đã xóa thiết bị" or "Không tìm thấy thiết bị", devices = kept })
+
+  elseif method == "controlDevice" then
+    local did = trim(params.id)
+    local op = trim(params.op)
+    local val = trim(params.value)
+    local btn_id = trim(params.button)
+    local dry = (params.dry_run == true)
+
+    local target = nil
+    for _, d in ipairs(devs) do if d.id == did then target = d; break end end
+    if not target then out_json({ ok = false, message = "Không tìm thấy thiết bị" }); return end
+
+    if not dry and (not ok_tuya or #(cfg.local_key or "") ~= 16) then
+      out_json({ ok = false, message = "S06 Pro chưa có Local Key 16 ký tự" })
+      return
+    end
+    heal_hub_ip(cfg)
+
+    if target.type == "ac" and ok_ac then
+      local st = target.state or { power = false, temp = 26, mode = "cool", fan = "auto", swing = false }
+      local prev_pwr = st.power and true or false
+      local enc_op = "set"
+      if op == "on" then st.power = true; enc_op = "on"
+      elseif op == "off" then st.power = false; enc_op = "off"
+      elseif op == "temp_up" then st.temp = math.min(30, (tonumber(st.temp) or 26) + 1); st.power = true
+      elseif op == "temp_down" then st.temp = math.max(16, (tonumber(st.temp) or 26) - 1); st.power = true
+      elseif op == "set_temp" then st.temp = math.min(30, math.max(16, tonumber(val) or 26)); st.power = true
+      elseif op == "mode" and val ~= "" then st.mode = val; st.power = true
+      elseif op == "fan" and val ~= "" then st.fan = val; st.power = true; enc_op = "fan"
+      elseif op == "swing" then st.swing = not (st.swing and true or false); st.power = true; enc_op = "swing"
+      elseif op == "next_variant" then
+        target.brand = ac_ir.next_variant(target.brand)
+        target.brand_label = ac_ir.get_brand_info(target.brand).label
+        target.state = st
+        save_devices(devs)
+        sync_cfg_to_hub({ ac_brand = target.brand })
+        out_json({ ok = true, message = "Đã đổi mã sang: " .. target.brand_label, device = target })
+        return
+      end
+      st.was_on = prev_pwr
+      local pkt = ac_ir.encode(target.brand or "lg2", st, enc_op)
+      if not pkt then out_json({ ok = false, message = "Lỗi mã hóa AC brand: " .. tostring(target.brand) }); return end
+      local ok, err = true, nil
+      if not dry then
+        ok, err = tuya_v35.send_head_key(cfg.ip, cfg.device_id, cfg.local_key, pkt.head, pkt.key, cfg.control_type)
+      end
+      if ok then
+        target.state = st
+        save_devices(devs)
+        sync_cfg_to_hub({ ac_brand = target.brand, ac_temp = st.temp, ac_mode = st.mode, ac_fan = st.fan, ac_power = st.power, ac_swing = st.swing })
+      end
+      out_json({
+        ok = ok and true or false,
+        dry_run = dry,
+        protocol = pkt.protocol,
+        head_len = #pkt.head,
+        key_len = #pkt.key,
+        message = ok and ("Đã gửi lệnh " .. target.name .. " (" .. tostring(st.temp) .. "°C • " .. tostring(st.mode) .. ")") or ("Lỗi S06: " .. tostring(err)),
+        device = target,
+      })
+    else
+      local b_found = nil
+      for _, b in ipairs(target.buttons or {}) do
+        if b.id == btn_id then b_found = b; break end
+      end
+      if not b_found then out_json({ ok = false, message = "Không tìm thấy nút: " .. btn_id }); return end
+      if b_found.base64 and b_found.base64 ~= "" then
+        local ok, err = true, nil
+        if not dry then
+          ok, err = tuya_v35.send_ir(cfg.ip, cfg.device_id, cfg.local_key, b_found.base64, cfg.control_type)
+        end
+        out_json({ ok = ok and true or false, dry_run = dry, mode = "learned", message = ok and ("Đã bấm nút [" .. b_found.label .. "] (Mã đã học)") or ("Lỗi S06: " .. tostring(err)) })
+      elseif b_found.proto and ok_ac and ac_ir.supports_generic(b_found.proto) then
+        local pkt = ac_ir.encode_generic(b_found.proto, b_found.dev, b_found.sub, b_found.fn)
+        if not pkt then out_json({ ok = false, message = "Lỗi encode " .. tostring(b_found.proto) }); return end
+        local ok, err = true, nil
+        if not dry then
+          ok, err = tuya_v35.send_head_key(cfg.ip, cfg.device_id, cfg.local_key, pkt.head, pkt.key, cfg.control_type)
+        end
+        out_json({ ok = ok and true or false, dry_run = dry, mode = pkt.protocol, head_len = #pkt.head, key_len = #pkt.key, message = ok and ("Đã bấm nút [" .. b_found.label .. "] (" .. pkt.protocol .. ")") or ("Lỗi S06: " .. tostring(err)) })
+      else
+        out_json({ ok = false, need_learn = true, message = "Nút [" .. b_found.label .. "] chưa có mã IR — hãy bật Chế độ Học Phím rồi bấm vào nút này!" })
+      end
+    end
+
+  elseif method == "learnButton" then
+    local did = trim(params.id)
+    local btn_id = trim(params.button)
+    local btn_label = trim(params.label)
+    if not ok_tuya or #(cfg.local_key or "") ~= 16 then
+      out_json({ ok = false, message = "S06 Pro chưa có Local Key 16 ký tự" })
+      return
+    end
+    local target = nil
+    for _, d in ipairs(devs) do if d.id == did then target = d; break end end
+    if not target then out_json({ ok = false, message = "Không tìm thấy thiết bị" }); return end
+    if btn_id == "" then
+      btn_id = "custom_" .. tostring(os.time())
+    end
+    heal_hub_ip(cfg)
+    local code, ct_or_err = tuya_v35.learn_ir(cfg.ip, cfg.device_id, cfg.local_key, 12, cfg.control_type)
+    if not code then
+      out_json({ ok = false, message = "Hết 12s chưa nhận được tín hiệu remote (" .. tostring(ct_or_err) .. "). Hãy chĩa sát remote vào S06 Pro và thử lại." })
+      return
+    end
+    target.buttons = target.buttons or {}
+    local updated = false
+    for _, b in ipairs(target.buttons) do
+      if b.id == btn_id then
+        b.base64 = code
+        if btn_label ~= "" then b.label = btn_label end
+        updated = true; break
+      end
+    end
+    if not updated then
+      target.buttons[#target.buttons + 1] = { id = btn_id, label = (btn_label ~= "") and btn_label or btn_id, base64 = code }
+    end
+    save_devices(devs)
+
+    if target.category == "fan" then
+      local voice_map = { power = "fan_power", speed_up = "fan_speed_up", speed_down = "fan_speed_down", swing = "fan_swing", timer = "fan_timer" }
+      local vk = voice_map[btn_id]
+      if vk then
+        local fresh = load_s06_cfg()
+        fresh.ir_codes[vk] = code
+        write_atomic(S06_CFG_FILE, cjson.encode(fresh), "600")
+      end
+    end
+    out_json({ ok = true, message = "Đã học xong nút [" .. ((btn_label ~= "") and btn_label or btn_id) .. "]!", device = target })
+  else
+    out_json({ ok = false, message = "Unknown method: " .. tostring(method) })
+  end
+end
