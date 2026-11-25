@@ -115,6 +115,10 @@ encode_sierra_imei() {
 	echo "$out"
 }
 
+is_nss_soc() {
+	lsmod 2>/dev/null | grep -qE '^qca_nss_drv|^ecm ' || [ -d /sys/kernel/debug/qca-nss-drv ] || [ -d /sys/kernel/debug/ecm ]
+}
+
 get_current_ttl() {
 	if [ -f "$CUSTOM_TTL_NFT" ]; then
 		sed -n 's/.*ip ttl set \([0-9]*\).*/\1/p' "$CUSTOM_TTL_NFT" 2>/dev/null | head -n 1
@@ -139,6 +143,7 @@ case "$1" in
 				if [ -c "$port" ]; then
 					(
 						flock -x -w 4 9 2>/dev/null || exit 1
+						export _MODEM_AT_LOCKED=1
 						ati=$(run_at "$port" "ATI")
 						[ -z "$imei" ] && imei=$(get_modem_imei "$port")
 						vendor=$(detect_vendor "$port" "auto" "$ati")
@@ -199,6 +204,7 @@ EOF
 				ok_flag=0
 				(
 					flock -x -w 8 9 2>/dev/null || exit 1
+					export _MODEM_AT_LOCKED=1
 					ati=$(run_at "$port" "ATI")
 					brand=$(detect_vendor "$port" "$brand_in" "$ati")
 					old_imei=$(get_modem_imei "$port")
@@ -289,22 +295,40 @@ EOF
 				;;
 			setTTL)
 				val=$(echo "$input" | jsonfilter -e '$.ttl' 2>/dev/null | tr -cd '0-9')
+				OFFLOAD_SAVE="/etc/config/.doanduy_offload_saved"
 				if [ "$val" = "0" ]; then
 					rm -f "$CUSTOM_TTL_NFT" /tmp/custom_ttl.dat /etc/custom_ttl.dat 2>/dev/null
 					sysctl -w net.ipv4.ip_default_ttl=64 >/dev/null 2>&1
+					if [ -f "$OFFLOAD_SAVE" ] && ! is_nss_soc; then
+						saved_of=$(cat "$OFFLOAD_SAVE" 2>/dev/null)
+						sw_of="${saved_of%%|*}"
+						hw_of="${saved_of#*|}"
+						uci -q set "firewall.@defaults[0].flow_offloading=${sw_of:-1}"
+						uci -q set "firewall.@defaults[0].flow_offloading_hw=${hw_of:-1}"
+						uci commit firewall 2>/dev/null
+						rm -f "$OFFLOAD_SAVE"
+					fi
 					/etc/init.d/firewall reload >/dev/null 2>&1
-					echo '{"success":true,"ttl":64,"message":"Đã tắt ép TTL, khôi phục TTL mặc định (64)."}'
+					echo '{"success":true,"ttl":64,"message":"Đã tắt ép TTL, khôi phục TTL (64) & Flow Offload tối ưu tốc độ 5G!"}'
 				elif [ -n "$val" ] && [ "$val" -ge 1 ] && [ "$val" -le 255 ]; then
-					mkdir -p /etc/nftables.d
+					mkdir -p /etc/nftables.d /etc/config
 					echo "chain set_custom_ttl { type filter hook postrouting priority 300; policy accept; ip ttl set $val; }" > "$CUSTOM_TTL_NFT"
 					sysctl -w "net.ipv4.ip_default_ttl=$val" >/dev/null 2>&1
+					if [ ! -f "$OFFLOAD_SAVE" ]; then
+						cur_sw=$(uci -q get firewall.@defaults[0].flow_offloading || echo 0)
+						cur_hw=$(uci -q get firewall.@defaults[0].flow_offloading_hw || echo 0)
+						printf '%s|%s\n' "$cur_sw" "$cur_hw" > "$OFFLOAD_SAVE"
+					fi
+					uci -q set firewall.@defaults[0].flow_offloading='0'
+					uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+					uci commit firewall 2>/dev/null
 					/etc/init.d/firewall reload >/dev/null 2>&1
 					echo "$val" > /tmp/custom_ttl.dat
 					echo "$val" > /etc/custom_ttl.dat
 					json_init
 					json_add_boolean "success" 1
 					json_add_int "ttl" "$val"
-					json_add_string "message" "Đã ghim TTL = $val thành công!"
+					json_add_string "message" "Đã ghim TTL = $val (tự tạm tắt Flow Offload để ép TTL chuẩn 100%)!"
 					json_dump
 				else
 					echo '{"success":false,"message":"Giá trị TTL phải từ 1 đến 255 (hoặc 0 để tắt)!"}'
@@ -321,6 +345,7 @@ EOF
 				fi
 				out=$(
 					flock -x -w 5 9 2>/dev/null || exit 1
+					export _MODEM_AT_LOCKED=1
 					run_at "$port" "$cmd"
 				) 9>"$AT_LOCK" 2>/dev/null
 				json_init

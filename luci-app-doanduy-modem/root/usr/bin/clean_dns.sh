@@ -8,12 +8,6 @@ mkdir -p "$CONF_DIR" /etc/config 2>/dev/null
 enable_clean_dns() {
     mkdir -p "$CONF_DIR" /etc/config 2>/dev/null
     cat << 'EOF' > "$CONF_FILE"
-# Smart DNS Racer & Quad-Stack Parallel DNS Upstreams
-server=1.1.1.1
-server=8.8.8.8
-server=9.9.9.9
-server=203.113.131.1
-
 # Smart Clean DNS - Unblock international domains bypassing carrier censorship
 server=/medium.com/1.1.1.1
 server=/reddit.com/1.1.1.1

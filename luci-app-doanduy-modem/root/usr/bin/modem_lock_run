@@ -1,6 +1,10 @@
 #!/bin/sh
 [ "$#" -gt 0 ] || exit 1
+if [ "${_MODEM_AT_LOCKED:-0}" = "1" ]; then
+	exec "$@"
+fi
 mkdir -p /var/lock 2>/dev/null
+export _MODEM_AT_LOCKED=1
 if command -v flock >/dev/null 2>&1; then
 	exec 9>"/var/lock/modem_at.lock"
 	flock -x -w 6 9 || exit 1

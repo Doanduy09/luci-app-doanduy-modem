@@ -89,11 +89,10 @@ ensure_dnsmasq_config() {
         changed=1
     fi
     local router_ll=$(ip -6 addr show dev "$lan_dev" scope link 2>/dev/null | grep -o 'fe80::[0-9a-f:]*' | head -n 1)
-    if [ -n "$router_ll" ]; then
-        if ! uci get dhcp.lan.dns 2>/dev/null | grep -q "$router_ll"; then
-            uci add_list dhcp.lan.dns="$router_ll" 2>/dev/null
-            changed=1
-        fi
+    if [ -n "$router_ll" ] && [ "$(uci -q get dhcp.lan.dns)" != "$router_ll" ]; then
+        uci -q delete dhcp.lan.dns
+        uci add_list dhcp.lan.dns="$router_ll" 2>/dev/null
+        changed=1
     fi
     if [ "$changed" = "1" ]; then
         uci commit dhcp 2>/dev/null

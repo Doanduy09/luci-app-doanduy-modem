@@ -89,7 +89,28 @@ if [ -f /etc/config/firewall ]; then
     done
     uci add_list "firewall.${wan_zone}.network=duydoan_5g"
     uci add_list "firewall.${wan_zone}.network=duydoan_5g_6"
+    uci set "firewall.${wan_zone}.masq6=1"
+    uci set "firewall.${wan_zone}.mtu_fix=1"
     uci commit firewall
+fi
+
+# Cau hinh IPv6 NAT6 sach cho LAN (on dinh tuyet doi qua lan doi IP 5G Single-/64)
+if [ -f /etc/config/dhcp ]; then
+    uci -q set dhcp.lan.ra='server'
+    uci -q set dhcp.lan.dhcpv6='server'
+    uci -q delete dhcp.lan.ndp
+    uci -q set dhcp.lan.ra_default='1'
+    uci commit dhcp
+fi
+
+# Dong bo lock AT cho legacy /usr/bin/at_mux va go xung dot cu neu ton tai
+[ -f /usr/bin/at_mux ] && sed -i 's|^LOCK_FD_FILE=.*|LOCK_FD_FILE="/var/lock/modem_at.lock"|' /usr/bin/at_mux 2>/dev/null
+if command -v nft >/dev/null 2>&1 && nft list table inet game_booster >/dev/null 2>&1; then
+    gb_handle=$(nft -a list chain inet game_booster qos_boost 2>/dev/null | sed -n 's/.*maxseg size set 1420.*handle \([0-9]*\).*/\1/p' | head -n 1)
+    [ -n "$gb_handle" ] && nft delete rule inet game_booster qos_boost handle "$gb_handle" 2>/dev/null
+fi
+if [ -x /etc/init.d/adb-enablemodem ] && ! lsusb 2>/dev/null | grep -qi '2357:000d'; then
+    /etc/init.d/adb-enablemodem disable 2>/dev/null
 fi
 
 rm -f /etc/hotplug.d/net/25-wwan-autodial 2>/dev/null

@@ -390,6 +390,7 @@ safe_at_once() {
         *)
             (
                 acquire_fd_lock 9 4 || true
+                export _MODEM_AT_LOCKED=1
                 if command -v stty >/dev/null 2>&1; then
                     stty -F "$port" 115200 raw -echo -echoe -echok -echoctl -echoke -icrnl -onlcr 2>/dev/null || true
                 fi
@@ -958,6 +959,35 @@ clamp_mtu() {
     fi
 }
 
+apply_carrier_ipv6_route_mtu() {
+    local gw6="${1:-}" v6_mtu="" cur_rt="" has_g6=""
+    has_g6=$(ip -6 addr show dev "$IFNAME" scope global 2>/dev/null | head -n 1)
+    [ -n "$has_g6" ] || return 0
+
+    if [ -f "$LOG_FILE" ]; then
+        v6_mtu=$(sed -n 's/.*ipv6 mtu[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$LOG_FILE" 2>/dev/null | tail -n 1)
+    fi
+    case "$v6_mtu" in ''|*[!0-9]*) v6_mtu="" ;; esac
+    if [ -n "$v6_mtu" ]; then
+        [ "$v6_mtu" -lt 1280 ] && v6_mtu=1280
+        [ "$v6_mtu" -gt 1500 ] && v6_mtu=1500
+    elif [ "$MODE" = "fm350_usb" ]; then
+        v6_mtu=1360
+    else
+        return 0
+    fi
+
+    cur_rt=$(ip -6 route show dev "$IFNAME" default 2>/dev/null | head -n 1)
+    if [ -z "$cur_rt" ] || ! printf '%s' "$cur_rt" | grep -q "mtu ${v6_mtu}"; then
+        if [ -n "$gw6" ]; then
+            ip -6 route replace default via "$gw6" dev "$IFNAME" metric "$metric" mtu "$v6_mtu" 2>/dev/null || \
+                ip -6 route replace default dev "$IFNAME" metric "$metric" mtu "$v6_mtu" 2>/dev/null || true
+        else
+            ip -6 route replace default dev "$IFNAME" metric "$metric" mtu "$v6_mtu" 2>/dev/null || true
+        fi
+    fi
+}
+
 publish_netifd_up() {
     local v4="$1" m4="$2" gw4="$3" v6="$4" m6="$5" gw6="$6" extra_dns="$7"
     local d added_dns=""
@@ -995,6 +1025,9 @@ publish_netifd_up() {
         proto_add_dns_server "2001:4860:4860::8888"
     fi
     proto_send_update "$interface"
+    if [ -n "$v6" ] || [ -n "$(ip -6 addr show dev "$IFNAME" scope global 2>/dev/null | head -n 1)" ]; then
+        apply_carrier_ipv6_route_mtu "$gw6"
+    fi
 }
 
 run_uqmi_fallback() {
@@ -1248,6 +1281,7 @@ run_fm350_usb_dial() {
         last_sig="${v4}|${gw4}|${v6}"
         publish_netifd_up "$v4" "24" "$gw4" "$v6" "64" "" "$dns4"
         [ -z "$v6" ] && ensure_dynamic_dhcpv6
+        apply_carrier_ipv6_route_mtu ""
         logger -t duydoan5g "FM350 USB connected! IP: $v4, GW: $gw4, DNS: ${dns4:-fallback}, IPv6: ${v6:-dhcpv6}"
 
         local miss=0
@@ -1257,6 +1291,7 @@ run_fm350_usb_dial() {
             detach_bridge_master
             ip link set dev "$IFNAME" arp off 2>/dev/null || true
             clamp_mtu
+            [ -z "$v6" ] && apply_carrier_ipv6_route_mtu ""
             cgp=$(safe_at_once "$AT_PORT" "AT+CGPADDR=$active_cid")
             v4=$(extract_cgpaddr_ipv4 "$cgp")
             v6=$(extract_cgpaddr_ipv6 "$cgp")

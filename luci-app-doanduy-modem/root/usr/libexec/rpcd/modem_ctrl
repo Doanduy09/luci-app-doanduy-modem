@@ -161,6 +161,7 @@ read_rf_telemetry_cached() {
 
 	(
 		flock -x -n 9 2>/dev/null || exit 1
+		export _MODEM_AT_LOCKED=1
 		local cops_out act_num cgmm_out cgsn_out rf_out lte_line nr_line temp_out max_t
 		local rsrp="" rsrq="" sinr="" band="" rat="" csq="" pct="" op="" model="" imei="" extra=""
 
