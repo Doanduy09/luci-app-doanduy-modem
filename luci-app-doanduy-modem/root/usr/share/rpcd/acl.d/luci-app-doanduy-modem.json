@@ -11,6 +11,7 @@
 				"doanduy.remote": [ "*" ],
 				"doanduy.vault": [ "*" ],
 				"doanduy.opt": [ "*" ],
+				"doanduy.smarthome": [ "*" ],
 				"network.interface": [ "dump", "status" ],
 				"uci": [ "get", "changes" ]
 			},
@@ -26,6 +27,7 @@
 				"doanduy.remote": [ "*" ],
 				"doanduy.vault": [ "*" ],
 				"doanduy.opt": [ "*" ],
+				"doanduy.smarthome": [ "*" ],
 				"uci": [ "set", "commit", "apply" ]
 			},
 			"uci": [ "network", "system", "firewall", "dhcp" ]
