@@ -142,14 +142,14 @@ jobs:
           [ "${IPKG_NO_SCRIPT:-0}" = "1" ] && exit 0
           [ -n "${IPKG_INSTROOT:-}" ] && exit 0
           [ -n "${APK_INSTALL_ROOT:-}" ] && exit 0
-          if [ -x /etc/uci-defaults/99-luci-app-doanduy-modem ]; then
-              /bin/sh /etc/uci-defaults/99-luci-app-doanduy-modem && rm -f /etc/uci-defaults/99-luci-app-doanduy-modem
+          [ -f /etc/uci-defaults/99-luci-app-doanduy-modem.apk-new ] && mv -f /etc/uci-defaults/99-luci-app-doanduy-modem.apk-new /etc/uci-defaults/99-luci-app-doanduy-modem
+          if [ -f /etc/uci-defaults/99-luci-app-doanduy-modem ]; then
+              /bin/sh /etc/uci-defaults/99-luci-app-doanduy-modem >/dev/null 2>&1 </dev/null && rm -f /etc/uci-defaults/99-luci-app-doanduy-modem
           fi
-          rm -f /www/cgi-bin/sim_manager /usr/bin/wwan_smart_dialer.sh 2>/dev/null
-          rm -f /tmp/luci-indexcache* 2>/dev/null
-          rm -rf /tmp/luci-modulecache 2>/dev/null
-          /etc/init.d/rpcd restart 2>/dev/null || true
-          /etc/init.d/uhttpd restart 2>/dev/null || true
+          rm -f /www/cgi-bin/sim_manager /usr/bin/wwan_smart_dialer.sh /tmp/luci-indexcache* 2>/dev/null || true
+          rm -rf /tmp/luci-modulecache 2>/dev/null || true
+          /etc/init.d/rpcd restart >/dev/null 2>&1 </dev/null || true
+          /etc/init.d/uhttpd restart >/dev/null 2>&1 </dev/null || true
           exit 0
           EOF
           sed -i 's/^[[:space:]]*//' build_staging/postinst_common.sh
@@ -224,21 +224,24 @@ jobs:
           sed -i 's/^[[:space:]]*//' build_staging/apk/scripts/pre-deinstall
           chmod 755 build_staging/apk/scripts/post-install build_staging/apk/scripts/post-upgrade build_staging/apk/scripts/pre-deinstall
 
-          fakeroot "$APK_BIN" mkpkg \
-            --info "name:luci-app-doanduy-modem" \
-            --info "version:${PKG_VER}-r${PKG_REL}" \
-            --info "description:Quan Tri Modem 5G PCIe & USB, SMS Engine, Auto-Renew, AI Sentinel & Dieu Khien Nha" \
-            --info "arch:noarch" \
-            --info "license:GPL-3.0-or-later" \
-            --info "origin:feeds/luci/applications/luci-app-doanduy-modem" \
-            --info "url:https://github.com/Doanduy09/luci-app-doanduy-modem" \
-            --info "maintainer:DOANDUY <doanduy09@gmail.com>" \
-            --script "post-install:build_staging/apk/scripts/post-install" \
-            --script "post-upgrade:build_staging/apk/scripts/post-upgrade" \
-            --script "pre-deinstall:build_staging/apk/scripts/pre-deinstall" \
-            --info "depends:luci-base rpcd ubus jsonfilter atinout ca-bundle lua lua-cjson luci-lib-nixio" \
-            --files "build_staging/apk/data" \
-            --output "$APK_FILE"
+          fakeroot bash -c '
+            chown -R 0:0 build_staging/apk
+            "'"$APK_BIN"'" mkpkg \
+              --info "name:luci-app-doanduy-modem" \
+              --info "version:'"${PKG_VER}-r${PKG_REL}"'" \
+              --info "description:Quan Tri Modem 5G PCIe & USB, SMS Engine, Auto-Renew, AI Sentinel & Dieu Khien Nha" \
+              --info "arch:noarch" \
+              --info "license:GPL-3.0-or-later" \
+              --info "origin:feeds/luci/applications/luci-app-doanduy-modem" \
+              --info "url:https://github.com/Doanduy09/luci-app-doanduy-modem" \
+              --info "maintainer:DOANDUY <doanduy09@gmail.com>" \
+              --script "post-install:build_staging/apk/scripts/post-install" \
+              --script "post-upgrade:build_staging/apk/scripts/post-upgrade" \
+              --script "pre-deinstall:build_staging/apk/scripts/pre-deinstall" \
+              --info "depends:luci-base rpcd ubus jsonfilter atinout ca-bundle lua lua-cjson luci-lib-nixio" \
+              --files "build_staging/apk/data" \
+              --output "'"$APK_FILE"'"
+          '
           ls -lh "$APK_FILE"
 
       - name: Verify Dual IPK & APK Packages + Generate SHA256
