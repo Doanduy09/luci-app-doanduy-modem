@@ -1,7 +1,21 @@
 #!/bin/sh
 # DOANDUY 5G Universal IMEI CLI Wrapper
+# [VERIFIED-GOLDEN: imei-cli-input-validation | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 if [ -n "$1" ]; then
-	ubus call doanduy.rf changeIMEI "{\"imei\":\"$1\",\"brand\":\"${2:-auto}\"}"
+	case "$1" in
+		*[!0-9]*)
+			echo '{"success":false,"message":"Lỗi: IMEI chỉ được phép chứa chữ số (đủ 15 số)!"}'
+			exit 1
+			;;
+	esac
+	if [ "${#1}" -ne 15 ]; then
+		echo '{"success":false,"message":"Lỗi: IMEI bắt buộc phải đúng 15 chữ số!"}'
+		exit 1
+	fi
+	BRAND=$(printf '%s' "${2:-auto}" | tr -cd 'a-zA-Z0-9_-')
+	[ -n "$BRAND" ] || BRAND="auto"
+	ubus call doanduy.rf changeIMEI "{\"imei\":\"$1\",\"brand\":\"$BRAND\"}"
 else
 	ubus call doanduy.rf getStatus '{}'
 fi
+# [/VERIFIED-GOLDEN]

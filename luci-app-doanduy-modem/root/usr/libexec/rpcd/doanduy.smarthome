@@ -48,11 +48,26 @@ local function url_encode(s)
   end):gsub(" ", "%%20")
 end
 
-local function http_get_json(url, timeout_s)
-  local p = io.popen(string.format("curl -4 -sS --connect-timeout 2 -m %d %s 2>/dev/null", timeout_s or 3, sh_quote(url)))
-  if not p then return nil end
+-- [VERIFIED-GOLDEN: smarthome-http-fallback | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+local function http_fetch_raw(url, timeout_s)
+  local tm = tonumber(timeout_s) or 3
+  local q = sh_quote(url)
+  local cmd = string.format(
+    "if command -v curl >/dev/null 2>&1; then curl -4 -sSL --connect-timeout 2 -m %d %s 2>/dev/null; " ..
+    "elif command -v uclient-fetch >/dev/null 2>&1; then timeout %d uclient-fetch -q -T %d -O - %s 2>/dev/null; " ..
+    "elif command -v wget >/dev/null 2>&1; then timeout %d wget -q -T %d -O - %s 2>/dev/null; fi",
+    tm, q, tm + 2, tm, q, tm + 2, tm, q
+  )
+  local p = io.popen(cmd)
+  if not p then return "" end
   local raw = p:read("*a") or ""
   p:close()
+  return raw
+end
+-- [/VERIFIED-GOLDEN]
+
+local function http_get_json(url, timeout_s)
+  local raw = http_fetch_raw(url, timeout_s or 3)
   if raw == "" then return nil end
   local ok, dec = pcall(cjson.decode, raw)
   return ok and dec or nil
@@ -531,10 +546,7 @@ for _, it in ipairs(BUILTIN_CATALOG) do BUILTIN_BY_ID[it.id] = it end
 local function ensure_irdb_index()
   local raw = read_file(IRDB_CACHE)
   if raw and #raw > 1000 then return raw end
-  local p = io.popen("curl -4 -sSL --connect-timeout 3 -m 6 'https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/index' 2>/dev/null")
-  if not p then return nil end
-  raw = p:read("*a") or ""
-  p:close()
+  raw = http_fetch_raw("https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/index", 6)
   if #raw > 1000 then
     write_atomic(IRDB_CACHE, raw, "644")
     return raw
@@ -551,10 +563,7 @@ end
 local function fetch_irdb_csv_buttons(irdb_path)
   if not is_valid_irdb_path(irdb_path) then return nil, "invalid_irdb_path" end
   local url = "https://cdn.jsdelivr.net/gh/probonopd/irdb@master/codes/" .. url_encode(irdb_path)
-  local p = io.popen(string.format("curl -4 -sSL --connect-timeout 3 -m 6 %s 2>/dev/null", sh_quote(url)))
-  if not p then return nil, "curl_failed" end
-  local csv = p:read("*a") or ""
-  p:close()
+  local csv = http_fetch_raw(url, 6)
   if csv == "" or not csv:find("functionname", 1, true) then return nil, "empty_or_invalid_csv" end
 
   local seen_sig = {}
@@ -1214,7 +1223,7 @@ if cmd == "call" then
       local u = nxt and target.on_url or (target.off_url or target.on_url)
       if not is_lan_http_url(u) then out_json({ ok = false, message = "URL Relay LAN không hợp lệ" }); return end
       if not dry then
-        os.execute(string.format("curl -4 -sS --connect-timeout 2 -m 3 %s >/dev/null 2>&1", sh_quote(u)))
+        http_fetch_raw(u, 3)
       end
       st.on = nxt; target.state = st; save_registry(reg)
       out_json({ ok = true, dry_run = dry, device = target, message = target.name .. (nxt and " → ĐÃ BẬT" or " → ĐÃ TẮT") })

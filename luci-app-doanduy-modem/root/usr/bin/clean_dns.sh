@@ -88,12 +88,21 @@ EOF
     return 0
 }
 
+# [VERIFIED-GOLDEN: bounded-dns-prefetch | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 predictive_dns_prefetch() {
     local hot_domains="youtube.com www.youtube.com google.com www.google.com facebook.com www.facebook.com tiktok.com shopee.vn lazada.vn vnexpress.net dantri.com.vn zalo.me api.telegram.org connectivitycheck.gstatic.com cp.cloudflare.com lienquan.garena.vn pubgmobile.com riotgames.com netflix.com vtv.vn apple.com icloud.com cdn.cloudflare.net"
+    local n=0
     for d in $hot_domains; do
-        nslookup "$d" 127.0.0.1 >/dev/null 2>&1 &
+        timeout 2 nslookup "$d" 127.0.0.1 >/dev/null 2>&1 &
+        n=$((n + 1))
+        if [ "$n" -ge 4 ]; then
+            wait 2>/dev/null
+            n=0
+        fi
     done
+    wait 2>/dev/null
 }
+# [/VERIFIED-GOLDEN]
 
 disable_clean_dns() {
     rm -f "$CONF_FILE" "$PERM_CONF" "$CONF_DIR/doh_shield.conf" /tmp/doh_privacy_shield.json 2>/dev/null

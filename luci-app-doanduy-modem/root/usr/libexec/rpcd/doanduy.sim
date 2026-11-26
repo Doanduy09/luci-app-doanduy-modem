@@ -66,7 +66,7 @@ probe_live_iccid() {
 	for wp in /dev/wwan0at0 /dev/mhi_DUN; do
 		if [ -c "$wp" ] && [ -x /usr/bin/read_pcie_sms.lua ]; then
 			for cmd in "AT+ICCID" "AT+QCCID"; do
-				resp=$(/usr/bin/read_pcie_sms.lua -p "$wp" --at "$cmd" 2>/dev/null)
+				resp=$(timeout 4 /usr/bin/read_pcie_sms.lua -p "$wp" --at "$cmd" 2>/dev/null)
 				iccid=$(printf '%s\n' "$resp" | grep -oE '[0-9]{18,22}' | head -n 1)
 				[ ${#iccid} -ge 18 ] && { printf '%s' "$iccid"; return 0; }
 				echo "$resp" | grep -qiE 'not inserted|SIM failure' && EXPLICIT_ABSENT=1

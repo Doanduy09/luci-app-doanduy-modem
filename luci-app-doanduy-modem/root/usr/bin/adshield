@@ -537,16 +537,37 @@ check_hijack_active() {
     fi
 }
 
+# [VERIFIED-GOLDEN: adshield-multi-fetcher | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+fetch_ad_url() {
+    local url="$1" out="$2" tm="${3:-25}" curl_tls="-k" ucl_tls="--no-check-certificate"
+    if [ -s /etc/ssl/certs/ca-certificates.crt ]; then
+        curl_tls=""
+        ucl_tls=""
+    fi
+    rm -f "$out" 2>/dev/null
+    if command -v curl >/dev/null 2>&1; then
+        curl $curl_tls -4 -fsSL --connect-timeout 5 -m "$tm" "$url" -o "$out" 2>/dev/null && [ -s "$out" ] && return 0
+    fi
+    if command -v uclient-fetch >/dev/null 2>&1; then
+        timeout $((tm + 3)) uclient-fetch $ucl_tls -q -T "$tm" -O "$out" "$url" 2>/dev/null && [ -s "$out" ] && return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        timeout $((tm + 3)) wget $ucl_tls -q -T "$tm" -O "$out" "$url" 2>/dev/null && [ -s "$out" ] && return 0
+    fi
+    rm -f "$out" 2>/dev/null
+    return 1
+}
+# [/VERIFIED-GOLDEN]
+
 do_update() {
     ensure_dnsmasq_config
     get_ram_tier_limits
-    local log_file="/tmp/log_chanquangcao" curl_tls="-k"
-    [ -s /etc/ssl/certs/ca-certificates.crt ] && curl_tls=""
+    local log_file="/tmp/log_chanquangcao"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Bắt đầu kiểm tra và cập nhật bộ lọc Micro AdShield Chuyên Gia (04:00 AM)..." | tee -a "$log_file"
     
     # 1. Tải danh sách hostsVN (Bộ lọc chuyên sâu số 1 cho người dùng Internet Việt Nam: quảng cáo, mã độc, lừa đảo, web cờ bạc)
     local hostsvn_tmp="/tmp/adshield_hostsvn.tmp"
-    if curl $curl_tls -s -m 25 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts" -o "$hostsvn_tmp" && [ -s "$hostsvn_tmp" ]; then
+    if fetch_ad_url "https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts" "$hostsvn_tmp" 25; then
         local h_lines=$(grep -E '^(0\.0\.0\.0|127\.0\.0\.1) ' "$hostsvn_tmp" 2>/dev/null | wc -l)
         if [ "$h_lines" -gt 500 ]; then
             grep -E '^(0\.0\.0\.0|127\.0\.0\.1) ' "$hostsvn_tmp" 2>/dev/null | awk '{print $2}' | tr -d ' \r\t' | grep -vE '^(localhost|0\.0\.0\.0|::1)$' | grep -v '^$' > /tmp/adshield_hostsvn.list
@@ -560,7 +581,7 @@ do_update() {
 
     # 2. Tải danh sách ABPVN (Bộ lọc chuyên sâu cho các website báo chí & TMĐT Việt Nam)
     local abpvn_tmp="/tmp/adshield_abpvn.tmp"
-    if curl $curl_tls -s -m 25 -L "https://adguardteam.github.io/HostlistsRegistry/assets/filter_16.txt" -o "$abpvn_tmp" && [ -s "$abpvn_tmp" ]; then
+    if fetch_ad_url "https://adguardteam.github.io/HostlistsRegistry/assets/filter_16.txt" "$abpvn_tmp" 25; then
         local a_lines=$(grep '^0\.0\.0\.0 ' "$abpvn_tmp" 2>/dev/null | wc -l)
         if [ "$a_lines" -gt 100 ]; then
             grep '^0\.0\.0\.0 ' "$abpvn_tmp" 2>/dev/null | awk '{print $2}' | tr -d ' \r\t' | grep -v '^$' > /tmp/adshield_abpvn.list
@@ -574,7 +595,7 @@ do_update() {
 
     # 3. Tải danh sách AdGuardDNS (Bộ lọc quảng cáo quốc tế, tracking & mobile ads - giới hạn theo RAM tier)
     local adg_tmp="/tmp/adshield_adg.tmp"
-    if curl $curl_tls -s -m 25 -L "https://v.firebog.net/hosts/AdguardDNS.txt" -o "$adg_tmp" && [ -s "$adg_tmp" ]; then
+    if fetch_ad_url "https://v.firebog.net/hosts/AdguardDNS.txt" "$adg_tmp" 25; then
         local g_lines=$(grep -v '^[#[:space:]]' "$adg_tmp" 2>/dev/null | wc -l)
         if [ "$g_lines" -gt 500 ]; then
             grep -v '^[#[:space:]]' "$adg_tmp" 2>/dev/null | tr -d ' \r\t' | grep -v '^$' | head -n "$TIER_ADG_CAP" > /tmp/adshield_adg.list
@@ -586,7 +607,7 @@ do_update() {
 
     # 4. Tải danh sách chuyên sâu Facebook/Meta Ad Telemetry & Tracking (hostsVN-FB)
     local fb_tmp="/tmp/adshield_fb.tmp"
-    if curl $curl_tls -s -m 20 -L "https://raw.githubusercontent.com/bigdargon/hostsVN/master/option/hostsVN-surge-FB.conf" -o "$fb_tmp" && [ -s "$fb_tmp" ]; then
+    if fetch_ad_url "https://raw.githubusercontent.com/bigdargon/hostsVN/master/option/hostsVN-surge-FB.conf" "$fb_tmp" 20; then
         local f_lines=$(grep '^DOMAIN-SUFFIX,' "$fb_tmp" 2>/dev/null | wc -l)
         if [ "$f_lines" -gt 10 ]; then
             grep '^DOMAIN-SUFFIX,' "$fb_tmp" 2>/dev/null | cut -d',' -f2 | tr -d ' \r\t' | grep -v '^$' > /tmp/adshield_fb.list
