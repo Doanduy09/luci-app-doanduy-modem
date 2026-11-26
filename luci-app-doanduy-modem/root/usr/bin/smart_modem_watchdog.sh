@@ -97,6 +97,16 @@ is_quectel_modem() {
     echo "$m_type" | grep -iqE "quectel|2c7c:"
 }
 
+wd_run_to() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 wd_at_cmd() {
     local port="$1" cmd="$2" t="${3:-3}" out=""
     [ -c "$port" ] && [ -n "$cmd" ] || return 1
@@ -104,11 +114,11 @@ wd_at_cmd() {
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if command -v modem_lock_run >/dev/null 2>&1; then
                 if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                    out=$(modem_lock_run timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                    out=$(modem_lock_run wd_run_to "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
                 if command -v tom_modem >/dev/null 2>&1; then
-                    out=$(modem_lock_run timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                    out=$(modem_lock_run wd_run_to "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
                 return 1
@@ -116,11 +126,11 @@ wd_at_cmd() {
                 (
                     flock -x 9 2>/dev/null || true
                     if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                        out=$(timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                        out=$(wd_run_to "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
                         [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                     fi
                     if command -v tom_modem >/dev/null 2>&1; then
-                        out=$(timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                        out=$(wd_run_to "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
                         [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                     fi
                     exit 1
@@ -131,34 +141,34 @@ wd_at_cmd() {
         *)
             if command -v modem_lock_run >/dev/null 2>&1; then
                 if command -v sms_tool >/dev/null 2>&1; then
-                    out=$(modem_lock_run timeout "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
+                    out=$(modem_lock_run wd_run_to "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
                 if command -v tom_modem >/dev/null 2>&1; then
-                    out=$(modem_lock_run timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                    out=$(modem_lock_run wd_run_to "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
                 if command -v atinout >/dev/null 2>&1; then
-                    out=$(printf '%s\r\n' "$cmd" | modem_lock_run timeout "$t" atinout - "$port" - 2>/dev/null)
+                    out=$(printf '%s\r\n' "$cmd" | modem_lock_run wd_run_to "$t" atinout - "$port" - 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
                 if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                    out=$(modem_lock_run timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                    out=$(modem_lock_run wd_run_to "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
                 fi
             else
                 (
                     flock -x 9 2>/dev/null || true
                     if command -v sms_tool >/dev/null 2>&1; then
-                        out=$(timeout "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
+                        out=$(wd_run_to "$t" sms_tool -d "$port" at "$cmd" 2>/dev/null)
                         [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                     fi
                     if command -v atinout >/dev/null 2>&1; then
-                        out=$(printf '%s\r\n' "$cmd" | timeout "$t" atinout - "$port" - 2>/dev/null)
+                        out=$(printf '%s\r\n' "$cmd" | wd_run_to "$t" atinout - "$port" - 2>/dev/null)
                         [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                     fi
                     if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                        out=$(timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                        out=$(wd_run_to "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
                         [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                     fi
                     exit 1
