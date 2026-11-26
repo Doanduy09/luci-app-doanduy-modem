@@ -1,6 +1,30 @@
-# 🚀 LuCI App DoanDuy Modem & 5G Sentinel Suite
+# 🚀 LuCI App DoanDuy Modem & 5G Sentinel Suite (`v2.5.0` — Modular Scenarios)
 
-Ứng dụng quản trị chuyên sâu dành cho Modem 5G PCIe (Sierra Wireless EM9190 / Snapdragon SDX55, Quectel RM500Q/RM520N, Fibocom) trên nền tảng **ImmortalWrt / OpenWrt** (Qualcomm IPQ8074, IPQ6000, MediaTek Filogic, x86).
+Ứng dụng quản trị chuyên sâu dành cho Modem 5G PCIe (Sierra Wireless EM9190 / Snapdragon SDX55, Quectel RM500Q/RM520N, Fibocom) & Nhà Thông Minh Đa Năng trên nền tảng **ImmortalWrt / OpenWrt** (Qualcomm IPQ8074, IPQ6000, MediaTek Filogic, x86).
+
+---
+
+## 🗂️ Cấu Trúc Tách Kịch Bản Độc Lập (`v2.5.0` — Dễ Quản Lý & Dễ Nâng Cấp)
+
+Toàn bộ mã nguồn đã được **tách thành 6 nhóm kịch bản độc lập** (xem bản đồ chi tiết tại [`SCENARIO_INDEX.md`](./SCENARIO_INDEX.md) và thư mục [`scenarios/`](./scenarios/)):
+
+| Nhóm | Thư Mục Kịch Bản | Chức Năng & Module Phụ Trách |
+| :--- | :--- | :--- |
+| **01** | [`scenarios/01-dialer-watchdog/`](./scenarios/01-dialer-watchdog/README.md) | Trình quay số `duydoan5g` (QMI/MBIM/AT/ECM) & Watchdog tự phục hồi mạng 5G |
+| **02** | [`scenarios/02-sim-sms/`](./scenarios/02-sim-sms/README.md) | Quản lý SIM, giải mã/gửi SMS tiếng Việt UCS2, hẹn giờ SMS (`doanduy/tab_sms.js`) |
+| **03** | [`scenarios/03-rf-band-imei/`](./scenarios/03-rf-band-imei/README.md) | Sóng 5G, Khóa Băng Tần/PCI, Đổi IMEI, TTL & Lệnh AT (`doanduy/tab_modem.js`) |
+| **04** | [`scenarios/04-sentinel-telegram-remote/`](./scenarios/04-sentinel-telegram-remote/README.md) | Đa Bot Telegram, AI Sentinel, Két Key & Camera/Tailscale (`doanduy/tab_sentinel.js`) |
+| **05** | [`scenarios/05-adshield-optimizer/`](./scenarios/05-adshield-optimizer/README.md) | AdShield chặn quảng cáo DNS, Auto-Optimizer phần cứng & Khung điều phối LuCI |
+| **06** | [`scenarios/06-smarthome/`](./scenarios/06-smarthome/README.md) | Nhà thông minh tự nhận diện qua IP, không giới hạn loại thiết bị & nút lệnh (5 module Lua + 2 module JS) |
+
+### ⚡ Kiểm Tra Hoặc Nạp Riêng Từng Kịch Bản (Windows PowerShell & Linux/CI)
+```powershell
+# Kiểm tra cú pháp + chuẩn LF riêng Kịch bản 06 (hoặc all cho cả 6 nhóm):
+.\scenarios\run_scenario.ps1 -Group 06 -Action check
+
+# Nạp nóng riêng Kịch bản 06 lên Router 192.168.1.1 (không đụng 5 nhóm còn lại):
+.\scenarios\run_scenario.ps1 -Group 06 -Action deploy -RouterIp 192.168.1.1
+```
 
 ---
 

@@ -1,0 +1,42 @@
+{
+  "id": "04-sentinel-telegram-remote",
+  "title": "Nhóm 04: Telegram Đa Bot, AI Sentinel, Kho Key Đa Tài Khoản & Kết Nối Từ Xa",
+  "description": "Lưu trữ khóa bảo mật chmod 600 (Zero-Leak Vault), cảnh báo Telegram nhiều Bot, tích hợp Tailscale VPN / Funnel HTTPS, đường hầm tạm thời và khóa bảo vệ chặn mở cổng WAN khi chưa đặt mật khẩu root.",
+  "files": [
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/doanduy.vault",
+      "router": "/usr/libexec/rpcd/doanduy.vault",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/doanduy.remote",
+      "router": "/usr/libexec/rpcd/doanduy.remote",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/send_telegram",
+      "router": "/usr/bin/send_telegram",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/doanduy_remote_auto.sh",
+      "router": "/usr/bin/doanduy_remote_auto.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/remote_web_tunnel.sh",
+      "router": "/usr/bin/remote_web_tunnel.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/etc/init.d/doanduy_auto",
+      "router": "/etc/init.d/doanduy_auto",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/doanduy/tab_sentinel.js",
+      "router": "/www/luci-static/resources/doanduy/tab_sentinel.js",
+      "mode": "644"
+    }
+  ]
+}

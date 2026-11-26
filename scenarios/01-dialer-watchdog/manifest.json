@@ -1,0 +1,42 @@
+{
+  "id": "01-dialer-watchdog",
+  "title": "Nhóm 01: Trình Quay Số 5G Thông Minh (USB & PCIe) & Watchdog Tự Phục Hồi",
+  "description": "Quản lý kết nối 5G netifd (duydoan5g), tự động dò card USB/PCIe (Quectel, Fibocom, Sierra, SIMCom), khóa flock chống xung đột cổng AT và tự phục hồi mạng 3 tầng.",
+  "files": [
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/duydoan5g_dialer.sh",
+      "router": "/usr/bin/duydoan5g_dialer.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/lib/netifd/proto/duydoan5g.sh",
+      "router": "/lib/netifd/proto/duydoan5g.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/smart_modem_watchdog.sh",
+      "router": "/usr/bin/smart_modem_watchdog.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/etc/init.d/smart_modem_watchdog",
+      "router": "/etc/init.d/smart_modem_watchdog",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/modem_lock_run",
+      "router": "/usr/bin/modem_lock_run",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/restart_wwan",
+      "router": "/usr/bin/restart_wwan",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/protocol/duydoan5g.js",
+      "router": "/www/luci-static/resources/protocol/duydoan5g.js",
+      "mode": "644"
+    }
+  ]
+}

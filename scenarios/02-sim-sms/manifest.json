@@ -1,0 +1,32 @@
+{
+  "id": "02-sim-sms",
+  "title": "Nhóm 02: Quản Lý SIM, Lịch Gia Hạn Tự Động & Hộp Thư SMS (USB & PCIe)",
+  "description": "Đọc/gửi/xóa tin nhắn SMS 3GPP Text & UCS-2 PDU đồng bộ trên cả USB và PCIe (Router ME & Thẻ SIM SM), gộp tin nhắn dài, kiểm tra cước 191 và tự động gia hạn gói theo khung giờ vàng.",
+  "files": [
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/luci.sms-status",
+      "router": "/usr/libexec/rpcd/luci.sms-status",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/read_pcie_sms.lua",
+      "router": "/usr/bin/read_pcie_sms.lua",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/doanduy.sim",
+      "router": "/usr/libexec/rpcd/doanduy.sim",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/daily_vip_renew.sh",
+      "router": "/usr/bin/daily_vip_renew.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/doanduy/tab_sms.js",
+      "router": "/www/luci-static/resources/doanduy/tab_sms.js",
+      "mode": "644"
+    }
+  ]
+}

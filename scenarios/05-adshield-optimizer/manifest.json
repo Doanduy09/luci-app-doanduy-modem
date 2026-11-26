@@ -1,0 +1,67 @@
+{
+  "id": "05-adshield-optimizer",
+  "title": "Nhóm 05: Chặn Quảng Cáo AdShield, Tối Ưu Phần Cứng, Đọc Log & Khung Hệ Thống",
+  "description": "Chặn quảng cáo/cờ bạc DNS Sinkhole + nftables 53/853, tối ưu phần cứng chuyên sâu MediaTek Filogic WED & Qualcomm NSS, công cụ đọc log, trình cài đặt kép opkg/apk và khung điều hướng chính.",
+  "files": [
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/adshield",
+      "router": "/usr/bin/adshield",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/clean_dns.sh",
+      "router": "/usr/bin/clean_dns.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/doanduy.adshield",
+      "router": "/usr/libexec/rpcd/doanduy.adshield",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/device_opt.sh",
+      "router": "/usr/bin/device_opt.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/doanduy.opt",
+      "router": "/usr/libexec/rpcd/doanduy.opt",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/doanduy_pkg_helper.sh",
+      "router": "/usr/bin/doanduy_pkg_helper.sh",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/logall",
+      "router": "/usr/bin/logall",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/logchan",
+      "router": "/usr/bin/logchan",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/etc/uci-defaults/99-luci-app-doanduy-modem",
+      "router": "/etc/uci-defaults/99-luci-app-doanduy-modem",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/share/luci/menu.d/luci-app-doanduy-modem.json",
+      "router": "/usr/share/luci/menu.d/luci-app-doanduy-modem.json",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/share/rpcd/acl.d/luci-app-doanduy-modem.json",
+      "router": "/usr/share/rpcd/acl.d/luci-app-doanduy-modem.json",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/view/modem/control.js",
+      "router": "/www/luci-static/resources/view/modem/control.js",
+      "mode": "644"
+    }
+  ]
+}

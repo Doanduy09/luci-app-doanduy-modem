@@ -1,0 +1,32 @@
+{
+  "id": "03-rf-band-imei",
+  "title": "Nhóm 03: Modem 5G, Khóa Băng Tần, Khóa Trạm BTS, IMEI Luhn & TTL",
+  "description": "Điều khiển sóng 4G/5G (Band Lock tự động theo nhà mạng hoặc chọn tay từng band, Cell Lock), kiểm định Luhn 15 số trước khi đổi IMEI, đổi TTL=65 chống bóp băng thông và trạng thái tổng quan LuCI.",
+  "files": [
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/doanduy.rf",
+      "router": "/usr/libexec/rpcd/doanduy.rf",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/modem_ctrl",
+      "router": "/usr/libexec/rpcd/modem_ctrl",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/bin/imei",
+      "router": "/usr/bin/imei",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/doanduy/tab_modem.js",
+      "router": "/www/luci-static/resources/doanduy/tab_modem.js",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/view/status/include/11_modem.js",
+      "router": "/www/luci-static/resources/view/status/include/11_modem.js",
+      "mode": "644"
+    }
+  ]
+}

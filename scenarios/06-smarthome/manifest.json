@@ -1,0 +1,57 @@
+{
+  "id": "06-smarthome",
+  "title": "Nhóm 06: Nhà Thông Minh Tự Nhận Diện IP, Thiết Bị Vô Hạn, S06 IR & Voice ESP32",
+  "description": "Tự động nhận diện thiết bị thông minh khi dán IP hoặc quét mạng LAN (WLED, Shelly, Tasmota, Yeelight, Sonoff DIY, Tuya 6668, Camera RTSP, Android TV, Soundbar), hỗ trợ không giới hạn loại thiết bị & nút lệnh.",
+  "files": [
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/libexec/rpcd/doanduy.smarthome",
+      "router": "/usr/libexec/rpcd/doanduy.smarthome",
+      "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/doanduy/smarthome/net_json.lua",
+      "router": "/usr/lib/lua/doanduy/smarthome/net_json.lua",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/doanduy/smarthome/store.lua",
+      "router": "/usr/lib/lua/doanduy/smarthome/store.lua",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/doanduy/smarthome/catalog.lua",
+      "router": "/usr/lib/lua/doanduy/smarthome/catalog.lua",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/doanduy/smarthome/discovery.lua",
+      "router": "/usr/lib/lua/doanduy/smarthome/discovery.lua",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/doanduy/smarthome/drivers.lua",
+      "router": "/usr/lib/lua/doanduy/smarthome/drivers.lua",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/tuya_v35_local.lua",
+      "router": "/usr/lib/lua/tuya_v35_local.lua",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/ac_ir_protocols.lua",
+      "router": "/usr/lib/lua/ac_ir_protocols.lua",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/doanduy/smarthome_modal.js",
+      "router": "/www/luci-static/resources/doanduy/smarthome_modal.js",
+      "mode": "644"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/htdocs/luci-static/resources/doanduy/smarthome.js",
+      "router": "/www/luci-static/resources/doanduy/smarthome.js",
+      "mode": "644"
+    }
+  ]
+}
