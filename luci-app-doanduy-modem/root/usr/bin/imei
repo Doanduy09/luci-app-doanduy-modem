@@ -1,6 +1,21 @@
 #!/bin/sh
 # DOANDUY 5G Universal IMEI CLI Wrapper
-# [VERIFIED-GOLDEN: imei-cli-input-validation | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+# [VERIFIED-GOLDEN: imei-cli-luhn-validation | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+is_valid_luhn_imei() {
+	local im="$1" sum=0 i=0 d
+	[ "${#im}" -eq 15 ] || return 1
+	while [ "$i" -lt 14 ]; do
+		d=$(printf '%s' "$im" | cut -c$((i + 1)))
+		if [ $((i % 2)) -eq 1 ]; then
+			d=$((d * 2))
+			[ "$d" -gt 9 ] && d=$((d - 9))
+		fi
+		sum=$((sum + d))
+		i=$((i + 1))
+	done
+	[ $(((10 - (sum % 10)) % 10)) -eq "$(printf '%s' "$im" | cut -c15)" ]
+}
+
 if [ -n "$1" ]; then
 	case "$1" in
 		*[!0-9]*)
@@ -10,6 +25,10 @@ if [ -n "$1" ]; then
 	esac
 	if [ "${#1}" -ne 15 ]; then
 		echo '{"success":false,"message":"Lỗi: IMEI bắt buộc phải đúng 15 chữ số!"}'
+		exit 1
+	fi
+	if ! is_valid_luhn_imei "$1"; then
+		echo '{"success":false,"message":"Lỗi: Số kiểm tra cuối (Luhn Check-Digit) của IMEI không hợp lệ!"}'
 		exit 1
 	fi
 	BRAND=$(printf '%s' "${2:-auto}" | tr -cd 'a-zA-Z0-9_-')
