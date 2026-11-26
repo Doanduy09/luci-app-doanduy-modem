@@ -16,7 +16,7 @@ local bit = nixio.bit
 local band, bor, lshift, rshift = bit.band, bit.bor, bit.lshift, bit.rshift
 
 local function open_at_fd(port)
-    if port:match("^/dev/tty") then
+    if port:match("^/dev/tty[A-Za-z0-9_.-]+$") then
         os.execute(string.format("stty -F '%s' 115200 raw -echo -echoe -echok -ixon -ixoff -crtscts 2>/dev/null", port))
     end
     local fd = nixio.open(port, nixio.open_flags("rdwr", "nonblock"))
@@ -544,7 +544,8 @@ local function send_text_sms_fd(fd, dest, msg)
     send_raw_at(fd, 'AT+CSCS="GSM"', 1500)
     local p_resp = send_raw_at(fd, string.format('AT+CMGS="%s"', dest), 4000, true)
     if not p_resp:find(">") then return false, p_resp end
-    fd:write(msg .. "\26")
+    local body = (msg or ""):gsub("[\26\27]", "")
+    fd:write(body .. "\26")
     local res = read_raw_until(fd, 15000)
     local ok = (res:find("+CMGS:") ~= nil) or (res:find("OK") ~= nil and not res:find("ERROR"))
     if not ok and #res == 0 then
@@ -559,8 +560,10 @@ local function send_raw_pdu_fd(fd, raw_pdu)
     if #pdu < 4 or #pdu % 2 ~= 0 or not pdu:match("^[0-9A-F]+$") then
         return false, "invalid PDU hex"
     end
+    local smsc_len = tonumber(pdu:sub(1, 2), 16) or 0
+    local tpdu_len = math.floor(#pdu / 2) - 1 - smsc_len
+    if tpdu_len <= 0 then return false, "invalid PDU length" end
     send_raw_at(fd, "AT+CMGF=0", 1500)
-    local tpdu_len = math.floor((#pdu - 2) / 2)
     local p_resp = send_raw_at(fd, string.format("AT+CMGS=%d", tpdu_len), 4000, true)
     if not p_resp:find(">") then return false, p_resp end
     fd:write(pdu .. "\26")

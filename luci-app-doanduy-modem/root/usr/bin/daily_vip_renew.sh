@@ -33,14 +33,20 @@ probe_at_tier() {
     [ -n "$dev" ] && [ -c "$dev" ] || return 1
     case "$dev" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
-            [ -x /usr/bin/read_pcie_sms.lua ] && resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    resp=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                else
+                    resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                fi
+            fi
             ;;
         *)
             if command -v atinout >/dev/null 2>&1; then
                 if command -v modem_lock_run >/dev/null 2>&1; then
-                    resp=$(modem_lock_run timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                    resp=$(modem_lock_run timeout 3 sh -c 'printf "ATI\r" | atinout - "$1" -' _ "$dev" 2>/dev/null)
                 else
-                    resp=$(timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                    resp=$(timeout 3 sh -c 'printf "ATI\r" | atinout - "$1" -' _ "$dev" 2>/dev/null)
                 fi
             fi
             if [ -z "$resp" ] && [ -x /usr/bin/read_pcie_sms.lua ]; then
@@ -271,7 +277,11 @@ run_send_sms() {
     case "$port" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                out=$(/usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
+                else
+                    out=$(/usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
+                fi
                 rc=$?
                 [ "$rc" -eq 0 ] && return 0
                 log "❌ PCIe SMS ($port) lỗi: $out"

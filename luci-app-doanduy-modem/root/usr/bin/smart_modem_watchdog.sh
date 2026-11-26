@@ -94,15 +94,31 @@ wd_at_cmd() {
     [ -c "$port" ] && [ -n "$cmd" ] || return 1
     case "$port" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
-            if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                out=$(timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
-                [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+            if command -v modem_lock_run >/dev/null 2>&1; then
+                if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                    out=$(modem_lock_run timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
+                if command -v tom_modem >/dev/null 2>&1; then
+                    out=$(modem_lock_run timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+                fi
+                return 1
+            else
+                (
+                    flock -x 9 2>/dev/null || true
+                    if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                        out=$(timeout "$t" /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                        [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
+                    fi
+                    if command -v tom_modem >/dev/null 2>&1; then
+                        out=$(timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                        [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
+                    fi
+                    exit 1
+                ) 9>/var/lock/modem_at.lock
+                return $?
             fi
-            if command -v tom_modem >/dev/null 2>&1; then
-                out=$(timeout "$t" tom_modem -d "$port" -c "$cmd" 2>/dev/null)
-                [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
-            fi
-            return 1
             ;;
         *)
             if command -v modem_lock_run >/dev/null 2>&1; then

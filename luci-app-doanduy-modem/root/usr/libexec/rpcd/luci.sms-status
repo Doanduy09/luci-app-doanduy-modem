@@ -41,18 +41,26 @@ probe_at_tier() {
     case "$dev" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if command -v tom_modem >/dev/null 2>&1; then
-                resp=$(timeout 3 tom_modem -d "$dev" -c ATI 2>/dev/null)
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    resp=$(modem_lock_run timeout 3 tom_modem -d "$dev" -c ATI 2>/dev/null)
+                else
+                    resp=$(timeout 3 tom_modem -d "$dev" -c ATI 2>/dev/null)
+                fi
             fi
             if [ -z "$resp" ] && [ -x /usr/bin/read_pcie_sms.lua ]; then
-                resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    resp=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                else
+                    resp=$(/usr/bin/read_pcie_sms.lua -p "$dev" --at "ATI" 2>/dev/null)
+                fi
             fi
             ;;
         *)
             if command -v atinout >/dev/null 2>&1; then
                 if command -v modem_lock_run >/dev/null 2>&1; then
-                    resp=$(modem_lock_run timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                    resp=$(modem_lock_run timeout 3 sh -c 'printf "ATI\r" | atinout - "$1" -' _ "$dev" 2>/dev/null)
                 else
-                    resp=$(timeout 3 sh -c "printf 'ATI\r' | atinout - '$dev' -" 2>/dev/null)
+                    resp=$(timeout 3 sh -c 'printf "ATI\r" | atinout - "$1" -' _ "$dev" 2>/dev/null)
                 fi
             fi
             if [ -z "$resp" ] && command -v sms_tool >/dev/null 2>&1; then
@@ -86,14 +94,18 @@ get_active_modem_port() {
         return 0
     fi
 
-    local cached_p=$(cat /tmp/master_sms_port 2>/dev/null)
-    if [ -n "$cached_p" ] && [ -c "$cached_p" ] && probe_at_tier "$cached_p" "strong"; then
-        echo "$cached_p"
-        return 0
-    fi
+    local META_AT_PORT=""
+    [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
+    for cached_p in "$META_AT_PORT" "$(cat /tmp/master_sms_port 2>/dev/null)"; do
+        if [ -n "$cached_p" ] && [ -c "$cached_p" ] && probe_at_tier "$cached_p" "strong"; then
+            echo "$cached_p" > /tmp/master_sms_port
+            echo "$cached_p"
+            return 0
+        fi
+    done
 
     local iface=""
-    for i in wwan0 wwan1 usb0; do
+    for i in wwan0 wwan1 mhi_hwip0 usb0 eth2; do
         [ -d "/sys/class/net/$i" ] && { iface="$i"; break; }
     done
 
@@ -160,7 +172,11 @@ send_at_direct() {
     case "$p" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                out=$(/usr/bin/read_pcie_sms.lua -p "$p" --at "$cmd" 2>/dev/null)
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$p" --at "$cmd" 2>/dev/null)
+                else
+                    out=$(/usr/bin/read_pcie_sms.lua -p "$p" --at "$cmd" 2>/dev/null)
+                fi
             fi
             ;;
         *)
@@ -186,7 +202,11 @@ _send_sms_on_port() {
     case "$cur_port" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                out=$(/usr/bin/read_pcie_sms.lua -p "$cur_port" --send "$target" "$msg" 2>&1)
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$cur_port" --send "$target" "$msg" 2>&1)
+                else
+                    out=$(/usr/bin/read_pcie_sms.lua -p "$cur_port" --send "$target" "$msg" 2>&1)
+                fi
                 rc=$?
                 [ "$rc" -eq 0 ] && { SMS_SENT_PORT="$cur_port"; return 0; }
             else
@@ -531,7 +551,11 @@ case "$1" in
                     [ -n "$p" ] && [ -c "$p" ] && [ -x /usr/bin/read_pcie_sms.lua ] || return 1
                     case "$p" in
                         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
-                            pdu_out=$(/usr/bin/read_pcie_sms.lua -p "$p" --send-raw-pdu "$raw_pdu" 2>&1)
+                            if command -v modem_lock_run >/dev/null 2>&1; then
+                                pdu_out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$p" --send-raw-pdu "$raw_pdu" 2>&1)
+                            else
+                                pdu_out=$(/usr/bin/read_pcie_sms.lua -p "$p" --send-raw-pdu "$raw_pdu" 2>&1)
+                            fi
                             pdu_rc=$?
                             ;;
                         *)
@@ -614,10 +638,17 @@ EOF
                 echo "$s_dst|$s_body|$carrier_display" > /tmp/carrier_data_preset.txt
 
                 if do_send_sms "$port" "$s_dst" "$s_body"; then
-                    case "$port" in
-                        /dev/wwan*|/dev/mhi*)
+                    sent_p="${SMS_SENT_PORT:-$port}"
+                    case "$sent_p" in
+                        /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
                             sleep 5
-                            [ -x /usr/bin/read_pcie_sms.lua ] && /usr/bin/read_pcie_sms.lua -p "$port" --read >/dev/null 2>&1
+                            if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                                if command -v modem_lock_run >/dev/null 2>&1; then
+                                    modem_lock_run /usr/bin/read_pcie_sms.lua -p "$sent_p" --read >/dev/null 2>&1
+                                else
+                                    /usr/bin/read_pcie_sms.lua -p "$sent_p" --read >/dev/null 2>&1
+                                fi
+                            fi
                             ;;
                         *)
                             sleep 6

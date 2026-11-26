@@ -376,16 +376,21 @@ safe_at_once() {
     [ -c "$port" ] && [ -n "$cmd" ] || return 1
     case "$port" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
-            if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                timeout 4 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && return 0
-            fi
-            if command -v tom_modem >/dev/null 2>&1; then
-                timeout 4 tom_modem -d "$port" -c "$cmd" 2>/dev/null && return 0
-            fi
-            if command -v sms_tool >/dev/null 2>&1; then
-                timeout 4 sms_tool -d "$port" at "$cmd" 2>/dev/null && return 0
-            fi
-            return 1
+            (
+                acquire_fd_lock 9 4 || true
+                export _MODEM_AT_LOCKED=1
+                if [ -x /usr/bin/read_pcie_sms.lua ]; then
+                    timeout 4 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && exit 0
+                fi
+                if command -v tom_modem >/dev/null 2>&1; then
+                    timeout 4 tom_modem -d "$port" -c "$cmd" 2>/dev/null && exit 0
+                fi
+                if command -v sms_tool >/dev/null 2>&1; then
+                    timeout 4 sms_tool -d "$port" at "$cmd" 2>/dev/null && exit 0
+                fi
+                exit 1
+            ) 9>/var/lock/modem_at.lock 2>/dev/null
+            return $?
             ;;
         *)
             (
@@ -534,7 +539,8 @@ find_pci_root_for_netdev() {
     while [ -n "$cur" ] && [ "$cur" != "/" ]; do
         if [ -r "$cur/vendor" ] && [ -r "$cur/device" ]; then
             case "$cur" in
-                */0000:*) echo "$cur"; return 0 ;;
+                */[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F].[0-9a-fA-F])
+                    echo "$cur"; return 0 ;;
             esac
         fi
         parent="${cur%/*}"
@@ -594,7 +600,17 @@ find_working_at_port() {
     else
         pci_root=$(find_pci_root_for_netdev 2>/dev/null || true)
         if [ -n "$pci_root" ] && [ -d "$pci_root" ]; then
-            for tpath in $(find "$pci_root" -maxdepth 4 \( -name 'wwan*at*' -o -name 'mhi_DUN*' -o -name 'ttyFMI*' \) 2>/dev/null | sort); do
+            for wlink in /sys/class/wwan/* /sys/class/tty/ttyFMI*; do
+                [ -e "$wlink" ] || continue
+                case "$(readlink -f "$wlink/device" 2>/dev/null)" in
+                    "$pci_root"*)
+                        case "${wlink##*/}" in
+                            *at*|mhi_DUN*|ttyFMI*) append_unique_port "/dev/${wlink##*/}" ;;
+                        esac
+                        ;;
+                esac
+            done
+            for tpath in $(find "$pci_root" -maxdepth 6 \( -name 'wwan*at*' -o -name 'mhi_DUN*' -o -name 'ttyFMI*' \) 2>/dev/null | sort); do
                 append_unique_port "/dev/${tpath##*/}"
             done
         fi
@@ -1306,6 +1322,8 @@ reexec_on_vanish() {
     proto_send_update "$interface"
     rm -f /tmp/master_sms_port
     logger -t duydoan5g "Interface $IFNAME vanished; re-initializing dialer detection"
+    sleep 2
+    [ "$STOP_REQ" = "0" ] || exit 0
     exec 8>&-
     exec /usr/bin/duydoan5g_dialer.sh "$interface" "$apn" "$pdptype" "$mtu" "$metric" "$pincode" "$username" "$password" "$auth" "0" "$user_pdp_index" "$force_apn" "$user_device"
 }
@@ -1441,7 +1459,7 @@ run_fm350_usb_dial() {
             detach_bridge_master
             ip link set dev "$IFNAME" arp off 2>/dev/null || true
             clamp_mtu
-            if [ "$pdptype" != "ip" ] && [ "$pdptype" != "ipv4" ] && [ -z "$v6" ]; then
+            if [ "$pdptype" != "ip" ] && [ "$pdptype" != "ipv4" ] && [ -z "$v6" ] && [ -z "$(ip -6 addr show dev "$IFNAME" scope global 2>/dev/null | head -n 1)" ]; then
                 command -v rdisc6 >/dev/null 2>&1 && { rdisc6 -1 "$IFNAME" >/dev/null 2>&1 || true; }
                 apply_carrier_ipv6_route_mtu ""
             fi

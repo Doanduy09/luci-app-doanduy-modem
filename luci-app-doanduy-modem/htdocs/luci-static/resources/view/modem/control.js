@@ -631,7 +631,8 @@ return view.extend({
                 callCheckDataBalance().then(function(res) {
                     if (res && res.success === false) {
                         var errMsg = res.message || 'Gửi lệnh tra cước thất bại!';
-                        inboxContainer.innerHTML = '<div style="padding: 16px; color: #b91c1c; font-weight: 700;">❌ ' + errMsg + '</div>';
+                        inboxContainer.innerHTML = '';
+                        inboxContainer.appendChild(E('div', { style: 'padding: 16px; color: #b91c1c; font-weight: 700;' }, '❌ ' + errMsg));
                         ui.addNotification(null, E('p', '❌ ' + errMsg), 'error');
                         return;
                     }
