@@ -138,6 +138,15 @@ vm.vfs_cache_pressure = 60
 EOF
 	sysctl -p "$OPT_CONF" >/dev/null 2>&1 || true
 	disable_wwan_powersave
+	# Tự động tắt nft_flow_offload trên Qualcomm IPQ NSS để tránh xung đột qca-nss-ecm gây giật ping
+	if [ "$SOC_TYPE" = "qualcomm_ipq_nss" ]; then
+		if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ] || [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ]; then
+			uci -q set firewall.@defaults[0].flow_offloading='0'
+			uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+			uci commit firewall
+			/etc/init.d/firewall reload >/dev/null 2>&1 || true
+		fi
+	fi
 	json_init
 	json_add_boolean "success" 1
 	json_add_string "message" "Đã áp dụng tối ưu chuẩn [${RAM_TIER} | ${SOC_LABEL}] (BBR/Sysctl/USB-PCIe Power On)!"

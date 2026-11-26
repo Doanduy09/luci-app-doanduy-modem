@@ -280,8 +280,13 @@ resolve_netdev_from_ctrl() {
 }
 
 matches_user_device() {
-    [ -z "$user_device" ] && return 0
-    [ "$1" = "$user_device" ] || { [ -n "$2" ] && [ "$2" = "$user_device" ]; }
+    [ -z "$user_device" ] || [ "$user_device" = "auto" ] && return 0
+    [ "$1" = "$user_device" ] || { [ -n "$2" ] && [ "$2" = "$user_device" ]; } && return 0
+    # Hot-swap auto-fallback: if configured device node/netdev is unplugged, accept any detected WWAN modem
+    if [ ! -d "/sys/class/net/$user_device" ] && [ ! -c "$user_device" ]; then
+        return 0
+    fi
+    return 1
 }
 
 detect_endpoint() {

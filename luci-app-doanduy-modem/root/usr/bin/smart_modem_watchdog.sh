@@ -12,6 +12,12 @@
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export TZ=Asia/Ho_Chi_Minh
 
+# Dọn ngay /tmp/wd_interface nếu bị script cũ gán nhầm vào cổng dây wan/lan
+if [ -f /tmp/wd_interface ]; then
+    _old_wdi=$(cat /tmp/wd_interface 2>/dev/null | tr -d ' \r\n')
+    [ "$_old_wdi" = "wan" ] || [ "$_old_wdi" = "lan" ] || [ "$_old_wdi" = "wan6" ] && rm -f /tmp/wd_interface 2>/dev/null
+fi
+
 # Vô hiệu hóa triệt để USB autosuspend để chống đơ USB 3.0 cdc_mbim
 echo -1 > /sys/module/usbcore/parameters/autosuspend 2>/dev/null
 for p in /sys/bus/usb/devices/*/power/control; do [ -f "$p" ] && echo on > "$p" 2>/dev/null; done
@@ -685,11 +691,22 @@ preemptive_5g_handover() {
     local sinr=""
     local rsrp=""
     
-    if [ -c "$port" ] && is_quectel_modem; then
-        local serving_cell=""
-        serving_cell=$(wd_at_cmd "$port" 'AT+QENG="servingcell"' 3 2>/dev/null)
-        sinr=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $NF}' | tr -d ' \r\n')
-        rsrp=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $(NF-2)}' | tr -d ' \r\n')
+    if [ -c "$port" ]; then
+        if is_quectel_modem; then
+            local serving_cell=""
+            serving_cell=$(wd_at_cmd "$port" 'AT+QENG="servingcell"' 3 2>/dev/null)
+            sinr=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $NF}' | tr -d ' \r\n')
+            rsrp=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $(NF-2)}' | tr -d ' \r\n')
+        else
+            local gstatus=""
+            gstatus=$(wd_at_cmd "$port" "AT!GSTATUS?" 3 2>/dev/null)
+            if printf '%s' "$gstatus" | grep -q "!GSTATUS:"; then
+                rsrp=$(printf '%s\n' "$gstatus" | sed -n 's/.*NR5G RSRP (dBm):[[:space:]]*\([-0-9]*\).*/\1/p' | head -n 1)
+                [ -z "$rsrp" ] && rsrp=$(printf '%s\n' "$gstatus" | sed -n 's/.*PCC RxM RSRP:[[:space:]]*\([-0-9]*\).*/\1/p' | head -n 1)
+                sinr=$(printf '%s\n' "$gstatus" | sed -n 's/.*NR5G SINR (dB):[[:space:]]*\([-0-9.]*\).*/\1/p' | cut -d'.' -f1 | head -n 1)
+                [ -z "$sinr" ] && sinr=$(printf '%s\n' "$gstatus" | sed -n 's/.*SINR (dB):[[:space:]]*\([-0-9.]*\).*/\1/p' | cut -d'.' -f1 | head -n 1)
+            fi
+        fi
     fi
     [ -z "$sinr" ] && sinr="15"
     [ -z "$rsrp" ] && rsrp="-85"

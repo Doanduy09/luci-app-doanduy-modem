@@ -52,9 +52,17 @@ fi
 
 # 4. Cau hinh interface duydoan_5g va tuong lua (Firewall Zone WAN)
 touch /etc/config/.wwan_custom_setup_done /etc/config/.doanduy_modem_managed 2>/dev/null
+if [ -f /tmp/wd_interface ]; then
+    _wdi=$(cat /tmp/wd_interface 2>/dev/null | tr -d ' \r\n')
+    [ "$_wdi" = "wan" ] || [ "$_wdi" = "lan" ] || [ "$_wdi" = "wan6" ] && rm -f /tmp/wd_interface 2>/dev/null
+fi
 uci -q delete network.wwan0
 uci -q delete network.wwan0_4
 uci -q delete network.wwan0_6
+if [ "$(uci -q get network.Modem.proto)" = "mbim" ] || [ "$(uci -q get network.Modem.proto)" = "qmi" ]; then
+    uci -q set network.Modem.auto='0'
+    uci -q set network.Modem.disabled='1'
+fi
 prev_proto=$(uci -q get network.duydoan_5g.proto)
 uci set network.duydoan_5g=interface
 uci set network.duydoan_5g.proto='duydoan5g'
