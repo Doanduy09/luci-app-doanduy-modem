@@ -11,35 +11,47 @@
 
 var callSMSInfo           = rpc.declare({ object: 'luci.sms-status', method: 'getSMSInfo', expect: { } });
 var callGetPorts          = rpc.declare({ object: 'luci.sms-status', method: 'getAvailablePorts', expect: { } });
-var callGetCellInfo       = rpc.declare({ object: 'luci.sms-status', method: 'getCellInfo', expect: { } });
 var callSimGetState       = rpc.declare({ object: 'doanduy.sim', method: 'getState', expect: { } });
 var callGetSentinelConfig = rpc.declare({ object: 'doanduy.vault', method: 'get', expect: { } });
 var callRemoteStatus      = rpc.declare({ object: 'doanduy.remote', method: 'status', expect: { } });
 var callRfStatus          = rpc.declare({ object: 'doanduy.rf', method: 'getStatus', expect: { } });
+
+function withTimeout(promise, ms, fallback) {
+    return new Promise(function(resolve) {
+        var done = false;
+        var timer = setTimeout(function() {
+            if (!done) { done = true; resolve(fallback); }
+        }, ms);
+        Promise.resolve(promise).then(function(val) {
+            if (!done) { done = true; clearTimeout(timer); resolve(val || fallback); }
+        }).catch(function() {
+            if (!done) { done = true; clearTimeout(timer); resolve(fallback); }
+        });
+    });
+}
 
 return view.extend({
     title: _('Tiện Ích 5G & Quản Trị Modem'),
 
     load: function() {
         return Promise.all([
-            callSMSInfo().catch(function() { return {}; }),
-            callGetPorts().catch(function() { return {}; }),
-            callGetCellInfo().catch(function() { return {}; }),
-            callSimGetState().catch(function() { return {}; }),
-            callGetSentinelConfig().catch(function() { return {}; }),
-            callRemoteStatus().catch(function() { return {}; }),
-            callRfStatus().catch(function() { return {}; })
+            withTimeout(callSMSInfo(), 2200, {}),
+            withTimeout(callGetPorts(), 2200, {}),
+            withTimeout(callSimGetState(), 2200, {}),
+            withTimeout(callGetSentinelConfig(), 2000, {}),
+            withTimeout(callRemoteStatus(), 2000, {}),
+            withTimeout(callRfStatus(), 2000, {})
         ]);
     },
 
     render: function(data) {
         var smsRes         = data[0] || {};
         var portsData      = data[1] || {};
-        var cellRes        = data[2] || {};
-        var simMgrData     = data[3] || {};
-        var sentinelConfig = data[4] || {};
-        var remoteState    = data[5] || {};
-        var rfStatus       = data[6] || {};
+        var cellRes        = {};
+        var simMgrData     = data[2] || {};
+        var sentinelConfig = data[3] || {};
+        var remoteState    = data[4] || {};
+        var rfStatus       = data[5] || {};
 
         var activePort = (portsData && portsData.current_port && portsData.current_port.indexOf('/dev/') !== -1)
             ? portsData.current_port
@@ -90,6 +102,9 @@ return view.extend({
                     btnEl.style.color       = act ? '#ffffff' : '#334155';
                     btnEl.style.borderColor = act ? '#2563eb' : '#cbd5e1';
                     paneEl.style.display    = act ? 'block' : 'none';
+                    if (act && typeof paneEl._onShow === 'function') {
+                        try { paneEl._onShow(); } catch (e) {}
+                    }
                 }
             });
         }

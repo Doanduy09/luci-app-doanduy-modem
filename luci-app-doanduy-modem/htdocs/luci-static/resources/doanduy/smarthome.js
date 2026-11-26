@@ -525,7 +525,13 @@ return baseclass.extend({
             modalMgr.overlay
         ]);
 
-        refreshStatus();
+        var hasLoadedOnce = false;
+        pane._onShow = function() {
+            if (!hasLoadedOnce) {
+                hasLoadedOnce = true;
+                refreshStatus();
+            }
+        };
         setInterval(function() {
             if (pane.style.display !== 'none' && !document.hidden && !modalMgr.isOpen() && !state.showCtrlsPanel) {
                 refreshStatus();

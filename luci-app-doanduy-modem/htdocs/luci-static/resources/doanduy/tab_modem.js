@@ -566,6 +566,13 @@ return baseclass.extend({
             cellInfoSection,
             atTerminalSection
         ]);
+        var cellLoaded = false;
+        modemTabContent._onShow = function() {
+            if (!cellLoaded) {
+                cellLoaded = true;
+                callGetCellInfo().then(renderCellGrid).catch(function() {});
+            }
+        };
         return modemTabContent;
     }
 });
