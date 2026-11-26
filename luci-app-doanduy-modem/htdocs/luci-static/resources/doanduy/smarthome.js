@@ -37,6 +37,15 @@ function mkBtn(label, style, onClick) {
     }, label);
 }
 
+function fmtAgo(sec) {
+    if (sec === null || sec === undefined || isNaN(sec)) return '';
+    var s = Math.max(0, Math.floor(Number(sec)));
+    if (s < 5) return 'vừa xong';
+    if (s < 60) return s + 's trước';
+    if (s < 3600) return Math.floor(s / 60) + 'p trước';
+    return Math.floor(s / 3600) + 'g trước';
+}
+
 return baseclass.extend({
     renderPane: function() {
         var state = {
@@ -44,6 +53,7 @@ return baseclass.extend({
             devices: [],
             lan_tvs: [],
             rooms: [],
+            voice_hub: null,
             roomFilter: 'all',
             cat: 'all',
             includeOnline: true,
@@ -274,37 +284,110 @@ return baseclass.extend({
         }
 
         // =========================================================================
-        // 3. COMPACT CONTROLLERS STRIP + COLLAPSIBLE CONTROLLER MANAGER
+        // 3. CONTROLLER & VOICE STATUS CARDS + COLLAPSIBLE CONTROLLER MANAGER
         // =========================================================================
-        var ctrlStrip = E('div', { style: 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; padding-top: 12px; border-top: 1px solid #e2e8f0;' });
+        var ctrlStrip = E('div', { style: 'margin-top: 14px; padding-top: 12px; border-top: 1px solid #e2e8f0;' });
         var ctrlManagerBox = E('div', { style: 'display: none; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 14px; margin-top: 10px;' });
 
         function renderControllers() {
             ctrlStrip.innerHTML = '';
-            ctrlStrip.appendChild(E('span', { style: 'font-size: 12px; font-weight: 750; color: #475569;' }, 'Bộ điều khiển kết nối:'));
-            (state.controllers || []).forEach(function(c) {
-                var icon = (c.kind === 'esp32_voice') ? '🎙️' : '📡';
-                var env = (c.temp_c !== undefined && c.temp_c !== null) ? (' • 🌡 ' + c.temp_c + '°C / ' + (c.humidity || '--') + '%') : '';
-                var ok = (c.live_ok || c.online);
-                ctrlStrip.appendChild(E('span', {
-                    style: 'display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; border: 1px solid ' + (ok ? '#a7f3d0' : '#e2e8f0') + '; background: ' + (ok ? '#ecfdf5' : '#f1f5f9') + '; color: ' + (ok ? '#047857' : '#475569') + ';'
-                }, (ok ? '🟢 ' : '⚪ ') + icon + ' ' + c.name + ' (' + c.ip + ')' + env));
+            var ctrls = state.controllers || [];
+            var activeCnt = 0;
+            ctrls.forEach(function(c) { if (c.live_ok || c.online) activeCnt++; });
+
+            var vh = state.voice_hub || {};
+            var vhNodes = [];
+            if (vh.ok) {
+                var vhText = '🎙️ Voice Hub OpenWrt: 🟢 Sẵn sàng';
+                if (vh.stt_ok > 0) vhText += ' • ' + vh.stt_ok + ' câu đã nghe';
+                if (vh.last_cmd) {
+                    var shortCmd = vh.last_cmd.length > 42 ? (vh.last_cmd.slice(0, 42) + '…') : vh.last_cmd;
+                    vhText += ' • Lệnh gần nhất: "' + shortCmd + '"';
+                }
+                vhNodes.push(E('span', {
+                    style: 'font-size: 11.5px; font-weight: 650; color: #0f766e; background: #f0fdfa; border: 1px solid #99f6e4; padding: 3px 9px; border-radius: 999px;'
+                }, vhText));
+            }
+
+            ctrlStrip.appendChild(E('div', {
+                style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 9px;'
+            }, [
+                E('div', { style: 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
+                    E('span', { style: 'font-size: 13px; font-weight: 800; color: #0f172a;' }, '📡 Trạng Thái Bộ Điều Khiển & Mạch Giọng Nói'),
+                    E('span', {
+                        style: 'font-size: 11.5px; font-weight: 750; padding: 2px 8px; border-radius: 999px; background: #dcfce7; color: #15803d;'
+                    }, activeCnt + '/' + ctrls.length + ' đang hoạt động')
+                ]),
+                E('div', { style: 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center;' }, vhNodes)
+            ]));
+
+            var cardsGrid = E('div', {
+                style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(265px, 1fr)); gap: 10px;'
             });
+
+            ctrls.forEach(function(c) {
+                var isVoice = (c.kind === 'esp32_voice');
+                var icon = isVoice ? '🎙️' : '📡';
+                var ok = !!(c.live_ok || c.online);
+                var badgeBg = ok ? '#16a34a' : '#dc2626';
+                var badgeTxt = ok ? (c.voice_active ? '🟢 Đang hoạt động • Đang nghe' : '🟢 Đang hoạt động') : '🔴 Ngắt kết nối';
+                var cardBg = ok ? '#f0fdf4' : '#fef2f2';
+                var cardBorder = ok ? '#86efac' : '#fecaca';
+
+                var metaLine = '📍 ' + (c.room || 'Nhà') + ' • IP: ' + (c.ip || '--');
+                var detailLine = '';
+                if (isVoice) {
+                    if (c.voice_active) {
+                        var agoTxt = fmtAgo(c.last_seen_ago_s);
+                        detailLine = '🎤 Thu âm trực tuyến (UDP 8995)' + (agoTxt ? (' • Tín hiệu ' + agoTxt) : '');
+                        if (c.packets > 0) detailLine += ' • ' + c.packets + ' lượt nói';
+                    } else if (ok) {
+                        detailLine = '📶 Đã kết nối Wi-Fi LAN • Sẵn sàng nghe lệnh giọng nói';
+                    } else {
+                        detailLine = '⚠️ Chưa cấp nguồn hoặc mất kết nối Wi-Fi';
+                    }
+                } else {
+                    var env = (c.temp_c !== undefined && c.temp_c !== null) ? ('🌡 ' + c.temp_c + '°C / ' + (c.humidity || '--') + '% • ') : '';
+                    detailLine = ok ? (env + 'Kết nối Tuya Local v3.5 ổn định') : '⚠️ Mất kết nối tới cục hồng ngoại S06';
+                }
+
+                var subChildren = [
+                    E('div', { style: 'font-size: 11.5px; color: #334155; font-weight: 600; margin-top: 5px;' }, metaLine),
+                    E('div', { style: 'font-size: 11.5px; color: ' + (ok ? '#15803d' : '#b91c1c') + '; font-weight: 700; margin-top: 3px;' }, detailLine)
+                ];
+                if (isVoice && c.last_text) {
+                    var lt = c.last_text.length > 38 ? (c.last_text.slice(0, 38) + '…') : c.last_text;
+                    subChildren.push(E('div', { style: 'font-size: 11px; color: #475569; margin-top: 3px;' }, '💬 Vừa nói: "' + lt + '"'));
+                }
+
+                cardsGrid.appendChild(E('div', {
+                    style: 'padding: 10px 12px; border-radius: 9px; border: 1.5px solid ' + cardBorder + '; background: ' + cardBg + ';'
+                }, [
+                    E('div', { style: 'display: flex; justify-content: space-between; align-items: center; gap: 6px; flex-wrap: wrap;' }, [
+                        E('span', { style: 'font-size: 13px; font-weight: 800; color: #0f172a;' }, icon + ' ' + c.name),
+                        E('span', {
+                            style: 'font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 999px; background: ' + badgeBg + '; color: #ffffff; white-space: nowrap;'
+                        }, badgeTxt)
+                    ])
+                ].concat(subChildren)));
+            });
+            ctrlStrip.appendChild(cardsGrid);
 
             ctrlManagerBox.innerHTML = '';
             ctrlManagerBox.appendChild(E('div', { style: 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px;' }, [
                 E('b', { style: 'font-size: 14px; color: #0f172a;' }, '📡 Danh Sách Cục S06 Pro & Mạch Giọng Nói ESP32-C3'),
                 mkBtn('➕ Thêm S06 / Mạch ESP32 Mới', 'background: #2563eb; color: #fff; border-color: #2563eb; font-size: 12px;', function() { openAddModal('ctrl'); })
             ]));
-            (state.controllers || []).forEach(function(c) {
+            ctrls.forEach(function(c) {
+                var ok = !!(c.live_ok || c.online);
                 var keyIn = E('input', { type: 'password', class: 'cbi-input-text', placeholder: c.has_key ? 'Đã lưu Key 16 ký tự (nhập mới nếu muốn đổi)' : 'Nhập Local Key 16 ký tự', style: 'width: 220px; font-size: 12px;' });
                 var ipIn = E('input', { type: 'text', class: 'cbi-input-text', value: c.ip || '', style: 'width: 120px; font-size: 12px;' });
                 var roomIn = E('input', { type: 'text', class: 'cbi-input-text', value: c.room || '', style: 'width: 110px; font-size: 12px;' });
                 ctrlManagerBox.appendChild(E('div', { style: 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 8px; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 6px; background: #f8fafc;' }, [
-                    E('span', { style: 'font-weight: 750; font-size: 12.5px; min-width: 185px;' }, ((c.kind === 'esp32_voice') ? '🎙️ ' : '📡 ') + c.name),
+                    E('span', { style: 'font-weight: 750; font-size: 12.5px; min-width: 205px;' }, (ok ? '🟢 ' : '🔴 ') + ((c.kind === 'esp32_voice') ? '🎙️ ' : '📡 ') + c.name),
                     ipIn,
                     roomIn,
-                    (c.kind === 'tuya_ir') ? keyIn : E('span', { style: 'font-size: 11.5px; color: #64748b;' }, 'UDP Voice Port 8995'),
+                    (c.kind === 'tuya_ir') ? keyIn : E('span', { style: 'font-size: 11.5px; color: #64748b;' }, c.status_label || 'UDP Voice Port 8995'),
                     mkBtn('💾 Lưu', 'font-size: 11.5px; padding: 4px 10px;', function() {
                         callSHSaveCtrl(c.id, c.kind, c.name, roomIn.value.trim(), ipIn.value.trim(), c.mac || '', c.device_id || '', keyIn.value.trim(), c.control_type || 1).then(function(r) {
                             keyIn.value = '';
@@ -618,6 +701,7 @@ return baseclass.extend({
                 state.devices = Array.isArray(res.devices) ? res.devices : [];
                 state.lan_tvs = Array.isArray(res.lan_tvs) ? res.lan_tvs : [];
                 state.rooms = Array.isArray(res.rooms) ? res.rooms : [];
+                state.voice_hub = res.voice_hub || null;
 
                 irCtrlSel.innerHTML = '';
                 state.controllers.forEach(function(c) {
@@ -646,6 +730,11 @@ return baseclass.extend({
         ]);
 
         refreshStatus();
+        setInterval(function() {
+            if (pane.style.display !== 'none' && !document.hidden && modalOverlay.style.display === 'none' && !state.showCtrlsPanel) {
+                refreshStatus();
+            }
+        }, 15000);
         return pane;
     }
 });
