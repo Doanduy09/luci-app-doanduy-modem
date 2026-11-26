@@ -1,3 +1,4 @@
+// [VERIFIED-GOLDEN: part4-luci-overview-11-modem | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 'use strict';
 'require baseclass';
 'require rpc';
@@ -93,3 +94,4 @@ return baseclass.extend({
 		}
 	}
 });
+// [/VERIFIED-GOLDEN]

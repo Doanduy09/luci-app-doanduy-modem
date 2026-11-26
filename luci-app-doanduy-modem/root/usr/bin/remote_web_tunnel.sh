@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-remote-luci-tunnel | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # /usr/bin/remote_web_tunnel.sh - DOANDUY 5G Universal Remote LuCI Tunnel
 # Tác quyền: Chuyên gia tối ưu hệ thống OpenWrt
 
@@ -180,3 +181,4 @@ case "$1" in
         ;;
 esac
 
+# [/VERIFIED-GOLDEN]

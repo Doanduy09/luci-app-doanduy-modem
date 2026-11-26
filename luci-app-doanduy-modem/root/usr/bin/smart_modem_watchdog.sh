@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part3-smart-modem-watchdog | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # ==============================================================================
 # 🛡️ "BÁC SĨ 5G TỰ CHỮA BỆNH MẠNG" (AI NETWORK SELF-HEALING ENGINE)
 # Hệ thống tự chuẩn đoán và tự chữa lành mạng 4 tầng cấp tiến (0s Downtime)
@@ -481,6 +482,10 @@ warm_reset_wwan_baseband() {
 
 heal_tier2_wwan_session() {
     local iface="${1:-$(get_smart_iface)}"
+    if [ -f /tmp/sms_sending.lock ]; then
+        echo "$(date): [Tầng 2] Tạm hoãn làm mới WWAN vì đang gửi/đọc SMS (sms_sending.lock)..." >> "$LOG_FILE"
+        return 1
+    fi
     local port=$(get_at_port)
     local proto=$(uci -q get network."$iface".proto || echo "mbim")
     echo "$(date): [Tầng 2] Làm mới phiên mạng WWAN (${iface}, proto=${proto}), Tái gắn kết PDP Context & Lấy lại IP..."
@@ -545,9 +550,9 @@ heal_tier3_cfun_cell_failover() {
         return 1
     fi
 
-    # 2. Bỏ qua nếu quectel-cm đang trong quá trình quay số
-    if [ -f "/tmp/quectel_dialing_${iface}" ] || [ -f /tmp/quectel_dialing ]; then
-        echo "$(date): [Tầng 3] Modem đang quay số (quectel_dialing), tạm hoãn can thiệp..."
+    # 2. Bỏ qua nếu quectel-cm đang quay số hoặc tiến trình SMS gia hạn/tra cước đang giữ cổng
+    if [ -f "/tmp/quectel_dialing_${iface}" ] || [ -f /tmp/quectel_dialing ] || [ -f /tmp/sms_sending.lock ]; then
+        echo "$(date): [Tầng 3] Modem đang quay số hoặc gửi SMS, tạm hoãn can thiệp..."
         return 1
     fi
 
@@ -728,8 +733,11 @@ switch_dual_sim() {
         if echo "$m_type" | grep -iqE "sierra|1199:"; then
             # Sierra Wireless EM919x/EM7565: AT!UIMS? (0: SIM1, 1: SIM2)
             cur_slot=$(wd_at_cmd "$port" "AT!UIMS?" 3 2>/dev/null | grep -i "!UIMS:" | awk -F':' '{print $2}' | tr -d ' \r\n')
-            [ "$cur_slot" = "0" ] && cur_slot="1"
-            [ "$cur_slot" = "1" ] && cur_slot="2"
+            case "$cur_slot" in
+                0) cur_slot="1" ;;
+                1) cur_slot="2" ;;
+                *) cur_slot="1" ;;
+            esac
         elif echo "$m_type" | grep -iqE "fibocom|fm350|2cb7:|0e8d:"; then
             # Fibocom: AT+GTSETSIM?
             cur_slot=$(wd_at_cmd "$port" "AT+GTSETSIM?" 3 2>/dev/null | grep -i "+GTSETSIM:" | awk -F':' '{print $2}' | tr -d ' \r\n')
@@ -861,6 +869,7 @@ echo "$(date): Bác Sĩ Mạng 5G AI (Smart Self-Healing Watchdog) đã kích ho
 rotate_log_if_needed
 
 proactive_rf_health_guard() {
+    [ -f /tmp/sms_sending.lock ] && return 0
     local now_ts=$(date +%s)
     local last_check=$(cat /tmp/last_proactive_check 2>/dev/null || echo 0)
     [ $((now_ts - last_check)) -lt 45 ] && return 0
@@ -944,7 +953,7 @@ while true; do
         if_json=$(ubus call network.interface."$ACT_IFACE" status 2>/dev/null)
         if_state=$(echo "$if_json" | jsonfilter -e '@.up' 2>/dev/null)
         if_pending=$(echo "$if_json" | jsonfilter -e '@.pending' 2>/dev/null)
-        if [ "$up_sec" -ge 90 ] && [ "$if_state" != "true" ] && [ "$if_pending" != "true" ] && [ ! -f "/tmp/quectel_dialing_${ACT_IFACE}" ] && [ ! -f /tmp/quectel_dialing ]; then
+        if [ "$up_sec" -ge 90 ] && [ "$if_state" != "true" ] && [ "$if_pending" != "true" ] && [ ! -f "/tmp/quectel_dialing_${ACT_IFACE}" ] && [ ! -f /tmp/quectel_dialing ] && [ ! -f /tmp/sms_sending.lock ]; then
             echo "$(date): [Interface Guard] ⚠️ Phát hiện giao diện $ACT_IFACE đang TẮT/DỪNG! Tự động bật lại ngay lập tức (ifup $ACT_IFACE)..." >> "$LOG_FILE"
             ubus call network.interface."$ACT_IFACE" up 2>/dev/null || ifup "$ACT_IFACE" 2>/dev/null
             sleep 2
@@ -1187,3 +1196,4 @@ while true; do
 💡 <b>Nguyên nhân có thể:</b> Trạm phát BTS khu vực đang mất sóng hoặc SIM hết hạn gói cước."
     fi
 done
+# [/VERIFIED-GOLDEN]

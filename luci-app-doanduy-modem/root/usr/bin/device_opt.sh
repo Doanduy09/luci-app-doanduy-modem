@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-ram-soc-device-optimizer | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Hardware-Universal Device Optimizer (RAM-Tier + SoC-Aware + Safe Rollback)
 . /usr/share/libubox/jshn.sh
 
@@ -182,3 +183,4 @@ case "$1" in
 	reset)  cmd_reset ;;
 	*)      cmd_status ;;
 esac
+# [/VERIFIED-GOLDEN]

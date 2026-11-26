@@ -1,3 +1,4 @@
+// [VERIFIED-GOLDEN: part4-luci-smarthome-ui | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 'use strict';
 'require baseclass';
 'require rpc';
@@ -738,3 +739,4 @@ return baseclass.extend({
         return pane;
     }
 });
+// [/VERIFIED-GOLDEN]

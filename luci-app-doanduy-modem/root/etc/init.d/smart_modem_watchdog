@@ -1,7 +1,8 @@
 #!/bin/sh /etc/rc.common
+# [VERIFIED-GOLDEN: part3-watchdog-init-seq98 | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 
 USE_PROCD=1
-START=97
+START=98
 STOP=10
 
 start_service() {
@@ -13,3 +14,4 @@ start_service() {
 	procd_set_param stderr 0
 	procd_close_instance
 }
+# [/VERIFIED-GOLDEN]

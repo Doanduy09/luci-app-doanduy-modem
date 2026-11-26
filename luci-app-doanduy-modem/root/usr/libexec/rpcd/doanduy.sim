@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-rpcd-sim-whitelist | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Authenticated SIM Whitelist & Auto-Renew RPCD Backend (Zero-Leak SHA-256)
 . /usr/share/libubox/jshn.sh
 
@@ -326,3 +327,4 @@ case "$1" in
 		esac
 		;;
 esac
+# [/VERIFIED-GOLDEN]

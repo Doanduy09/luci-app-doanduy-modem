@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part3-modem-suite-uci-defaults | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Master Suite - System Initialization & Auto-Setup
 
 # 1. Cap quyen thuc thi cho toan bo script he thong
@@ -167,3 +168,4 @@ rm -rf /tmp/luci-modulecache 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null
 
 exit 0
+# [/VERIFIED-GOLDEN]

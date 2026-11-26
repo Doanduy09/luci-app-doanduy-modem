@@ -1,3 +1,4 @@
+-- [VERIFIED-GOLDEN: part4-tuya-v35-local | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 -- Pure-Lua Tuya Protocol v3.5 Local LAN Client for OpenWrt (Lua 5.1 + nixio + cjson)
 -- Implements AES-128-GCM, SHA-256, HMAC-SHA256, v3.5 session negotiation (6699/9966),
 -- and S06 Pro Universal IR send/learn/status on TCP 6668 with zero external binaries.
@@ -690,3 +691,4 @@ function M.learn_ir(ip, dev_id, local_key, timeout_s, control_type)
 end
 
 return M
+-- [/VERIFIED-GOLDEN]

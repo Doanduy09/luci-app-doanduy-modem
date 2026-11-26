@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-logall-cli | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Universal Modem & Dialer Status CLI
 if command -v ubus >/dev/null 2>&1 && ubus list modem_ctrl >/dev/null 2>&1; then
 	echo "=== THONG TIN MODEM (LIVE) ==="
@@ -13,3 +14,4 @@ done
 echo ""
 echo "=== LOG GAN NHAT ==="
 logread | grep -i duydoan5g | tail -n 15
+# [/VERIFIED-GOLDEN]

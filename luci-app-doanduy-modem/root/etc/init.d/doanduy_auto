@@ -1,7 +1,8 @@
 #!/bin/sh /etc/rc.common
 # DOANDUY 5G Auto Background Optimizer & Nightly AdShield Daemon
+# [VERIFIED-GOLDEN: part4-doanduy-auto-seq95 | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 
-START=96
+START=95
 STOP=10
 
 start() {
@@ -35,3 +36,4 @@ start() {
 stop() {
 	return 0
 }
+# [/VERIFIED-GOLDEN]

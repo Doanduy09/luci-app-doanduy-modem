@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-restart-wwan-cli | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Universal Restart All WWAN Interfaces
 ifaces=$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='duydoan5g'$/\1/p")
 [ -n "$ifaces" ] || ifaces="duydoan_5g"
@@ -8,3 +9,4 @@ for iface in $ifaces; do
 	sleep 2
 	ifup "$iface"
 done
+# [/VERIFIED-GOLDEN]

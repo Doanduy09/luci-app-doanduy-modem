@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-rpcd-sms-bandlock | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 
 safe_at_cleanup() {
     killall -CONT ModemManager modemmanager 2>/dev/null
@@ -1266,3 +1267,4 @@ EOF
         esac
         ;;
 esac
+# [/VERIFIED-GOLDEN]

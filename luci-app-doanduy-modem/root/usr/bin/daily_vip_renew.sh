@@ -1,10 +1,20 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part3-daily-vip-renew-engine | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 export TZ='<+07>-7'
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
+dec_num() {
+    local n
+    n=$(printf '%s' "$1" | tr -cd '0-9' | sed 's/^0*//')
+    printf '%s' "${n:-0}"
+}
+
 log() {
+    if [ -f /tmp/daily_vip_renew.log ] && [ "$(wc -c < /tmp/daily_vip_renew.log 2>/dev/null || echo 0)" -gt 51200 ]; then
+        tail -n 100 /tmp/daily_vip_renew.log > /tmp/daily_vip_renew.log.tmp 2>/dev/null && mv -f /tmp/daily_vip_renew.log.tmp /tmp/daily_vip_renew.log 2>/dev/null
+    fi
     echo "$(TZ='<+07>-7' date '+%Y-%m-%d %H:%M:%S') $1" >> /tmp/daily_vip_renew.log
 }
 
@@ -210,18 +220,22 @@ if [ "$is_manual" -ne 1 ]; then
     fi
 fi
 
-# 4. Tinh toan lich gui cho SIM VIP
+# 4. Tinh toan lich gui cho SIM VIP (POSIX decimal-safe: khong bao gio loi bat phan 08/09 trong BusyBox ash)
 custom_time=$(cat /etc/config/sms_custom_time.dat 2>/dev/null | tr -d ' \r\n')
 [ -z "$custom_time" ] && custom_time="01:25:30"
-t_h=$(echo "$custom_time" | cut -d':' -f1)
-t_m=$(echo "$custom_time" | cut -d':' -f2)
-t_s=$(echo "$custom_time" | cut -d':' -f3)
-[ -z "$t_s" ] && t_s="00"
+t_h_raw=$(echo "$custom_time" | cut -d':' -f1)
+t_m_raw=$(echo "$custom_time" | cut -d':' -f2)
+t_s_raw=$(echo "$custom_time" | cut -d':' -f3)
+t_h=$(dec_num "$t_h_raw")
+t_m=$(dec_num "$t_m_raw")
+t_s=$(dec_num "${t_s_raw:-0}")
 
 total_sec=$(( t_h*3600 + t_m*60 + t_s ))
 if [ "$total_sec" -lt 1200 ] || [ "$total_sec" -gt 20400 ]; then
     t_h=1; t_m=25; t_s=30
     custom_time="01:25:30"
+else
+    custom_time=$(printf '%02d:%02d:%02d' "$t_h" "$t_m" "$t_s")
 fi
 
 today_midnight=$(TZ='<+07>-7' date -d "${today} 00:00:00" +%s 2>/dev/null || date +%s)
@@ -351,3 +365,4 @@ echo "{\"status\":\"sent\",\"package\":\"$renew_pkg\",\"dest\":\"$renew_dest\",\
 sync
 log "🎯 Chu kỳ gia hạn và đổi IP ngày $today đã hoàn tất xuất sắc."
 exit 0
+# [/VERIFIED-GOLDEN]

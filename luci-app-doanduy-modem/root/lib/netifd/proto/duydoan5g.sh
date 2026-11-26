@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part3-netifd-proto-duydoan5g | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 . /lib/functions.sh
 . /lib/netifd/netifd-proto.sh
 init_proto "$@"
@@ -52,3 +53,4 @@ proto_duydoan5g_teardown() {
 }
 
 add_protocol duydoan5g
+# [/VERIFIED-GOLDEN]

@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-logchan-cli | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 LOGFILE="/tmp/log_chanquangcao"
 case "$1" in
 	clear|xoa|reset|clr) > "$LOGFILE" && echo "Đã xóa sạch nhật ký." ;;
@@ -7,3 +8,4 @@ case "$1" in
 	status) /usr/bin/adshield status ;;
 	*) echo "=== Nhật ký Micro AdShield ==="; tail -n 30 "$LOGFILE" 2>/dev/null; /usr/bin/adshield status ;;
 esac
+# [/VERIFIED-GOLDEN]

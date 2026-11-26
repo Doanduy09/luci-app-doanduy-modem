@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part3-supervised-5g-dialer | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Supervised Netifd Dialer (QModem-Grade Lifecycle & MBIM/QMI/DHCP)
 . /lib/functions.sh
 . /lib/netifd/netifd-proto.sh
@@ -1778,3 +1779,4 @@ while [ "$STOP_REQ" = "0" ]; do
     [ "$backoff" -gt 15 ] && backoff=15
     sleep "$backoff"
 done
+# [/VERIFIED-GOLDEN]

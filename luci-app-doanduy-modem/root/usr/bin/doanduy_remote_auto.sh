@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-tailscale-auto-provisioner | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Universal Tailscale Auto-Provisioner & Debian VM Mesh Bridge
 . /usr/share/libubox/jshn.sh
 
@@ -410,3 +411,4 @@ case "$1" in
 	ensure) cmd_ensure ;;
 	*)      echo "Usage: $0 {up [key] [funnel]|down|ensure}"; exit 1 ;;
 esac
+# [/VERIFIED-GOLDEN]

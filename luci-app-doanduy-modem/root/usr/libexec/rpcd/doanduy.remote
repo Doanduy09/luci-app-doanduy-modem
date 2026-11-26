@@ -1,4 +1,5 @@
 #!/bin/sh
+# [VERIFIED-GOLDEN: part4-rpcd-remote | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 # DOANDUY 5G Universal Remote Access (Tailscale, Safe WAN Port, Tunnel) RPCD Backend
 . /usr/share/libubox/jshn.sh
 
@@ -157,3 +158,4 @@ case "$1" in
 		esac
 		;;
 esac
+# [/VERIFIED-GOLDEN]

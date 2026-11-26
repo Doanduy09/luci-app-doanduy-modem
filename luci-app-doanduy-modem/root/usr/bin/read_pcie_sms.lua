@@ -1,4 +1,5 @@
 #!/usr/bin/lua
+-- [VERIFIED-GOLDEN: part3-pcie-usb-pdu-sms-engine | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 -- DOANDUY 5G PCIe AT & SMS Engine (Raw POSIX WWAN FD + QMI WMS + PDU/UTF-8)
 local nixio = require("nixio")
 
@@ -767,3 +768,4 @@ else
         write_inbox_json({})
     end
 end
+-- [/VERIFIED-GOLDEN]

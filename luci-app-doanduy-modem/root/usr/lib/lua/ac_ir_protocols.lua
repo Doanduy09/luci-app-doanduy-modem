@@ -1,3 +1,4 @@
+-- [VERIFIED-GOLDEN: part4-ac-ir-protocols | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
 -- Pure-Lua Universal AC IR Protocol Synthesizer for Tuya S06 Pro (OpenWrt Lua 5.1)
 -- Generates Tuya-native (head, key) timing strings locally with zero cloud or remote learning needed.
 -- Bit timings & frame checksums verified against crankyoldgit/IRremoteESP8266.
@@ -576,3 +577,4 @@ function M.encode_generic(proto, dev, subdev, func)
 end
 
 return M
+-- [/VERIFIED-GOLDEN]

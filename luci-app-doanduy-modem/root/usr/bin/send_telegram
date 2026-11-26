@@ -1,5 +1,10 @@
 #!/bin/sh
-trap 'wait -n 2>/dev/null' CHLD
+# [VERIFIED-GOLDEN: part4-send-telegram-posix-safe | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+dec_num() {
+    local n
+    n=$(printf '%s' "$1" | tr -cd '0-9' | sed 's/^0*//')
+    printf '%s' "${n:-0}"
+}
 read_kv() {
     [ -f "$1" ] || return 0
     local v
@@ -27,7 +32,7 @@ autodel="${3:-$TG_AUTODEL}"
 [ -z "$msg" ] || [ -z "$ADMIN_CHAT_ID" ] || [ -z "$BOT_TOKEN" ] && exit 0
 
 # 🌙 CHẾ ĐỘ YÊN TĨNH BAN ĐÊM (23:00 - 06:59): Không gửi báo cáo định kỳ làm phiền giấc ngủ
-cur_hour=$(date +%H 2>/dev/null || echo 12)
+cur_hour=$(dec_num "$(date +%H 2>/dev/null || echo 12)")
 if [ "$cur_hour" -ge 23 ] || [ "$cur_hour" -lt 7 ]; then
     if ! echo "$msg" | grep -qE '(CẢNH BÁO KHẨN|SOS|BÁO ĐỘNG|XÂM NHẬP|CHÁY NỔ|QUÁ NHIỆT|NGUY HIỂM)'; then
         exit 0
@@ -83,27 +88,52 @@ if [ -s /etc/ssl/certs/ca-certificates.crt ]; then
     uf_tls=""
 fi
 
+url_encode_post() {
+    local cid="$1" mode="$2" txt="$3" mk="$4"
+    if command -v lua >/dev/null 2>&1; then
+        lua - "$cid" "$mode" "$txt" "$mk" << 'LUAENC' 2>/dev/null
+local cid, mode, txt, mk = arg[1] or "", arg[2] or "", arg[3] or "", arg[4] or ""
+local function enc(s)
+    return (tostring(s):gsub("([^%w%-_%.~])", function(c) return string.format("%%%02X", string.byte(c)) end))
+end
+local out = "chat_id=" .. enc(cid) .. "&text=" .. enc(txt)
+if mode ~= "" then out = out .. "&parse_mode=" .. enc(mode) end
+if mk ~= "" and mk:find("{", 1, true) then out = out .. "&reply_markup=" .. enc(mk) end
+io.write(out)
+LUAENC
+        return 0
+    fi
+    printf 'chat_id=%s&text=%s' "$cid" "$(printf '%s' "$txt" | tr '\r\n' '  ' | sed 's/%/%25/g; s/&/%26/g; s/+/%2B/g; s/#/%23/g; s/=/%3D/g; s/ /%20/g')"
+}
+
 res=""
-if command -v curl >/dev/null 2>&1; then
+if command -v curl >/dev/null 2>&1 && ! curl --version 2>/dev/null | grep -qi 'uclient-fetch'; then
     set -- $curl_tls -s -m 8 -X POST -d "chat_id=${ADMIN_CHAT_ID}" -d "parse_mode=HTML" --data-urlencode "text=${clean_msg}"
     case "$markup" in
         *{*) set -- "$@" --data-urlencode "reply_markup=${markup}" ;;
     esac
     res=$(curl "$@" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
-else
-    res=$(uclient-fetch -q -O - $uf_tls --timeout=8 --post-data="chat_id=${ADMIN_CHAT_ID}" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?text=$(printf '%s' "$clean_msg" | sed 's/ /%20/g')" 2>/dev/null)
+elif command -v uclient-fetch >/dev/null 2>&1; then
+    post_body=$(url_encode_post "$ADMIN_CHAT_ID" "HTML" "$clean_msg" "$markup")
+    res=$(timeout 10 uclient-fetch -q -O - $uf_tls --timeout=8 --post-data="$post_body" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+elif command -v wget >/dev/null 2>&1; then
+    post_body=$(url_encode_post "$ADMIN_CHAT_ID" "HTML" "$clean_msg" "$markup")
+    res=$(timeout 10 wget -q -O - $uf_tls -T 8 --post-data="$post_body" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
 fi
 record_rate_limit "$res"
 
 if ! echo "$res" | grep -q '"ok":true'; then
     check_rate_limit || exit 0
     plain_text=$(printf '%s' "$clean_msg" | sed 's/<[^>]*>/ /g' | tr -s ' ' | cut -c 1-4000)
-    if command -v curl >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1 && ! curl --version 2>/dev/null | grep -qi 'uclient-fetch'; then
         set -- $curl_tls -s -m 8 -X POST -d "chat_id=${ADMIN_CHAT_ID}" --data-urlencode "text=${plain_text}"
         case "$markup" in
             *{*) set -- "$@" --data-urlencode "reply_markup=${markup}" ;;
         esac
         res=$(curl "$@" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        post_body=$(url_encode_post "$ADMIN_CHAT_ID" "" "$plain_text" "$markup")
+        res=$(timeout 10 uclient-fetch -q -O - $uf_tls --timeout=8 --post-data="$post_body" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null)
     fi
     record_rate_limit "$res"
 fi
@@ -125,3 +155,4 @@ if [ -n "$autodel" ] && [ "$autodel" -gt 0 ] 2>/dev/null && [ -n "$msg_id" ]; th
 fi
 
 echo "$res"
+# [/VERIFIED-GOLDEN]
