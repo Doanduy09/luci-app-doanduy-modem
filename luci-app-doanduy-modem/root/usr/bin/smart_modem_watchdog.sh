@@ -91,6 +91,7 @@ is_quectel_modem() {
     local META_VENDOR="" META_USB_VID=""
     [ -f /tmp/duydoan5g_modem_meta ] && . /tmp/duydoan5g_modem_meta 2>/dev/null
     [ "$META_VENDOR" = "quectel" ] || [ "$META_USB_VID" = "2c7c" ] && return 0
+    [ -n "$META_VENDOR" ] && [ "$META_VENDOR" != "quectel" ] && return 1
     local m_type
     m_type=$(cat /tmp/master_m_type 2>/dev/null || lsusb 2>/dev/null)
     echo "$m_type" | grep -iqE "quectel|2c7c:"
