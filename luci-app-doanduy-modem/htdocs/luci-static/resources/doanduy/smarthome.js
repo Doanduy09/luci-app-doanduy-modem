@@ -1,4 +1,5 @@
-// [VERIFIED-GOLDEN: part4-luci-smarthome-ui | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+// [VERIFIED-GOLDEN: part4-luci-smarthome-ui-v246 | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+// DOANDUY Smart Home v2.4.6 LuCI Frontend (Auto-Discovery + Unlimited Devices & Actions)
 'use strict';
 'require baseclass';
 'require rpc';
@@ -6,12 +7,27 @@
 
 var callSHStatus    = rpc.declare({ object: 'doanduy.smarthome', method: 'status', expect: { } });
 var callSHScan      = rpc.declare({ object: 'doanduy.smarthome', method: 'scanHubs', expect: { } });
+var callSHProbeIp   = rpc.declare({ object: 'doanduy.smarthome', method: 'probeIp', params: ['ip'], expect: { } });
+var callSHScanLan   = rpc.declare({ object: 'doanduy.smarthome', method: 'scanLanSmartDevices', expect: { } });
 var callSHSaveCtrl  = rpc.declare({ object: 'doanduy.smarthome', method: 'saveController', params: ['id', 'kind', 'name', 'room', 'ip', 'mac', 'device_id', 'local_key', 'control_type'], expect: { } });
 var callSHRmCtrl    = rpc.declare({ object: 'doanduy.smarthome', method: 'removeController', params: ['id'], expect: { } });
 var callSHSearch    = rpc.declare({ object: 'doanduy.smarthome', method: 'searchCatalog', params: ['query', 'category', 'include_online'], expect: { } });
 var callSHTestItem  = rpc.declare({ object: 'doanduy.smarthome', method: 'testCatalogItem', params: ['catalog_id', 'irdb_path', 'controller_id', 'dry_run'], expect: { } });
-var callSHAdd       = rpc.declare({ object: 'doanduy.smarthome', method: 'addDevice', params: ['driver', 'catalog_id', 'irdb_path', 'controller_id', 'name', 'room', 'category', 'ip', 'mac', 'device_id', 'local_key', 'dp', 'on_url', 'off_url', 'tv_id'], expect: { } });
+var callSHAdd       = rpc.declare({
+    object: 'doanduy.smarthome', method: 'addDevice',
+    params: [
+        'driver', 'catalog_id', 'irdb_path', 'controller_id',
+        'name', 'room', 'category', 'category_label',
+        'ip', 'mac', 'device_id', 'local_key', 'dp',
+        'on_url', 'off_url', 'tv_id',
+        'port', 'shelly_gen', 'channels', 'web_url', 'rtsp_url',
+        'actions_json', 'capabilities_json', 'meta_json'
+    ],
+    expect: { }
+});
 var callSHRemove    = rpc.declare({ object: 'doanduy.smarthome', method: 'removeDevice', params: ['id'], expect: { } });
+var callSHSaveAct   = rpc.declare({ object: 'doanduy.smarthome', method: 'saveDeviceAction', params: ['id', 'action_id', 'label', 'icon', 'kind', 'url', 'body', 'ip', 'port', 'payload', 'dp', 'dp_val', 'style'], expect: { } });
+var callSHRmAct     = rpc.declare({ object: 'doanduy.smarthome', method: 'removeDeviceAction', params: ['id', 'action_id'], expect: { } });
 var callSHControl   = rpc.declare({ object: 'doanduy.smarthome', method: 'controlDevice', params: ['id', 'op', 'value', 'button', 'dry_run'], expect: { } });
 var callSHLearn     = rpc.declare({ object: 'doanduy.smarthome', method: 'learnButton', params: ['id', 'button', 'label'], expect: { } });
 
@@ -25,9 +41,75 @@ var CAT_META = [
     { key: 'irdb',  icon: '🌐', label: 'Kho Online 3.200+' }
 ];
 
+var SMART_CATEGORIES = [
+    { key: 'light',    icon: '💡', label: 'Đèn thông minh' },
+    { key: 'plug',     icon: '🔌', label: 'Ổ cắm / Công tắc' },
+    { key: 'security', icon: '🚨', label: 'Chống trộm / Báo động' },
+    { key: 'sensor',   icon: '📡', label: 'Cảm biến' },
+    { key: 'curtain',  icon: '🪟', label: 'Rèm / Cổng / Cửa cuốn' },
+    { key: 'lock',     icon: '🔐', label: 'Khóa thông minh' },
+    { key: 'camera',   icon: '📹', label: 'Camera an ninh' },
+    { key: 'pump',     icon: '💧', label: 'Máy bơm / Tưới cây' },
+    { key: 'ac',       icon: '❄️', label: 'Máy lạnh' },
+    { key: 'tv',       icon: '📺', label: 'Tivi' },
+    { key: 'fan',      icon: '🌀', label: 'Quạt' },
+    { key: 'audio',    icon: '🔊', label: 'Loa / Soundbar' },
+    { key: 'custom',   icon: '✨', label: 'Tự đặt loại mới...' }
+];
+
+var DRIVER_OPTIONS = [
+    { key: 'tasmota',       label: 'Tasmota Wi-Fi (Đèn / Công tắc / Chống trộm)' },
+    { key: 'shelly',        label: 'Shelly Gen1/Gen2 Local' },
+    { key: 'wled',          label: 'Đèn LED WLED (Bật/Tắt + Độ sáng)' },
+    { key: 'yeelight',      label: 'Đèn Yeelight Wi-Fi (TCP 55443)' },
+    { key: 'sonoff_diy',    label: 'Sonoff DIY LAN (Port 8081)' },
+    { key: 'tuya_switch',   label: 'Thiết bị Tuya Smart LAN (Port 6668 + Local Key)' },
+    { key: 'android_tv',    label: 'Android TV / Google TV (LAN)' },
+    { key: 'camera_lan',    label: 'Camera An Ninh IP / RTSP / Web' },
+    { key: 'smart_actions', label: 'Thiết bị Thông Minh Tùy Biến (Vô hạn nút lệnh)' },
+    { key: 'http_relay',    label: 'Công tắc HTTP Relay LAN (2 URL Bật/Tắt)' }
+];
+
 function catIcon(cat) {
-    var map = { ac: '❄️', tv: '📺', fan: '🌀', audio: '🔊', light: '💡', plug: '🔌', other: '📦' };
+    var map = {
+        ac: '❄️', tv: '📺', fan: '🌀', audio: '🔊',
+        light: '💡', plug: '🔌', security: '🚨', sensor: '📡',
+        curtain: '🪟', lock: '🔐', camera: '📹', pump: '💧',
+        custom: '✨', other: '📦'
+    };
     return map[cat] || '🎛️';
+}
+
+function buildActionTemplates(cat, ip, port) {
+    var host = (ip && ip.trim()) ? ip.trim() : '192.168.1.x';
+    var base = 'http://' + host + (port && Number(port) !== 80 ? (':' + port) : '');
+    if (cat === 'security') {
+        return [
+            { id: 'arm',    label: 'Bật Chống Trộm', icon: '🛡️', kind: 'http_get', url: base + '/arm', style: 'success' },
+            { id: 'disarm', label: 'Tắt Báo Động',   icon: '🔓', kind: 'http_get', url: base + '/disarm', style: 'neutral' },
+            { id: 'sos',    label: 'Hú Còi SOS',     icon: '🚨', kind: 'http_get', url: base + '/sos', style: 'danger' },
+            { id: 'ping',   label: 'Kiểm Tra Online', icon: '🩺', kind: 'ping', style: 'info' }
+        ];
+    }
+    if (cat === 'curtain') {
+        return [
+            { id: 'open',  label: 'Mở Ra',    icon: '🪟', kind: 'http_get', url: base + '/open', style: 'success' },
+            { id: 'stop',  label: 'Dừng Lại', icon: '⏸️', kind: 'http_get', url: base + '/stop', style: 'neutral' },
+            { id: 'close', label: 'Đóng Lại', icon: '🔒', kind: 'http_get', url: base + '/close', style: 'danger' }
+        ];
+    }
+    if (cat === 'lock') {
+        return [
+            { id: 'unlock', label: 'Mở Khóa',  icon: '🔓', kind: 'http_get', url: base + '/unlock', style: 'success' },
+            { id: 'lock',   label: 'Khóa Lại', icon: '🔐', kind: 'http_get', url: base + '/lock', style: 'danger' },
+            { id: 'ping',   label: 'Kiểm Tra', icon: '🩺', kind: 'ping', style: 'info' }
+        ];
+    }
+    return [
+        { id: 'on',   label: 'Bật',             icon: '⚡', kind: 'http_get', url: base + '/on', style: 'success' },
+        { id: 'off',  label: 'Tắt',             icon: '🛑', kind: 'http_get', url: base + '/off', style: 'danger' },
+        { id: 'ping', label: 'Kiểm Tra Online', icon: '🩺', kind: 'ping', style: 'info' }
+    ];
 }
 
 function mkBtn(label, style, onClick) {
@@ -60,16 +142,96 @@ return baseclass.extend({
             includeOnline: true,
             searchTimer: null,
             learnDevices: {},
+            editActionDev: {},
             showCtrlsPanel: false,
-            modalTab: 'ir'
+            modalTab: 'auto',
+            autoDraft: null,
+            autoScanItems: []
         };
+
+        // Shared inline Action Builder (Zero duplication between Add Modal & Device Cards)
+        function createActionForm(defaultIp, onAdd, onCancel) {
+            var baseIp = (defaultIp && defaultIp.trim()) ? defaultIp.trim() : '192.168.1.x';
+            var aLabelIn = E('input', { type: 'text', class: 'cbi-input-text', placeholder: 'Tên nút (VD: Bật còi, Mở cổng)', style: 'width: 100%; box-sizing: border-box; font-size: 12px;' });
+            var aIconIn  = E('input', { type: 'text', class: 'cbi-input-text', value: '⚡', placeholder: 'Icon', style: 'width: 100%; box-sizing: border-box; font-size: 12px; text-align: center;' });
+            var aKindSel = E('select', { class: 'cbi-input-select', style: 'width: 100%; font-size: 12px;' }, [
+                E('option', { value: 'http_get' }, 'HTTP GET (LAN URL)'),
+                E('option', { value: 'http_post' }, 'HTTP POST (JSON/Text)'),
+                E('option', { value: 'tuya_dp' }, 'Tuya DP (Chân DP thiết bị Tuya)'),
+                E('option', { value: 'tcp_send' }, 'TCP Raw (IP + Port + Chuỗi)'),
+                E('option', { value: 'udp_send' }, 'UDP Raw (IP + Port + Chuỗi)'),
+                E('option', { value: 'open_url' }, 'Mở Trang Web Thiết Bị'),
+                E('option', { value: 'ping' }, 'Kiểm Tra Trạng Thái Online')
+            ]);
+            var aUrlIn   = E('input', { type: 'text', class: 'cbi-input-text', value: 'http://' + baseIp + '/on', placeholder: 'http://192.168.1.x/...', style: 'width: 100%; box-sizing: border-box; font-size: 12px;' });
+            var aBodyIn  = E('input', { type: 'text', class: 'cbi-input-text', placeholder: 'JSON Body / Chuỗi gửi (VD: {"on":true})', style: 'width: 100%; box-sizing: border-box; font-size: 12px;' });
+            var aIpIn    = E('input', { type: 'text', class: 'cbi-input-text', value: baseIp, placeholder: '192.168.1.x', style: 'width: 100%; box-sizing: border-box; font-size: 12px;' });
+            var aPortIn  = E('input', { type: 'text', class: 'cbi-input-text', value: '8080', placeholder: 'Port', style: 'width: 100%; box-sizing: border-box; font-size: 12px;' });
+            var aDpIn    = E('input', { type: 'text', class: 'cbi-input-text', value: '1', placeholder: 'VD: 1, 2, 101', style: 'width: 100%; box-sizing: border-box; font-size: 12px;' });
+            var aDpValIn = E('input', { type: 'text', class: 'cbi-input-text', value: 'true', placeholder: 'true / false / số / chuỗi', style: 'width: 100%; box-sizing: border-box; font-size: 12px;' });
+
+            var urlWrap  = E('div', { style: 'grid-column: 1 / -1;' }, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Đường dẫn URL (Mạng LAN)'), aUrlIn ]);
+            var bodyWrap = E('div', { style: 'display: none; grid-column: 1 / -1;' }, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Nội dung Payload / JSON Body'), aBodyIn ]);
+            var netWrap  = E('div', { style: 'display: none; grid-template-columns: 2fr 1fr; gap: 6px; grid-column: 1 / -1;' }, [
+                E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'IP LAN'), aIpIn ]),
+                E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Port'), aPortIn ])
+            ]);
+            var dpWrap   = E('div', { style: 'display: none; grid-template-columns: 1fr 2fr; gap: 6px; grid-column: 1 / -1;' }, [
+                E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Mã DP'), aDpIn ]),
+                E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Giá trị DP'), aDpValIn ])
+            ]);
+
+            function syncKindFields() {
+                var k = aKindSel.value;
+                urlWrap.style.display  = (k === 'http_get' || k === 'http_post' || k === 'open_url') ? 'block' : 'none';
+                bodyWrap.style.display = (k === 'http_post' || k === 'tcp_send' || k === 'udp_send') ? 'block' : 'none';
+                netWrap.style.display  = (k === 'tcp_send' || k === 'udp_send') ? 'grid' : 'none';
+                dpWrap.style.display   = (k === 'tuya_dp') ? 'grid' : 'none';
+            }
+            aKindSel.addEventListener('change', syncKindFields);
+            syncKindFields();
+
+            return E('div', { style: 'background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; margin-top: 8px;' }, [
+                E('div', { style: 'display: grid; grid-template-columns: 3fr 1fr 2fr; gap: 6px;' }, [
+                    E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Tên nút lệnh'), aLabelIn ]),
+                    E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Icon'), aIconIn ]),
+                    E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Giao thức'), aKindSel ]),
+                    urlWrap, netWrap, dpWrap, bodyWrap
+                ]),
+                E('div', { style: 'display: flex; gap: 6px; margin-top: 8px; justify-content: flex-end;' }, [
+                    mkBtn('Hủy', 'font-size: 11.5px; padding: 4px 10px;', function() { if (onCancel) onCancel(); }),
+                    mkBtn('💾 Lưu Nút Lệnh', 'font-size: 11.5px; padding: 4px 12px; background: #2563eb; color: #fff; border-color: #2563eb;', function() {
+                        var lbl = aLabelIn.value.trim();
+                        if (!lbl) { ui.addNotification(null, E('p', 'Vui lòng nhập tên nút lệnh!'), 'warning'); return; }
+                        var k = aKindSel.value;
+                        onAdd({
+                            id: 'act_' + Date.now(),
+                            label: lbl,
+                            icon: aIconIn.value.trim() || '⚡',
+                            kind: k,
+                            url: (k === 'http_get' || k === 'http_post' || k === 'open_url') ? aUrlIn.value.trim() : '',
+                            body: (k === 'http_post') ? aBodyIn.value : '',
+                            ip: (k === 'tcp_send' || k === 'udp_send') ? aIpIn.value.trim() : '',
+                            port: (k === 'tcp_send' || k === 'udp_send') ? (parseInt(aPortIn.value, 10) || 8080) : 0,
+                            payload: (k === 'tcp_send' || k === 'udp_send') ? aBodyIn.value : '',
+                            dp: (k === 'tuya_dp') ? (aDpIn.value.trim() || '1') : '',
+                            dp_val: (k === 'tuya_dp') ? aDpValIn.value.trim() : '',
+                            style: 'info'
+                        });
+                    })
+                ])
+            ]);
+        }
 
         // =========================================================================
         // 1. HEADER TOOLBAR + ROOM PILLS (Front & Center)
         // =========================================================================
         var roomBar = E('div', { style: 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center;' });
         var addCtaBtn = mkBtn('➕ Thêm Thiết Bị', 'background: #2563eb; color: #ffffff; border-color: #2563eb; padding: 8px 15px; font-size: 13px;', function() {
-            openAddModal('ir');
+            openAddModal('auto', false);
+        });
+        var autoScanBtn = mkBtn('🔍 Quét Tự Động LAN', 'background: #ecfdf5; color: #047857; border-color: #86efac; padding: 8px 13px; font-size: 12.5px;', function() {
+            openAddModal('auto', true);
         });
         var toggleCtrlsBtn = mkBtn('📡 Bộ Điều Khiển', 'background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;', function() {
             state.showCtrlsPanel = !state.showCtrlsPanel;
@@ -81,10 +243,11 @@ return baseclass.extend({
         }, [
             E('div', {}, [
                 E('h3', { style: 'margin: 0; font-size: 18px; font-weight: 850; color: #0f172a;' }, '🏠 Thiết Bị Điều Khiển Nhà'),
-                E('div', { style: 'font-size: 12px; color: #64748b; margin-top: 2px;' }, 'Điều khiển tập trung Máy lạnh, Quạt, Đèn, Công tắc Wi-Fi, TV LAN, Cục S06 & Mạch Giọng nói ESP32')
+                E('div', { style: 'font-size: 12px; color: #64748b; margin-top: 2px;' }, 'Tự nhận diện qua IP • Điều khiển không giới hạn Đèn, Ổ cắm, Chống trộm, Camera, Cảm biến, Rèm, Máy lạnh, TV & Voice ESP32')
             ]),
             E('div', { style: 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center;' }, [
                 addCtaBtn,
+                autoScanBtn,
                 toggleCtrlsBtn,
                 mkBtn('🔄 Làm mới', '', function() { refreshStatus(); })
             ])
@@ -140,14 +303,16 @@ return baseclass.extend({
                     style: 'grid-column: 1 / -1; padding: 26px; text-align: center; background: #ffffff; border: 1.5px dashed #cbd5e1; border-radius: 10px; color: #475569;'
                 }, [
                     E('div', { style: 'font-size: 14px; font-weight: 700; margin-bottom: 8px;' }, 'Chưa có thiết bị nào trong mục này.'),
-                    mkBtn('➕ Thêm Thiết Bị Ngay', 'background: #2563eb; color: #fff; border-color: #2563eb;', function() { openAddModal('ir'); })
+                    mkBtn('➕ Thêm Thiết Bị Ngay', 'background: #2563eb; color: #fff; border-color: #2563eb;', function() { openAddModal('auto', false); })
                 ]));
                 return;
             }
 
             visible.forEach(function(dev) {
                 var drv = dev.driver || (dev.type === 'ac' ? 'tuya_ir_ac' : 'tuya_ir_remote');
-                var subMeta = (dev.room || 'Nhà') + ' • ' + (dev.brand_label || dev.brand || drv);
+                var catMeta = dev.category_label ? (dev.category_label + ' • ') : '';
+                var subMeta = (dev.room || 'Nhà') + ' • ' + catMeta + (dev.brand_label || dev.brand || drv);
+                if (dev.ip) subMeta += ' • ' + dev.ip;
                 if (drv === 'tuya_ir_ac' || drv === 'tuya_ir_remote' || drv === 'custom_ir') {
                     subMeta += ' • qua ' + findCtrlName(dev.controller_id || 's06_default');
                 }
@@ -167,6 +332,7 @@ return baseclass.extend({
                 ]);
 
                 var bodyNodes = [];
+                var isPowerSwitch = (drv === 'tuya_switch' || drv === 'http_relay' || drv === 'tasmota' || drv === 'shelly' || drv === 'wled' || drv === 'yeelight' || drv === 'sonoff_diy');
                 if (drv === 'tuya_ir_ac' || dev.type === 'ac') {
                     var st = dev.state || { power: false, temp: 26, mode: 'cool', fan: 'auto', swing: false };
                     bodyNodes.push(E('div', { style: 'display: flex; align-items: center; justify-content: space-between; background: #f8fafc; padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;' }, [
@@ -204,9 +370,9 @@ return baseclass.extend({
                     fr.appendChild(mkBtn('🔄 Đổi mã', '', function() { sendCtrl(dev.id, 'next_variant'); }));
                     bodyNodes.push(fr);
 
-                } else if (drv === 'tuya_switch' || drv === 'http_relay') {
+                } else if (isPowerSwitch) {
                     var swOn = !!(dev.state && dev.state.on);
-                    bodyNodes.push(E('div', { style: 'display: flex; justify-content: space-between; align-items: center; background: #f8fafc; padding: 12px 14px; border-radius: 8px; gap: 8px;' }, [
+                    bodyNodes.push(E('div', { style: 'display: flex; justify-content: space-between; align-items: center; background: #f8fafc; padding: 11px 14px; border-radius: 8px; gap: 8px; flex-wrap: wrap;' }, [
                         E('div', { style: 'font-weight: 800; font-size: 14px; color: ' + (swOn ? '#16a34a' : '#64748b') + ';' }, swOn ? '🟢 ĐANG BẬT' : '⚪ ĐANG TẮT'),
                         E('div', { style: 'display: flex; gap: 6px;' }, [
                             mkBtn('⚡ BẬT', swOn ? 'background: #16a34a; color: #fff; border-color: #16a34a;' : '', function() { sendCtrl(dev.id, 'on'); }),
@@ -214,6 +380,43 @@ return baseclass.extend({
                             mkBtn('🔁 Đảo', '', function() { sendCtrl(dev.id, 'toggle'); })
                         ])
                     ]));
+                    var hasBri = Array.isArray(dev.capabilities) && dev.capabilities.indexOf('brightness') !== -1;
+                    if (hasBri || drv === 'wled' || drv === 'yeelight') {
+                        var curBri = (dev.state && dev.state.brightness) ? Number(dev.state.brightness) : 100;
+                        var briLbl = E('span', { style: 'font-size: 11.5px; font-weight: 700; color: #0284c7;' }, '🔆 Độ sáng: ' + curBri + '%');
+                        var briSlider = E('input', {
+                            type: 'range', min: '1', max: '100', value: String(curBri),
+                            style: 'flex: 1; min-width: 110px; cursor: pointer;',
+                            input: function(ev) { briLbl.textContent = '🔆 Độ sáng: ' + ev.target.value + '%'; },
+                            change: function(ev) { sendCtrl(dev.id, 'brightness', String(ev.target.value)); }
+                        });
+                        bodyNodes.push(E('div', { style: 'display: flex; align-items: center; gap: 8px; margin-top: 8px; background: #f8fafc; padding: 7px 10px; border-radius: 7px;' }, [
+                            briLbl, briSlider
+                        ]));
+                    }
+
+                } else if (drv === 'camera_lan') {
+                    var camOn = !(dev.state && dev.state.online === false);
+                    bodyNodes.push(E('div', { style: 'display: flex; justify-content: space-between; align-items: center; background: #f8fafc; padding: 10px 12px; border-radius: 8px; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;' }, [
+                        E('span', { style: 'font-weight: 800; font-size: 13px; color: ' + (camOn ? '#047857' : '#b91c1c') + ';' }, camOn ? '📹 Sẵn sàng trên LAN' : '🔴 Chưa phản hồi'),
+                        E('div', { style: 'display: flex; gap: 6px; flex-wrap: wrap;' }, [
+                            dev.web_url ? mkBtn('🌐 Mở Camera', 'background: #2563eb; color: #fff; border-color: #2563eb; font-size: 12px;', function() { window.open(dev.web_url, '_blank', 'noopener'); }) : E('span', {}),
+                            dev.rtsp_url ? mkBtn('📋 Copy RTSP', 'font-size: 12px;', function() {
+                                if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(dev.rtsp_url);
+                                ui.addNotification(null, E('p', '📋 Đã chép link RTSP: ' + dev.rtsp_url), 'info');
+                            }) : E('span', {}),
+                            mkBtn('🩺 Ping', 'font-size: 12px;', function() { sendCtrl(dev.id, 'ping'); })
+                        ])
+                    ]));
+
+                } else if (drv === 'smart_actions') {
+                    if (dev.category === 'security') {
+                        var am = (dev.state && dev.state.alarm_mode) || 'disarmed';
+                        var secBg = (am === 'sos') ? '#fef2f2; border-color: #fca5a5;' : (am === 'armed' ? '#f0fdf4; border-color: #86efac;' : '#f8fafc; border-color: #cbd5e1;');
+                        var secTxt = (am === 'sos') ? '🚨 ĐANG BÁO ĐỘNG SOS!' : (am === 'armed' ? '🛡️ ĐANG BẢO VỆ (ARMED)' : '🔓 ĐANG TẮT BẢO VỆ');
+                        var secCol = (am === 'sos') ? '#b91c1c' : (am === 'armed' ? '#15803d' : '#475569');
+                        bodyNodes.push(E('div', { style: 'padding: 9px 12px; border-radius: 8px; border: 1.5px solid; background: ' + secBg + ' margin-bottom: 8px; font-weight: 800; font-size: 13px; color: ' + secCol + ';' }, secTxt));
+                    }
 
                 } else if (drv === 'android_tv') {
                     var tvGrid = E('div', { style: 'display: grid; grid-template-columns: repeat(auto-fill, minmax(95px, 1fr)); gap: 6px;' }, [
@@ -276,6 +479,70 @@ return baseclass.extend({
                         }));
                     });
                     bodyNodes.push(kpad);
+                }
+
+                // Unlimited Actions Grid & Inline Action Adder for all Smart IP Devices
+                if (isPowerSwitch || drv === 'camera_lan' || drv === 'smart_actions') {
+                    var acts = Array.isArray(dev.actions) ? dev.actions : [];
+                    var isAddingAct = (state.editActionDev[dev.id] === 'add');
+                    var isManageAct = (state.editActionDev[dev.id] === 'manage');
+                    if (acts.length > 0) {
+                        var aGrid = E('div', { style: 'display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;' });
+                        acts.forEach(function(act) {
+                            var aSt = 'font-size: 12px; padding: 5px 10px;';
+                            if (act.style === 'success') aSt += 'background: #f0fdf4; color: #15803d; border-color: #86efac;';
+                            else if (act.style === 'danger') aSt += 'background: #fef2f2; color: #b91c1c; border-color: #fecaca;';
+                            else if (act.style === 'info') aSt += 'background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;';
+                            var btnWrap = E('div', { style: 'display: inline-flex; align-items: center; gap: 2px;' }, [
+                                mkBtn((act.icon ? (act.icon + ' ') : '') + act.label, aSt, function() {
+                                    if (act.kind === 'open_url' && act.url) {
+                                        window.open(act.url, '_blank', 'noopener');
+                                    } else {
+                                        sendCtrl(dev.id, 'action', '', act.id);
+                                    }
+                                }),
+                                isManageAct ? mkBtn('✕', 'font-size: 10px; padding: 3px 5px; color: #dc2626; border-color: #fecaca;', function() {
+                                    callSHRmAct(dev.id, act.id).then(function(r) {
+                                        if (r && r.device) {
+                                            for (var i = 0; i < state.devices.length; i++) {
+                                                if (state.devices[i].id === dev.id) { state.devices[i] = r.device; break; }
+                                            }
+                                            renderDeviceCards();
+                                        }
+                                    });
+                                }) : E('span', {})
+                            ]);
+                            aGrid.appendChild(btnWrap);
+                        });
+                        bodyNodes.push(aGrid);
+                    }
+                    bodyNodes.push(E('div', { style: 'display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;' }, [
+                        mkBtn('➕ Thêm Lệnh', 'font-size: 11px; padding: 3px 8px; background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;', function() {
+                            state.editActionDev[dev.id] = isAddingAct ? null : 'add';
+                            renderDeviceCards();
+                        }),
+                        acts.length > 0 ? mkBtn(isManageAct ? '✅ Xong' : '⚙️ Xóa bớt nút', 'font-size: 11px; padding: 3px 8px;', function() {
+                            state.editActionDev[dev.id] = isManageAct ? null : 'manage';
+                            renderDeviceCards();
+                        }) : E('span', {})
+                    ]));
+                    if (isAddingAct) {
+                        bodyNodes.push(createActionForm(dev.ip || '', function(newAct) {
+                            callSHSaveAct(dev.id, newAct.id, newAct.label, newAct.icon, newAct.kind, newAct.url, newAct.body, newAct.ip, newAct.port, newAct.payload, newAct.dp, newAct.dp_val, newAct.style).then(function(r) {
+                                ui.addNotification(null, E('p', (r && r.message) || 'Đã thêm lệnh!'), r && r.ok ? 'info' : 'error');
+                                if (r && r.ok && r.device) {
+                                    for (var i = 0; i < state.devices.length; i++) {
+                                        if (state.devices[i].id === dev.id) { state.devices[i] = r.device; break; }
+                                    }
+                                    state.editActionDev[dev.id] = null;
+                                    renderDeviceCards();
+                                }
+                            });
+                        }, function() {
+                            state.editActionDev[dev.id] = null;
+                            renderDeviceCards();
+                        }));
+                    }
                 }
 
                 devicesGrid.appendChild(E('div', {
@@ -486,7 +753,7 @@ return baseclass.extend({
             });
         }
         function doAddIR(cid, ipath, cname) {
-            callSHAdd(cid ? '' : 'tuya_ir_remote', cid, ipath, irCtrlSel.value || 's06_default', cname, irRoomIn.value.trim() || 'Phòng ngủ', '', '', '', '', '', '', '', '', '').then(function(r) {
+            callSHAdd(cid ? '' : 'tuya_ir_remote', cid, ipath, irCtrlSel.value || 's06_default', cname, irRoomIn.value.trim() || 'Phòng ngủ', '', '', '', '', '', '', '', '', '', '', 0, 0, 0, '', '', '', '', '').then(function(r) {
                 ui.addNotification(null, E('p', (r && r.message) || 'Đã thêm!'), r && r.ok ? 'info' : 'error');
                 if (r && r.ok) { irNameIn.value = ''; closeModal(); refreshStatus(); }
             });
@@ -510,6 +777,235 @@ return baseclass.extend({
                 p.style.display = act ? 'block' : 'none';
             });
         }
+
+        // Modal Pane 0: Smart IP Auto-Detect & Unlimited Device Builder
+        var autoIpIn = E('input', {
+            type: 'text', class: 'cbi-input-text',
+            placeholder: 'Dán IP hoặc link thiết bị (VD: 192.168.1.50, 192.168.1.169, http://192.168.1.88:8080)...',
+            style: 'flex: 1; min-width: 220px; padding: 8px 12px; font-size: 13.5px; font-weight: 600;',
+            keydown: function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); runAutoProbe(); } }
+        });
+        var autoPreviewBox = E('div', { style: 'display: none; background: #ffffff; border: 1.5px solid #93c5fd; border-radius: 10px; padding: 12px; margin-top: 10px;' });
+        var autoScanList = E('div', { style: 'margin-top: 10px; max-height: 250px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; padding: 8px;' },
+            E('div', { style: 'font-size: 12px; color: #64748b; text-align: center; padding: 10px;' }, '💡 Dán IP bất kỳ ở trên rồi bấm ⚡ Tự Nhận Diện, hoặc bấm 🔍 Quét Tự Động Cả Mạng LAN.')
+        );
+
+        function renderAutoPreview(prof) {
+            state.autoDraft = {
+                profile: prof,
+                actions: Array.isArray(prof.suggested_actions) ? prof.suggested_actions.slice() : [],
+                showAddAct: false
+            };
+            autoPreviewBox.innerHTML = '';
+            autoPreviewBox.style.display = 'block';
+
+            var nameIn = E('input', { type: 'text', class: 'cbi-input-text', value: prof.suggested_name || '', style: 'width: 100%; box-sizing: border-box; font-weight: 700;' });
+            var roomIn = E('input', { type: 'text', class: 'cbi-input-text', value: prof.suggested_room || 'Phòng khách', style: 'width: 100%; box-sizing: border-box;' });
+            var catSel = E('select', { class: 'cbi-input-select', style: 'width: 100%;' });
+            SMART_CATEGORIES.forEach(function(c) {
+                catSel.appendChild(E('option', { value: c.key, selected: (c.key === (prof.suggested_category || 'custom')) ? 'selected' : null }, c.icon + ' ' + c.label));
+            });
+            var customCatIn = E('input', { type: 'text', class: 'cbi-input-text', placeholder: 'Nhập tên loại (VD: Báo cháy, Cửa cuốn, Bể cá...)', style: 'width: 100%; box-sizing: border-box; margin-top: 4px;' });
+            var customCatWrap = E('div', { style: 'display: ' + (catSel.value === 'custom' ? 'block' : 'none') + ';' }, [ customCatIn ]);
+
+            var drvSel = E('select', { class: 'cbi-input-select', style: 'width: 100%;' });
+            DRIVER_OPTIONS.forEach(function(d) {
+                drvSel.appendChild(E('option', { value: d.key, selected: (d.key === prof.suggested_driver) ? 'selected' : null }, d.label));
+            });
+
+            var tuyaDidIn = E('input', { type: 'text', class: 'cbi-input-text', value: (prof.meta && prof.meta.tuya_device_id) || '', placeholder: 'Device ID', style: 'width: 100%; box-sizing: border-box;' });
+            var tuyaKeyIn = E('input', { type: 'password', class: 'cbi-input-text', placeholder: 'Local Key 16 ký tự', style: 'width: 100%; box-sizing: border-box;' });
+            var tuyaDpIn  = E('input', { type: 'text', class: 'cbi-input-text', value: '1', placeholder: '1, 2, 3...', style: 'width: 100%; box-sizing: border-box;' });
+            var tuyaBox = E('div', { style: 'display: ' + (drvSel.value === 'tuya_switch' ? 'grid' : 'none') + '; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-top: 8px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 8px;' }, [
+                E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Tuya Device ID'), tuyaDidIn ]),
+                E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Local Key (16 ký tự)'), tuyaKeyIn ]),
+                E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Kênh (DP)'), tuyaDpIn ])
+            ]);
+
+            var actionsListBox = E('div', { style: 'margin-top: 8px;' });
+            function drawDraftActions() {
+                actionsListBox.innerHTML = '';
+                var acts = state.autoDraft.actions;
+                actionsListBox.appendChild(E('div', { style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 6px;' }, [
+                    E('b', { style: 'font-size: 12px; color: #0f172a;' }, '🎛️ Nút lệnh điều khiển (' + acts.length + ' nút):'),
+                    E('div', { style: 'display: flex; gap: 4px; flex-wrap: wrap;' }, [
+                        mkBtn('🚨 Chống trộm', 'font-size: 11px; padding: 3px 7px;', function() {
+                            catSel.value = 'security'; customCatWrap.style.display = 'none';
+                            drvSel.value = 'smart_actions'; tuyaBox.style.display = 'none';
+                            state.autoDraft.actions = buildActionTemplates('security', prof.ip, prof.meta && prof.meta.port);
+                            drawDraftActions();
+                        }),
+                        mkBtn('💡 Đèn / Ổ cắm', 'font-size: 11px; padding: 3px 7px;', function() {
+                            state.autoDraft.actions = buildActionTemplates('plug', prof.ip, prof.meta && prof.meta.port);
+                            drawDraftActions();
+                        }),
+                        mkBtn('🪟 Cổng / Rèm', 'font-size: 11px; padding: 3px 7px;', function() {
+                            catSel.value = 'curtain'; customCatWrap.style.display = 'none';
+                            drvSel.value = 'smart_actions'; tuyaBox.style.display = 'none';
+                            state.autoDraft.actions = buildActionTemplates('curtain', prof.ip, prof.meta && prof.meta.port);
+                            drawDraftActions();
+                        }),
+                        mkBtn('➕ Thêm Nút Lệnh', 'font-size: 11px; padding: 3px 8px; background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;', function() {
+                            state.autoDraft.showAddAct = !state.autoDraft.showAddAct;
+                            drawDraftActions();
+                        })
+                    ])
+                ]));
+                if (acts.length > 0) {
+                    var chips = E('div', { style: 'display: flex; gap: 6px; flex-wrap: wrap;' });
+                    acts.forEach(function(a, idx) {
+                        chips.appendChild(E('span', { style: 'display: inline-flex; align-items: center; gap: 5px; background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; font-size: 11.5px; font-weight: 650;' }, [
+                            (a.icon ? (a.icon + ' ') : '') + a.label + ' [' + a.kind + ']',
+                            E('span', {
+                                style: 'color: #dc2626; cursor: pointer; font-weight: 800; margin-left: 3px;',
+                                click: function() { state.autoDraft.actions.splice(idx, 1); drawDraftActions(); }
+                            }, '✕')
+                        ]));
+                    });
+                    actionsListBox.appendChild(chips);
+                }
+                if (state.autoDraft.showAddAct) {
+                    actionsListBox.appendChild(createActionForm(prof.ip, function(newAct) {
+                        state.autoDraft.actions.push(newAct);
+                        state.autoDraft.showAddAct = false;
+                        drawDraftActions();
+                    }, function() {
+                        state.autoDraft.showAddAct = false;
+                        drawDraftActions();
+                    }));
+                }
+            }
+            drawDraftActions();
+
+            catSel.addEventListener('change', function() {
+                customCatWrap.style.display = (catSel.value === 'custom') ? 'block' : 'none';
+                if (drvSel.value === 'smart_actions') {
+                    state.autoDraft.actions = buildActionTemplates(catSel.value, prof.ip, prof.meta && prof.meta.port);
+                    drawDraftActions();
+                }
+            });
+            drvSel.addEventListener('change', function() {
+                tuyaBox.style.display = (drvSel.value === 'tuya_switch') ? 'grid' : 'none';
+            });
+
+            var statusTag = prof.already_added
+                ? E('span', { style: 'font-size: 11px; font-weight: 750; padding: 2px 8px; border-radius: 999px; background: #fef3c7; color: #b45309;' }, 'Đã lưu: ' + prof.registered_name)
+                : E('span', { style: 'font-size: 11px; font-weight: 750; padding: 2px 8px; border-radius: 999px; background: ' + (prof.online ? '#dcfce7; color: #15803d;' : '#f1f5f9; color: #475569;') }, prof.online ? '🟢 Trực tuyến' : '⚪ Chưa thấy phản hồi');
+
+            var portsTxt = (Array.isArray(prof.open_ports) && prof.open_ports.length > 0) ? (' • Cổng mở: ' + prof.open_ports.join(', ')) : '';
+            var submitRow = E('div', { style: 'display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px;' });
+            if (prof.target_type === 'controller') {
+                submitRow.appendChild(mkBtn('📡 Thêm / Cập Nhật Vào Bộ Điều Khiển', 'background: #047857; color: #fff; border-color: #047857;', function() {
+                    callSHSaveCtrl('', prof.suggested_driver, nameIn.value.trim(), roomIn.value.trim(), prof.ip, prof.mac || '', tuyaDidIn.value.trim(), tuyaKeyIn.value.trim(), 1).then(function(r) {
+                        ui.addNotification(null, E('p', (r && r.message) || 'Đã lưu bộ điều khiển!'), r && r.ok ? 'info' : 'error');
+                        if (r && r.ok) { closeModal(); refreshStatus(); }
+                    });
+                }));
+            }
+            submitRow.appendChild(mkBtn('✅ Xác Nhận Thêm Thiết Bị', 'background: #2563eb; color: #fff; border-color: #2563eb;', function() {
+                var meta = prof.meta || {};
+                var onU = '', offU = '';
+                if (drvSel.value === 'http_relay') {
+                    var acts = state.autoDraft.actions;
+                    for (var i = 0; i < acts.length; i++) {
+                        if (!onU && acts[i].url) onU = acts[i].url;
+                        else if (onU && !offU && acts[i].url) offU = acts[i].url;
+                    }
+                    if (!onU) onU = 'http://' + prof.ip + '/on';
+                    if (!offU) offU = 'http://' + prof.ip + '/off';
+                }
+                callSHAdd(
+                    drvSel.value, '', '', '',
+                    nameIn.value.trim(), roomIn.value.trim(), catSel.value,
+                    (catSel.value === 'custom') ? customCatIn.value.trim() : '',
+                    prof.ip, prof.mac || '', tuyaDidIn.value.trim(), tuyaKeyIn.value.trim(), tuyaDpIn.value.trim() || '1',
+                    onU, offU, meta.tv_id || '',
+                    Number(meta.port) || 0, Number(meta.shelly_gen) || 0, Number(meta.channels) || 1,
+                    meta.web_url || '', meta.rtsp_url || '',
+                    JSON.stringify(state.autoDraft.actions || []),
+                    JSON.stringify(prof.capabilities || []),
+                    JSON.stringify(meta)
+                ).then(function(r) {
+                    ui.addNotification(null, E('p', (r && r.message) || 'Đã thêm!'), r && r.ok ? 'info' : 'error');
+                    if (r && r.ok) { closeModal(); refreshStatus(); }
+                });
+            }));
+
+            autoPreviewBox.appendChild(E('div', {}, [
+                E('div', { style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 6px;' }, [
+                    E('div', { style: 'font-weight: 800; font-size: 14px; color: #0f172a;' }, catIcon(prof.suggested_category) + ' ' + (prof.detected_kind || 'Thiết bị LAN')),
+                    statusTag
+                ]),
+                E('div', { style: 'font-size: 11.5px; color: #64748b; margin-bottom: 8px;' }, 'IP: ' + prof.ip + (prof.mac ? (' • MAC: ' + prof.mac) : '') + (prof.hostname ? (' • Host: ' + prof.hostname) : '') + portsTxt),
+                E('div', { style: 'background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 8px 10px; font-size: 12px; color: #1e3a8a; margin-bottom: 10px;' }, [
+                    E('b', {}, '✨ Hệ thống đề xuất thiết bị này sẽ làm: '),
+                    prof.what_it_can_do || ''
+                ]),
+                E('div', { style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 8px;' }, [
+                    E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Tên thiết bị'), nameIn ]),
+                    E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Phòng'), roomIn ]),
+                    E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Loại thiết bị (Không giới hạn)'), catSel, customCatWrap ]),
+                    E('div', {}, [ E('div', { style: 'font-size: 11px; font-weight: 700;' }, 'Giao thức điều khiển'), drvSel ])
+                ]),
+                tuyaBox,
+                actionsListBox,
+                submitRow
+            ]));
+        }
+
+        function runAutoProbe(ipOverride) {
+            var target = (typeof ipOverride === 'string' && ipOverride) ? ipOverride : autoIpIn.value.trim();
+            if (!target) { ui.addNotification(null, E('p', 'Hãy dán địa chỉ IP của thiết bị vào ô trước!'), 'warning'); return; }
+            autoPreviewBox.style.display = 'block';
+            autoPreviewBox.innerHTML = '<div style="padding: 12px; color: #2563eb; font-weight: 700;">⏳ Đang kiểm tra ' + target + ' và tự động nhận diện giao thức...</div>';
+            callSHProbeIp(target).then(function(r) {
+                if (!r || !r.ok || !r.profile) {
+                    autoPreviewBox.innerHTML = '<div style="padding: 10px; color: #b91c1c; font-weight: 700;">❌ ' + ((r && r.message) || 'Không kiểm tra được IP này') + '</div>';
+                    return;
+                }
+                renderAutoPreview(r.profile);
+            }).catch(function(err) {
+                autoPreviewBox.innerHTML = '<div style="padding: 10px; color: #b91c1c; font-weight: 700;">❌ Lỗi kết nối: ' + err + '</div>';
+            });
+        }
+
+        function runSmartLanScan() {
+            autoScanList.innerHTML = '<div style="padding: 12px; color: #047857; font-weight: 700;">🔍 Đang quét toàn bộ mạng LAN (Tuya, Tasmota, Shelly, WLED, Yeelight, TV, Camera, ESP32)...</div>';
+            callSHScanLan().then(function(r) {
+                autoScanList.innerHTML = '';
+                var devs = (r && Array.isArray(r.devices)) ? r.devices : [];
+                state.autoScanItems = devs;
+                if (devs.length === 0) {
+                    autoScanList.appendChild(E('div', { style: 'padding: 12px; text-align: center; color: #64748b; font-size: 12.5px;' }, 'Chưa quét thấy thiết bị IoT mới phản hồi. Bạn vẫn có thể dán thẳng IP của thiết bị vào ô phía trên để thêm bất kỳ loại nào!'));
+                    return;
+                }
+                autoScanList.appendChild(E('div', { style: 'font-size: 11.5px; font-weight: 750; color: #334155; margin-bottom: 6px;' }, 'Tìm thấy ' + devs.length + ' thiết bị trên ' + (r.total_lan_hosts || devs.length) + ' máy LAN (' + (r.scanned_ms || 0) + 'ms):'));
+                devs.forEach(function(it) {
+                    autoScanList.appendChild(E('div', { style: 'display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 5px; flex-wrap: wrap;' }, [
+                        E('div', { style: 'flex: 1; min-width: 190px;' }, [
+                            E('div', { style: 'font-size: 13px; font-weight: 750; color: #0f172a;' }, catIcon(it.suggested_category) + ' ' + it.suggested_name + (it.already_added ? ' ✅' : '')),
+                            E('div', { style: 'font-size: 11.5px; color: #64748b;' }, (it.detected_kind || '') + ' • ' + it.ip + (it.open_ports && it.open_ports.length ? (' [' + it.open_ports.join(',') + ']') : ''))
+                        ]),
+                        mkBtn('⚡ Chọn Thiết Bị Này', 'background: #2563eb; color: #fff; border-color: #2563eb; font-size: 12px; padding: 5px 10px;', function() {
+                            autoIpIn.value = it.ip;
+                            renderAutoPreview(it);
+                        })
+                    ]));
+                });
+            }).catch(function(err) {
+                autoScanList.innerHTML = '<div style="padding: 10px; color: #b91c1c;">❌ Lỗi quét LAN: ' + err + '</div>';
+            });
+        }
+
+        modalPanes.auto = E('div', {}, [
+            E('div', { style: 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center;' }, [
+                autoIpIn,
+                mkBtn('⚡ Tự Nhận Diện', 'background: #2563eb; color: #fff; border-color: #2563eb; padding: 8px 14px;', function() { runAutoProbe(); }),
+                mkBtn('🔍 Quét Cả LAN', 'background: #047857; color: #fff; border-color: #047857; padding: 8px 12px;', runSmartLanScan)
+            ]),
+            autoPreviewBox,
+            autoScanList
+        ]);
 
         // Modal Pane 1: IR
         modalPanes.ir = E('div', {}, [
@@ -570,7 +1066,7 @@ return baseclass.extend({
             tuyaSwFields, httpRelFields,
             E('div', { style: 'margin-top: 12px;' }, [
                 mkBtn('➕ Lưu & Thêm Công Tắc / Đèn', 'background: #2563eb; color: #fff; border-color: #2563eb;', function() {
-                    callSHAdd(swDrvSel.value, '', '', '', swNameIn.value.trim(), swRoomIn.value.trim(), swCatSel.value, swIpIn.value.trim(), '', swDidIn.value.trim(), swKeyIn.value.trim(), swDpIn.value.trim(), swOnUrlIn.value.trim(), swOffUrlIn.value.trim(), '').then(function(r) {
+                    callSHAdd(swDrvSel.value, '', '', '', swNameIn.value.trim(), swRoomIn.value.trim(), swCatSel.value, '', swIpIn.value.trim(), '', swDidIn.value.trim(), swKeyIn.value.trim(), swDpIn.value.trim(), swOnUrlIn.value.trim(), swOffUrlIn.value.trim(), '', 0, 0, 0, '', '', '', '', '').then(function(r) {
                         ui.addNotification(null, E('p', (r && r.message) || 'Xong!'), r && r.ok ? 'info' : 'error');
                         if (r && r.ok) { swNameIn.value = ''; swKeyIn.value = ''; closeModal(); refreshStatus(); }
                     });
@@ -651,7 +1147,7 @@ return baseclass.extend({
                         E('div', { style: 'font-size: 12px; color: #64748b;' }, (t.brand || 'Android TV') + ' • IP: ' + t.ip)
                     ]),
                     mkBtn('➕ Thêm Thẻ TV', 'background: #2563eb; color: #fff; border-color: #2563eb;', function() {
-                        callSHAdd('android_tv', '', '', '', t.name, (t.name.indexOf('Ngủ') !== -1 ? 'Phòng ngủ' : 'Phòng khách'), 'tv', '', '', '', '', '', '', '', t.id).then(function(r) {
+                        callSHAdd('android_tv', '', '', '', t.name, (t.name.indexOf('Ngủ') !== -1 ? 'Phòng ngủ' : 'Phòng khách'), 'tv', '', t.ip || '', '', '', '', '', '', '', t.id, 0, 0, 0, '', '', '', '', '').then(function(r) {
                             ui.addNotification(null, E('p', (r && r.message) || 'Đã thêm TV!'), r && r.ok ? 'info' : 'warning');
                             if (r && r.ok) { closeModal(); refreshStatus(); }
                         });
@@ -667,6 +1163,7 @@ return baseclass.extend({
         ]);
         var modalTabBar = E('div', { style: 'display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px;' });
         [
+            ['auto', '✨ Tự Nhận / Dán IP'],
             ['ir', '❄️📺🌀 Hồng Ngoại (S06)'],
             ['wifi', '💡🔌 Đèn / Công Tắc Wi-Fi'],
             ['ctrl', '🎙️📡 Mạch Voice / S06 Mới'],
@@ -674,6 +1171,7 @@ return baseclass.extend({
         ].forEach(function(pair) {
             var b = mkBtn(pair[1], 'font-size: 12px; padding: 6px 11px;', function() {
                 switchModalTab(pair[0]);
+                if (pair[0] === 'ir') runSearch();
                 if (pair[0] === 'ctrl') runLanScanIntoModal();
                 if (pair[0] === 'tv') renderModalTVs();
             });
@@ -682,17 +1180,20 @@ return baseclass.extend({
         });
         modalCard.appendChild(modalHeader);
         modalCard.appendChild(modalTabBar);
+        modalCard.appendChild(modalPanes.auto);
         modalCard.appendChild(modalPanes.ir);
         modalCard.appendChild(modalPanes.wifi);
         modalCard.appendChild(modalPanes.ctrl);
         modalCard.appendChild(modalPanes.tv);
 
-        function openAddModal(tabKey) {
+        function openAddModal(tabKey, triggerAutoScan) {
             modalOverlay.style.display = 'flex';
-            switchModalTab(tabKey || 'ir');
-            if (tabKey === 'ir' || !tabKey) runSearch();
-            if (tabKey === 'ctrl') runLanScanIntoModal();
-            if (tabKey === 'tv') renderModalTVs();
+            var k = tabKey || 'auto';
+            switchModalTab(k);
+            if (k === 'auto' && triggerAutoScan) runSmartLanScan();
+            if (k === 'ir') runSearch();
+            if (k === 'ctrl') runLanScanIntoModal();
+            if (k === 'tv') renderModalTVs();
         }
 
         function refreshStatus() {
