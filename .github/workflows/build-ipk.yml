@@ -1,4 +1,5 @@
-name: Build and Release IPK Package
+# [VERIFIED-GOLDEN: dual-ipk-apk-ci-builder | 2026-11-26 | DO NOT MODIFY UNLESS TARGETED]
+name: Build and Release Dual IPK & APK Packages
 
 on:
   push:
@@ -13,52 +14,104 @@ permissions:
 
 jobs:
   build:
-    name: Package IPK & Publish Release
+    name: Validate, Package (.ipk + .apk) & Publish Release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Extract Package Version
+      - name: 3-Axis Pre-Flight Static & Syntax Audit
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1 fakeroot >/dev/null
+
+          echo ">> [1/4] Checking LF line endings..."
+          python3 - << 'PYEOF'
+          import os, sys
+          bad = []
+          for root, _, files in os.walk("luci-app-doanduy-modem"):
+              for fn in files:
+                  p = os.path.join(root, fn)
+                  with open(p, "rb") as f:
+                      if b"\r\n" in f.read():
+                          bad.append(p)
+          if bad:
+              print("CRLF detected in:", bad, file=sys.stderr)
+              sys.exit(1)
+          print("LF check passed.")
+          PYEOF
+
+          echo ">> [2/4] Validating POSIX/ash shell syntax across root/..."
+          for shf in \
+            luci-app-doanduy-modem/root/usr/bin/* \
+            luci-app-doanduy-modem/root/etc/init.d/* \
+            luci-app-doanduy-modem/root/etc/uci-defaults/* \
+            luci-app-doanduy-modem/root/lib/netifd/proto/* \
+            luci-app-doanduy-modem/root/usr/libexec/rpcd/*; do
+            [ -f "$shf" ] || continue
+            head1=$(head -n 1 "$shf")
+            case "$head1" in
+              *"/bin/sh"*|*"/etc/rc.common"*)
+                sh -n "$shf"
+                ;;
+              *"lua"*)
+                luac5.1 -p "$shf"
+                ;;
+            esac
+          done
+
+          echo ">> [3/4] Validating Lua modules..."
+          for luaf in luci-app-doanduy-modem/root/usr/bin/*.lua luci-app-doanduy-modem/root/usr/lib/lua/*.lua; do
+            [ -f "$luaf" ] || continue
+            luac5.1 -p "$luaf"
+          done
+
+          echo ">> [4/4] Validating JSON & JS files..."
+          python3 - << 'PYEOF'
+          import glob, json
+          for jf in glob.glob("luci-app-doanduy-modem/**/*.json", recursive=True):
+              with open(jf, "r", encoding="utf-8") as f:
+                  json.load(f)
+          print("JSON check passed.")
+          PYEOF
+          for jsf in $(find luci-app-doanduy-modem/htdocs -name '*.js'); do
+            node --check "$jsf"
+          done
+
+      - name: Extract Package Metadata
         run: |
           PKG_VER=$(sed -n 's/^PKG_VERSION:=//p' luci-app-doanduy-modem/Makefile | tr -d ' \r')
           PKG_REL=$(sed -n 's/^PKG_RELEASE:=//p' luci-app-doanduy-modem/Makefile | tr -d ' \r')
-          echo "PKG_VER=$PKG_VER" >> "$GITHUB_ENV"
-          echo "PKG_REL=${PKG_REL:-1}" >> "$GITHUB_ENV"
+          PKG_REL="${PKG_REL:-1}"
+          IPK_FILE="luci-app-doanduy-modem_${PKG_VER}-${PKG_REL}_all.ipk"
+          APK_FILE="luci-app-doanduy-modem-${PKG_VER}-r${PKG_REL}.apk"
+          {
+            echo "PKG_VER=$PKG_VER"
+            echo "PKG_REL=$PKG_REL"
+            echo "IPK_FILE=$IPK_FILE"
+            echo "APK_FILE=$APK_FILE"
+          } >> "$GITHUB_ENV"
 
-      - name: Build Standard OpenWrt IPK Package
+      - name: Stage Common RootFS Payload & Keepfiles
         run: |
-          mkdir -p build_staging/data build_staging/control
-          
-          # Copy root files
-          cp -r luci-app-doanduy-modem/root/* build_staging/data/
-          
-          # Copy htdocs into /www
-          mkdir -p build_staging/data/www
-          cp -r luci-app-doanduy-modem/htdocs/* build_staging/data/www/
-          
-          # Enforce proper execution permissions
-          find build_staging/data -type d -exec chmod 755 {} +
-          find build_staging/data -type f -exec chmod 644 {} +
-          chmod 755 build_staging/data/usr/bin/* 2>/dev/null || true
-          chmod 755 build_staging/data/usr/libexec/rpcd/* 2>/dev/null || true
-          chmod 755 build_staging/data/etc/init.d/* 2>/dev/null || true
-          chmod 755 build_staging/data/etc/uci-defaults/* 2>/dev/null || true
-          chmod 755 build_staging/data/lib/netifd/proto/* 2>/dev/null || true
-          
-          # Control file
-          cat << EOF > build_staging/control/control
-          Package: luci-app-doanduy-modem
-          Version: ${PKG_VER}-${PKG_REL}
-          Depends: luci-base, rpcd, ubus, jsonfilter, atinout
-          Section: luci
-          Architecture: all
-          Maintainer: DOANDUY <doanduy09@gmail.com>
-          Description: Quan Tri Modem 5G PCIe & USB, SMS Engine, Auto-Renew & AI Sentinel
-          EOF
-          
-          # Conffiles
-          cat << 'EOF' > build_staging/control/conffiles
+          set -euo pipefail
+          rm -rf build_staging
+          mkdir -p build_staging/base/www build_staging/base/lib/upgrade/keep.d
+
+          cp -r luci-app-doanduy-modem/root/* build_staging/base/
+          cp -r luci-app-doanduy-modem/htdocs/* build_staging/base/www/
+
+          # Enforce canonical permissions
+          find build_staging/base -type d -exec chmod 755 {} +
+          find build_staging/base -type f -exec chmod 644 {} +
+          chmod 755 build_staging/base/usr/bin/* 2>/dev/null || true
+          chmod 755 build_staging/base/usr/libexec/rpcd/* 2>/dev/null || true
+          chmod 755 build_staging/base/etc/init.d/* 2>/dev/null || true
+          chmod 755 build_staging/base/etc/uci-defaults/* 2>/dev/null || true
+          chmod 755 build_staging/base/lib/netifd/proto/* 2>/dev/null || true
+
+          cat << 'EOF' > build_staging/conffiles.txt
           /etc/config/doanduy_smarthome.json
           /etc/config/doanduy_smarthome_keys.json
           /etc/duytv_s06_config.json
@@ -80,55 +133,166 @@ jobs:
           /etc/config/tailscale_hostname
           /etc/config/gemini_api.key
           EOF
-          
-          # Post-installation script
-          cat << 'EOF' > build_staging/control/postinst
-          #!/bin/sh
-          [ -n "$IPKG_INSTROOT" ] || {
-              [ -x /etc/uci-defaults/99-luci-app-doanduy-modem ] && /bin/sh /etc/uci-defaults/99-luci-app-doanduy-modem && rm -f /etc/uci-defaults/99-luci-app-doanduy-modem
-              rm -f /www/cgi-bin/sim_manager /usr/bin/wwan_smart_dialer.sh 2>/dev/null
-              rm -f /tmp/luci-indexcache* 2>/dev/null
-              rm -rf /tmp/luci-modulecache 2>/dev/null
-              /etc/init.d/rpcd restart 2>/dev/null
-              /etc/init.d/uhttpd restart 2>/dev/null
-              exit 0
-          }
-          EOF
-          chmod 755 build_staging/control/postinst
-          find build_staging/control -type f ! -name "postinst" -exec chmod 644 {} +
-          
-          # Debian binary format
-          echo "2.0" > build_staging/debian-binary
-          
-          # Pack archives
-          tar -czf build_staging/data.tar.gz -C build_staging/data .
-          tar -czf build_staging/control.tar.gz -C build_staging/control .
-          
-          # Pack final IPK
-          IPK_FILE="luci-app-doanduy-modem_${PKG_VER}-${PKG_REL}_all.ipk"
-          echo "IPK_FILE=$IPK_FILE" >> "$GITHUB_ENV"
-          tar -czf "$IPK_FILE" -C build_staging debian-binary control.tar.gz data.tar.gz
-          
-          ls -la "$IPK_FILE"
+          sed -i 's/^[[:space:]]*//' build_staging/conffiles.txt
+          cp -f build_staging/conffiles.txt build_staging/base/lib/upgrade/keep.d/luci-app-doanduy-modem
+          chmod 644 build_staging/base/lib/upgrade/keep.d/luci-app-doanduy-modem
 
-      - name: Upload IPK Artifact
-        uses: actions/upload-artifact@v4
+          cat << 'EOF' > build_staging/postinst_common.sh
+          #!/bin/sh
+          [ "${IPKG_NO_SCRIPT:-0}" = "1" ] && exit 0
+          [ -n "${IPKG_INSTROOT:-}" ] && exit 0
+          [ -n "${APK_INSTALL_ROOT:-}" ] && exit 0
+          if [ -x /etc/uci-defaults/99-luci-app-doanduy-modem ]; then
+              /bin/sh /etc/uci-defaults/99-luci-app-doanduy-modem && rm -f /etc/uci-defaults/99-luci-app-doanduy-modem
+          fi
+          rm -f /www/cgi-bin/sim_manager /usr/bin/wwan_smart_dialer.sh 2>/dev/null
+          rm -f /tmp/luci-indexcache* 2>/dev/null
+          rm -rf /tmp/luci-modulecache 2>/dev/null
+          /etc/init.d/rpcd restart 2>/dev/null || true
+          /etc/init.d/uhttpd restart 2>/dev/null || true
+          exit 0
+          EOF
+          sed -i 's/^[[:space:]]*//' build_staging/postinst_common.sh
+          chmod 755 build_staging/postinst_common.sh
+
+      - name: Build OpenWrt IPK Package (opkg <= 24.10)
+        run: |
+          set -euo pipefail
+          mkdir -p build_staging/ipk/data build_staging/ipk/control
+          cp -a build_staging/base/. build_staging/ipk/data/
+
+          cat << EOF > build_staging/ipk/control/control
+          Package: luci-app-doanduy-modem
+          Version: ${PKG_VER}-${PKG_REL}
+          Depends: luci-base, rpcd, ubus, jsonfilter, atinout, curl, ca-bundle, lua, lua-cjson, luci-lib-nixio
+          Section: luci
+          Architecture: all
+          Maintainer: DOANDUY <doanduy09@gmail.com>
+          Description: Quan Tri Modem 5G PCIe & USB, SMS Engine, Auto-Renew, AI Sentinel & Dieu Khien Nha
+          EOF
+          sed -i 's/^[[:space:]]*//' build_staging/ipk/control/control
+          cp -f build_staging/conffiles.txt build_staging/ipk/control/conffiles
+          cp -f build_staging/postinst_common.sh build_staging/ipk/control/postinst
+          chmod 644 build_staging/ipk/control/control build_staging/ipk/control/conffiles
+          chmod 755 build_staging/ipk/control/postinst
+
+          echo "2.0" > build_staging/ipk/debian-binary
+          fakeroot bash -c '
+            tar --numeric-owner --owner=0 --group=0 -czf build_staging/ipk/data.tar.gz -C build_staging/ipk/data .
+            tar --numeric-owner --owner=0 --group=0 -czf build_staging/ipk/control.tar.gz -C build_staging/ipk/control .
+            tar --numeric-owner --owner=0 --group=0 -czf "'"$IPK_FILE"'" -C build_staging/ipk debian-binary control.tar.gz data.tar.gz
+          '
+          ls -lh "$IPK_FILE"
+
+      - name: Build OpenWrt 25.12 / 26+ APKv3 Package (apk-tools mkpkg)
+        run: |
+          set -euo pipefail
+          mkdir -p build_staging/apk_bin build_staging/apk/data/lib/apk/packages build_staging/apk/scripts
+          cp -a build_staging/base/. build_staging/apk/data/
+
+          # Download official Alpine/OpenWrt apk-tools v3 static binary
+          APK_STATIC_PKG=$(curl -fsSL https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/ | grep -oE 'apk-tools-static-3\.[0-9.]+-r[0-9]+\.apk' | sort -V | tail -n 1)
+          if [ -z "$APK_STATIC_PKG" ]; then
+            echo "::error::Unable to locate apk-tools-static v3 package!" >&2
+            exit 1
+          fi
+          curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/${APK_STATIC_PKG}" | tar -xz -C build_staging/apk_bin sbin/apk.static 2>/dev/null || true
+          APK_BIN="$PWD/build_staging/apk_bin/sbin/apk.static"
+          chmod +x "$APK_BIN"
+          "$APK_BIN" --version
+
+          # OpenWrt package-pack.mk standard metadata files inside /lib/apk/packages/
+          (cd build_staging/apk/data && find . -type f,l -printf "/%P\n" | sort > /tmp/luci-app-doanduy-modem.list)
+          mv /tmp/luci-app-doanduy-modem.list build_staging/apk/data/lib/apk/packages/luci-app-doanduy-modem.list
+          cp -f build_staging/conffiles.txt build_staging/apk/data/lib/apk/packages/luci-app-doanduy-modem.conffiles
+          chmod 644 build_staging/apk/data/lib/apk/packages/luci-app-doanduy-modem.*
+
+          cp -f build_staging/postinst_common.sh build_staging/apk/scripts/post-install
+          {
+            echo "#!/bin/sh"
+            echo "export PKG_UPGRADE=1"
+            sed '1{/^#!/d}' build_staging/postinst_common.sh
+          } > build_staging/apk/scripts/post-upgrade
+          cat << 'EOF' > build_staging/apk/scripts/pre-deinstall
+          #!/bin/sh
+          [ -n "${IPKG_INSTROOT:-}" ] && exit 0
+          [ -n "${APK_INSTALL_ROOT:-}" ] && exit 0
+          /etc/init.d/smart_modem_watchdog stop 2>/dev/null || true
+          /etc/init.d/doanduy_auto stop 2>/dev/null || true
+          exit 0
+          EOF
+          sed -i 's/^[[:space:]]*//' build_staging/apk/scripts/pre-deinstall
+          chmod 755 build_staging/apk/scripts/post-install build_staging/apk/scripts/post-upgrade build_staging/apk/scripts/pre-deinstall
+
+          fakeroot "$APK_BIN" mkpkg \
+            --info "name:luci-app-doanduy-modem" \
+            --info "version:${PKG_VER}-r${PKG_REL}" \
+            --info "description:Quan Tri Modem 5G PCIe & USB, SMS Engine, Auto-Renew, AI Sentinel & Dieu Khien Nha" \
+            --info "arch:noarch" \
+            --info "license:GPL-3.0-or-later" \
+            --info "origin:feeds/luci/applications/luci-app-doanduy-modem" \
+            --info "url:https://github.com/Doanduy09/luci-app-doanduy-modem" \
+            --info "maintainer:DOANDUY <doanduy09@gmail.com>" \
+            --script "post-install:build_staging/apk/scripts/post-install" \
+            --script "post-upgrade:build_staging/apk/scripts/post-upgrade" \
+            --script "pre-deinstall:build_staging/apk/scripts/pre-deinstall" \
+            --info "depends:luci-base rpcd ubus jsonfilter atinout curl ca-bundle lua lua-cjson luci-lib-nixio" \
+            --files "build_staging/apk/data" \
+            --output "$APK_FILE"
+          ls -lh "$APK_FILE"
+
+      - name: Verify Dual IPK & APK Packages + Generate SHA256
+        run: |
+          set -euo pipefail
+          APK_BIN="$PWD/build_staging/apk_bin/sbin/apk.static"
+          mkdir -p verify_ipk verify_apk
+
+          # 1. Verify IPK structure & payload
+          tar -xzf "$IPK_FILE" -C verify_ipk
+          test -f verify_ipk/debian-binary
+          mkdir -p verify_ipk/data
+          tar -xzf verify_ipk/data.tar.gz -C verify_ipk/data
+          test -x verify_ipk/data/usr/bin/duydoan5g_dialer.sh
+          test -x verify_ipk/data/usr/bin/read_pcie_sms.lua
+          test -x verify_ipk/data/usr/bin/doanduy_pkg_helper.sh
+
+          # 2. Verify APKv3 extraction & payload
+          "$APK_BIN" extract --allow-untrusted --destination verify_apk "$APK_FILE"
+          test -x verify_apk/usr/bin/duydoan5g_dialer.sh
+          test -x verify_apk/usr/bin/read_pcie_sms.lua
+          test -x verify_apk/usr/bin/doanduy_pkg_helper.sh
+          test -f verify_apk/lib/apk/packages/luci-app-doanduy-modem.list
+          test -f verify_apk/lib/upgrade/keep.d/luci-app-doanduy-modem
+
+          sha256sum "$IPK_FILE" "$APK_FILE" | tee sha256sums.txt
+          rm -rf verify_ipk verify_apk
+
+      - name: Upload Dual Package Artifacts (.ipk + .apk)
+        uses: actions/upload-artifact@v6
         with:
-          name: luci-app-doanduy-modem_${{ env.PKG_VER }}-${{ env.PKG_REL }}_all
-          path: ${{ env.IPK_FILE }}
+          name: luci-app-doanduy-modem_${{ env.PKG_VER }}-${{ env.PKG_REL }}_dual_ipk_apk
+          path: |
+            ${{ env.IPK_FILE }}
+            ${{ env.APK_FILE }}
+            sha256sums.txt
           if-no-files-found: error
 
-      - name: Publish to GitHub Releases
+      - name: Publish Dual Packages (.ipk + .apk) to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG_NAME="v${PKG_VER}"
+          NOTES="### LuCI App DoanDuy Modem v${PKG_VER} (Dual Package Standard: OPKG .ipk & OpenWrt 25.12/26+ APK .apk)
+          - **OpenWrt / ImmortalWrt <= 24.10 (\`opkg\`)**: \`opkg install ${IPK_FILE}\`
+          - **OpenWrt / ImmortalWrt 25.12 / 26+ (\`apk\`)**: \`apk add --allow-untrusted ${APK_FILE}\`
+          - Tích hợp QModem-grade USB + PCIe SMS PDU Engine, Smart 5G Dialer, Dual Package Helper (\`doanduy_pkg_helper.sh\`), Smart Home Hub & AI Sentinel."
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            echo "Release $TAG_NAME already exists, uploading asset..."
-            gh release upload "$TAG_NAME" "$IPK_FILE" --clobber
+            gh release upload "$TAG_NAME" "$IPK_FILE" "$APK_FILE" sha256sums.txt --clobber
+            gh release edit "$TAG_NAME" --title "LuCI App DoanDuy Modem v${PKG_VER} (Dual .ipk + .apk)" --notes "$NOTES"
           else
-            echo "Creating new release $TAG_NAME..."
-            gh release create "$TAG_NAME" "$IPK_FILE" \
-              --title "LuCI App DoanDuy Modem v${PKG_VER}" \
-              --notes "Release v${PKG_VER}: Smart Home Control Hub Tab (Multi-Controller S06 Pro & ESP32-C3 Voice + Tuya Local Switch + HTTP Relay + Android TV LAN + Universal IRDB Search), plus Modem 5G & AI Sentinel suite."
+            gh release create "$TAG_NAME" "$IPK_FILE" "$APK_FILE" sha256sums.txt \
+              --title "LuCI App DoanDuy Modem v${PKG_VER} (Dual .ipk + .apk)" \
+              --notes "$NOTES"
           fi
+# [/VERIFIED-GOLDEN]

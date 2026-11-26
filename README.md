@@ -49,11 +49,20 @@ make menuconfig
 # Chọn: LuCI -> 3. Applications -> <*> luci-app-doanduy-modem
 ```
 
-### Cách 2: Cài trực tiếp file `.ipk` trên Router đang chạy
-Tải file `luci-app-doanduy-modem_1.0.0-1_all.ipk` từ mục [Releases](https://github.com/Doanduy09/luci-app-doanduy-modem/releases) rồi cài đặt:
+### Cách 2: Cài trực tiếp trên Router đang chạy (Hỗ trợ song song `.ipk` và `.apk`)
+Tải gói tương ứng từ mục [Releases](https://github.com/Doanduy09/luci-app-doanduy-modem/releases):
+
+**1. OpenWrt / ImmortalWrt <= 24.10 (chuẩn `opkg` `.ipk`):**
 ```bash
 opkg update
-opkg install luci-app-doanduy-modem*.ipk
+opkg install luci-app-doanduy-modem_*.ipk
+/etc/init.d/rpcd restart
+/etc/init.d/uhttpd restart
+```
+
+**2. OpenWrt / ImmortalWrt 25.12 / 26+ (chuẩn `apk` `.apk` mới):**
+```bash
+apk add --allow-untrusted luci-app-doanduy-modem-*.apk
 /etc/init.d/rpcd restart
 /etc/init.d/uhttpd restart
 ```

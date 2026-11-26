@@ -7,7 +7,7 @@ chmod +x /usr/bin/duydoan5g_dialer.sh 2>/dev/null
 chmod +x /usr/bin/read_pcie_sms.lua 2>/dev/null
 chmod +x /usr/bin/smart_modem_watchdog.sh 2>/dev/null
 chmod +x /usr/bin/modem_lock_run 2>/dev/null
-chmod +x /usr/bin/adshield /usr/bin/clean_dns.sh /usr/bin/remote_web_tunnel.sh /usr/bin/doanduy_remote_auto.sh /usr/bin/send_telegram /usr/bin/device_opt.sh 2>/dev/null
+chmod +x /usr/bin/adshield /usr/bin/clean_dns.sh /usr/bin/remote_web_tunnel.sh /usr/bin/doanduy_remote_auto.sh /usr/bin/doanduy_pkg_helper.sh /usr/bin/send_telegram /usr/bin/device_opt.sh 2>/dev/null
 chmod +x /usr/bin/logall /usr/bin/imei /usr/bin/restart_wwan /usr/bin/logchan 2>/dev/null
 chmod +x /usr/libexec/rpcd/luci.sms-status 2>/dev/null
 chmod +x /usr/libexec/rpcd/modem_ctrl 2>/dev/null

@@ -80,17 +80,21 @@ ensure_tailscale_binary() {
 		if [ "${avail_kb:-0}" -le 35000 ] && [ "${mem_mb:-0}" -lt 220 ]; then
 			return 1
 		fi
-		pkg_f=$(ls /tmp/tailscale*.apk /rom/tailscale*.apk /etc/tailscale/tailscale*.apk 2>/dev/null | head -n 1)
+		pkg_f=$(ls /tmp/tailscale*.apk /rom/tailscale*.apk /etc/tailscale/tailscale*.apk /tmp/tailscale*.ipk /rom/tailscale*.ipk /etc/tailscale/tailscale*.ipk 2>/dev/null | head -n 1)
 		if [ -z "$pkg_f" ] && command -v apk >/dev/null 2>&1; then
 			( apk update >/dev/null 2>&1 && apk fetch -o /tmp tailscale >/dev/null 2>&1 ) || \
 			{ apk update --allow-untrusted >/dev/null 2>&1 && apk fetch --allow-untrusted -o /tmp tailscale >/dev/null 2>&1; }
 			pkg_f=$(ls /tmp/tailscale*.apk 2>/dev/null | head -n 1)
 			[ -n "$pkg_f" ] && fetched_tmp=1
 		fi
-		if [ -n "$pkg_f" ] && command -v apk >/dev/null 2>&1; then
+		if [ -n "$pkg_f" ]; then
 			mkdir -p /tmp/ts_ext_tmp
-			apk extract --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1 || \
-				apk extract --allow-untrusted --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1
+			if [ -x /usr/bin/doanduy_pkg_helper.sh ]; then
+				/usr/bin/doanduy_pkg_helper.sh extract "$pkg_f" /tmp/ts_ext_tmp >/dev/null 2>&1 || true
+			elif command -v apk >/dev/null 2>&1; then
+				apk extract --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1 || \
+					apk extract --allow-untrusted --destination /tmp/ts_ext_tmp "$pkg_f" >/dev/null 2>&1
+			fi
 			avail_kb=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print $4}')
 			if [ -f /tmp/ts_ext_tmp/usr/sbin/tailscaled ]; then
 				if [ "${avail_kb:-0}" -gt 35000 ]; then
@@ -108,6 +112,9 @@ ensure_tailscale_binary() {
 			[ -f /tmp/ts_ext_tmp/etc/init.d/tailscale ] && [ ! -f /etc/init.d/tailscale ] && cp -f /tmp/ts_ext_tmp/etc/init.d/tailscale /etc/init.d/tailscale
 			rm -rf /tmp/ts_ext_tmp
 			[ "$fetched_tmp" = "1" ] && rm -f /tmp/tailscale*.apk 2>/dev/null
+		elif command -v apk >/dev/null 2>&1; then
+			apk update >/dev/null 2>&1 || apk update --allow-untrusted >/dev/null 2>&1
+			apk add tailscale >/dev/null 2>&1 || apk add --allow-untrusted tailscale >/dev/null 2>&1
 		elif command -v opkg >/dev/null 2>&1; then
 			opkg update >/dev/null 2>&1
 			opkg install --nodeps tailscale >/dev/null 2>&1
