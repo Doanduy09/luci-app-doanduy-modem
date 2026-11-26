@@ -68,7 +68,7 @@ pkg_install() {
 	case "$mgr" in
 		apk)
 			if [ -f "$target" ]; then
-				apk add --allow-untrusted "$target"
+				apk add --no-network --allow-untrusted "$target" 2>/dev/null || apk add --allow-untrusted "$target"
 			else
 				apk update >/dev/null 2>&1 || apk update --allow-untrusted >/dev/null 2>&1 || true
 				if [ "$nodeps" = "1" ]; then

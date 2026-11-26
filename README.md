@@ -62,7 +62,7 @@ opkg install luci-app-doanduy-modem_*.ipk
 
 **2. OpenWrt / ImmortalWrt 25.12 / 26+ (chuẩn `apk` `.apk` mới):**
 ```bash
-apk add --allow-untrusted luci-app-doanduy-modem-*.apk
+apk add --no-network --allow-untrusted luci-app-doanduy-modem-*.apk || apk add --allow-untrusted luci-app-doanduy-modem-*.apk
 /etc/init.d/rpcd restart
 /etc/init.d/uhttpd restart
 ```
