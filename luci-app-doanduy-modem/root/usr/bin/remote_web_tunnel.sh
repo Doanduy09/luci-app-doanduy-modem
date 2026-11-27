@@ -91,7 +91,7 @@ start_tunnel() {
 
         local count=0
         while [ $count -lt 30 ]; do
-            sleep 0.5
+            sleep 1
             count=$((count + 1))
             public_url=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$LOG_FILE" 2>/dev/null | head -n 1)
             [ -n "$public_url" ] && break

@@ -433,7 +433,7 @@ server=8.8.8.8
 server=9.9.9.9
 EOF_DNS
                 killall -SIGHUP dnsmasq 2>/dev/null
-                sleep 0.5
+                sleep 1
             fi
         fi
     fi
