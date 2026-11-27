@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.0)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.1)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -23,6 +23,7 @@ DIRECT_OK_STREAK_FILE="/tmp/doanduy_mesh_direct_streak"
 PAIR_UNTIL_FILE="/tmp/doanduy_mesh_pair_until"
 IDLE_FLAG_FILE="/tmp/doanduy_mesh_auto_idle"
 HAD_PEER_FILE="/tmp/doanduy_mesh_had_peer"
+PAUSED_APS_FILE="/etc/config/doanduy_mesh_paused_aps"
 ACTION_EPOCH_FILE="/tmp/doanduy_mesh_action_epoch"
 WIFI_HELPER="/usr/lib/lua/doanduy/mesh_wifi.lua"
 PAIR_WINDOW_SEC=300
@@ -902,15 +903,33 @@ optimize_hw_offload() {
 	touch /tmp/doanduy_mesh_offload_done 2>/dev/null || true
 }
 
+# Khôi phục các AP bị tạm ẩn khi chuyển sang Router Chính hoặc Unmesh (chạy trước restore_orig)
+restore_paused_user_aps() {
+	local pf pchanged=0 puap
+	for pf in "$PAUSED_APS_FILE" /tmp/doanduy_mesh_paused_aps; do
+		[ -f "$pf" ] || continue
+		for puap in $(cat "$pf" 2>/dev/null); do
+			if [ -n "$(uci -q get "wireless.${puap}")" ] && [ "$(uci -q get "wireless.${puap}.disabled")" = "1" ]; then
+				uci -q set "wireless.${puap}.disabled=0"
+				pchanged=1
+			fi
+		done
+		rm -f "$pf"
+	done
+	[ "$pchanged" = "1" ] && uci commit wireless
+	echo "$pchanged"
+}
+
 # Phân kênh 2.4 GHz xen kẽ không chồng lấn (1 / 6 / 11 @ 20MHz) giảm nhiễu đồng kênh giữa các tầng Mesh
 optimize_2g_channel() {
 	local role="${1:-controller}" lip up_gw oct p_oct target_2g=1 dev band cur_c cur_ht changed=0
 	if [ "$role" != "controller" ]; then
-		lip=$(get_node_ip)
 		up_gw=$(get_upstream_gateway)
+		[ -n "$up_gw" ] || { echo 0; return 0; }
+		lip=$(get_node_ip)
 		oct="${lip##*.}"
 		case "$oct" in ''|*[!0-9]*) oct=10 ;; esac
-		if [ -z "$up_gw" ] || [ "$up_gw" = "192.168.1.1" ]; then
+		if [ "$up_gw" = "192.168.1.1" ]; then
 			[ $((oct % 2)) -eq 0 ] && target_2g=6 || target_2g=11
 		else
 			p_oct=$(printf '%s' "$up_gw" | cut -d. -f3)
@@ -1030,9 +1049,10 @@ apply_controller_role() {
 
 	# Giữ dải 192.168.1.10..99 dành riêng cho các Router Phụ, DHCP cấp từ .100 trở lên
 	dhcp_start=$(uci -q get dhcp.lan.start 2>/dev/null || echo 100)
-	if [ "$cur_ignore" = "1" ] || [ "${dhcp_start:-100}" -lt 100 ]; then
+	if [ "$cur_ignore" = "1" ] || [ "${dhcp_start:-100}" -lt 100 ] || [ -n "$(uci -q get dhcp.mesh_uplink)" ]; then
 		uci set dhcp.lan.ignore='0'
 		[ "${dhcp_start:-100}" -lt 100 ] && uci set dhcp.lan.start='100'
+		uci -q delete dhcp.mesh_uplink
 		uci commit dhcp
 		net_changed=1
 	fi
@@ -1077,23 +1097,14 @@ apply_controller_role() {
 		wifi_changed=1
 	fi
 
+	[ "$(restore_paused_user_aps)" = "1" ] && wifi_changed=1
+
 	if [ -f "$WIFI_HELPER" ] && command -v lua >/dev/null 2>&1; then
 		lua "$WIFI_HELPER" restore_orig >/dev/null 2>&1
 		if [ "$?" -eq 2 ]; then
 			wifi_changed=1
 			log_mesh "Thiết bị lên Router Chính -> Khôi phục Wi-Fi mặc định ban đầu trước khi phát sóng."
 		fi
-	fi
-
-	if [ -f /tmp/doanduy_mesh_paused_aps ]; then
-		local puap
-		for puap in $(cat /tmp/doanduy_mesh_paused_aps 2>/dev/null); do
-			if [ -n "$(uci -q get "wireless.${puap}")" ] && [ "$(uci -q get "wireless.${puap}.disabled")" = "1" ]; then
-				uci -q set "wireless.${puap}.disabled=0"
-				wifi_changed=1
-			fi
-		done
-		rm -f /tmp/doanduy_mesh_paused_aps
 	fi
 
 	[ "$(configure_roaming_on_user_aps)" = "1" ] && wifi_changed=1
@@ -1183,25 +1194,36 @@ ensure_node_relay_ap() {
 	target_ssid="${CFG_SSID}_R"
 	target_key="$CFG_KEY"
 
-	# Auto-pause user APs sharing uplink_radio if driver fails STA+AP (carrier=0 / Channel: 0) at 160MHz
+	# Auto-pause user APs sharing uplink_radio only after 20s reload grace and real dead-AP proof (avoid false trigger on healthy dual-band APs)
 	if [ -f "$HAD_PEER_FILE" ]; then
-		local uap uap_if
-		for uap in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
-			case "$uap" in mesh_backhaul_ap|mesh_sta) continue ;; esac
-			[ "$(uci -q get "wireless.${uap}.device")" = "$uplink_radio" ] || continue
-			[ "$(uci -q get "wireless.${uap}.mode")" = "ap" ] || continue
-			[ "$(uci -q get "wireless.${uap}.disabled")" = "1" ] && continue
-			uap_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${uplink_radio}.interfaces[@.section='${uap}'].ifname" 2>/dev/null | head -n 1)
-			if [ -n "$uap_if" ] && [ -d "/sys/class/net/$uap_if" ]; then
-				if [ "$(cat "/sys/class/net/${uap_if}/carrier" 2>/dev/null)" = "0" ] || \
-				   iwinfo "$uap_if" info 2>/dev/null | grep -q 'Channel: 0'; then
-					uci set "wireless.${uap}.disabled=1"
-					grep -qx "$uap" /tmp/doanduy_mesh_paused_aps 2>/dev/null || echo "$uap" >> /tmp/doanduy_mesh_paused_aps
-					changed=1
-					log_mesh "Radio $uplink_radio ($uap_if) không hỗ trợ STA+AP đồng thời -> Tạm ẩn AP '$uap' để dứt lỗi hostapd & giữ max băng thông."
+		local now_ap last_ap uap uap_if op_ap car_ap iwi_ap dead_uap
+		now_ap=$(date +%s)
+		last_ap=$(cat "$LAST_RELOAD_FILE" 2>/dev/null || echo 0)
+		if [ $((now_ap - ${last_ap:-0})) -ge 20 ]; then
+			for uap in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+				case "$uap" in mesh_backhaul_ap|mesh_sta) continue ;; esac
+				[ "$(uci -q get "wireless.${uap}.device")" = "$uplink_radio" ] || continue
+				[ "$(uci -q get "wireless.${uap}.mode")" = "ap" ] || continue
+				[ "$(uci -q get "wireless.${uap}.disabled")" = "1" ] && continue
+				uap_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${uplink_radio}.interfaces[@.section='${uap}'].ifname" 2>/dev/null | head -n 1)
+				if [ -n "$uap_if" ] && [ -d "/sys/class/net/$uap_if" ]; then
+					dead_uap=0
+					op_ap=$(cat "/sys/class/net/${uap_if}/operstate" 2>/dev/null || echo "")
+					car_ap=$(cat "/sys/class/net/${uap_if}/carrier" 2>/dev/null || echo "")
+					[ "$op_ap" = "down" ] && dead_uap=1
+					[ "$car_ap" = "0" ] && [ "$op_ap" != "up" ] && dead_uap=1
+					iwi_ap=$(iwinfo "$uap_if" info 2>/dev/null)
+					printf '%s' "$iwi_ap" | grep -qE 'Channel: 0|Tx-Power: 0 dBm|HT Mode: NOHT' && dead_uap=1
+					if [ "$dead_uap" = "1" ]; then
+						uci set "wireless.${uap}.disabled=1"
+						mkdir -p /etc/config 2>/dev/null
+						grep -qx "$uap" "$PAUSED_APS_FILE" 2>/dev/null || echo "$uap" >> "$PAUSED_APS_FILE"
+						changed=1
+						log_mesh "Radio $uplink_radio ($uap_if) không hỗ trợ STA+AP đồng thời -> Tạm ẩn AP '$uap' để dứt lỗi hostapd & giữ max băng thông."
+					fi
 				fi
-			fi
-		done
+			done
+		fi
 	fi
 
 	# Router Dual-Band dùng chung 1 radio 5G: đợi kết nối Uplink ổn định (>= 1 chu kỳ) rồi mới dựng Relay AP
@@ -1547,16 +1569,7 @@ restore_default_standalone() {
 	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0 fw_changed=0
 	ensure_mesh_uci
 	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done
-	if [ -f /tmp/doanduy_mesh_paused_aps ]; then
-		local puap
-		for puap in $(cat /tmp/doanduy_mesh_paused_aps 2>/dev/null); do
-			if [ -n "$(uci -q get "wireless.${puap}")" ] && [ "$(uci -q get "wireless.${puap}.disabled")" = "1" ]; then
-				uci -q set "wireless.${puap}.disabled=0"
-				wifi_changed=1
-			fi
-		done
-		rm -f /tmp/doanduy_mesh_paused_aps
-	fi
+	[ "$(restore_paused_user_aps)" = "1" ] && wifi_changed=1
 	if [ "$mode_after" = "disabled" ]; then
 		uci set "${MESH_UCI}.mesh.enabled=0"
 		uci set "${MESH_UCI}.mesh.mode=standalone"
@@ -1604,8 +1617,9 @@ restore_default_standalone() {
 		net_changed=1
 	fi
 
-	if [ "$(uci -q get dhcp.lan.ignore)" = "1" ]; then
+	if [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get dhcp.mesh_uplink)" ]; then
 		uci set dhcp.lan.ignore='0'
+		uci -q delete dhcp.mesh_uplink
 		uci commit dhcp
 		net_changed=1
 	fi
