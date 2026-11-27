@@ -1251,6 +1251,26 @@ publish_umbim_config() {
     return 0
 }
 
+usb_soft_reset_ctrl() {
+    local real_dev udev="" p=""
+    real_dev=$(readlink -f "/sys/class/net/${IFNAME}/device" 2>/dev/null || readlink -f "/sys/class/usbmisc/${CTRL_DEV##*/}/device" 2>/dev/null)
+    [ -n "$real_dev" ] || return 1
+    p="$real_dev"
+    while [ "$p" != "/" ] && [ -n "$p" ]; do
+        if [ -f "$p/authorized" ] && [ -f "$p/idVendor" ]; then
+            udev="$p"; break
+        fi
+        p="${p%/*}"
+    done
+    [ -n "$udev" ] || return 1
+    logger -t duydoan5g "USB MBIM stalled; toggling $udev/authorized for fast recovery"
+    echo 0 > "$udev/authorized" 2>/dev/null || return 1
+    sleep 1
+    echo 1 > "$udev/authorized" 2>/dev/null || return 1
+    sleep 2
+    return 0
+}
+
 run_umbim_fallback() {
     logger -t duydoan5g "Switching to native umbim fallback on $CTRL_DEV ($IFNAME)"
     stop_competing_dialers
@@ -1259,45 +1279,52 @@ run_umbim_fallback() {
 
     local tid=2 tries=0 ok=0 pdp_req="ipv4v6:" mbimconfig m_auth="none"
     UMBIM_ACTIVE=1
-    while [ "$tries" -lt 3 ] && [ "$STOP_REQ" = "0" ]; do
+    while [ "$tries" -lt 2 ] && [ "$STOP_REQ" = "0" ]; do
         # First command MUST NOT pass -t so umbim sends MBIM_OPEN_MSG (tid=1) then caps (tid=2)
-        if timeout 8 umbim -n -d "$CTRL_DEV" caps >/dev/null 2>&1; then
+        if timeout 4 umbim -n -d "$CTRL_DEV" caps >/dev/null 2>&1; then
             ok=1; tid=3; break
         fi
-        timeout 4 umbim -d "$CTRL_DEV" disconnect >/dev/null 2>&1 || true
-        tries=$((tries + 1)); sleep 1
+        timeout 2 umbim -d "$CTRL_DEV" disconnect >/dev/null 2>&1 || true
+        tries=$((tries + 1))
+        [ "$tries" -eq 1 ] && sleep 1
     done
+    if [ "$ok" != "1" ] && [ "$STOP_REQ" = "0" ]; then
+        usb_soft_reset_ctrl >/dev/null 2>&1 || true
+        if timeout 4 umbim -n -d "$CTRL_DEV" caps >/dev/null 2>&1; then
+            ok=1; tid=3
+        fi
+    fi
     [ "$ok" = "1" ] || { UMBIM_ACTIVE=0; return 1; }
 
     if [ -n "$pincode" ]; then
-        timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" unlock "$pincode" >/dev/null 2>&1 || true
+        timeout 4 umbim -n -t "$tid" -d "$CTRL_DEV" unlock "$pincode" >/dev/null 2>&1 || true
         tid=$((tid + 1))
     fi
-    timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" subscriber >/dev/null 2>&1 || { UMBIM_ACTIVE=0; return 1; }
+    timeout 4 umbim -n -t "$tid" -d "$CTRL_DEV" subscriber >/dev/null 2>&1 || { UMBIM_ACTIVE=0; return 1; }
     tid=$((tid + 1))
     tries=0; ok=0
-    while [ "$tries" -lt 15 ] && [ "$STOP_REQ" = "0" ]; do
-        timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" registration >/dev/null 2>&1
+    while [ "$tries" -lt 10 ] && [ "$STOP_REQ" = "0" ]; do
+        timeout 4 umbim -n -t "$tid" -d "$CTRL_DEV" registration >/dev/null 2>&1
         rc=$?
         tid=$((tid + 1))
         [ "$rc" = "0" ] || [ "$rc" = "4" ] || [ "$rc" = "5" ] && { ok=1; break; }
         tries=$((tries + 1)); sleep 1
     done
     [ "$ok" = "1" ] || { UMBIM_ACTIVE=0; return 1; }
-    timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" attach >/dev/null 2>&1 || true
+    timeout 4 umbim -n -t "$tid" -d "$CTRL_DEV" attach >/dev/null 2>&1 || true
     tid=$((tid + 1))
 
     case "$pdptype" in ip|ipv4) pdp_req="ipv4:" ;; ipv6) pdp_req="ipv6:" ;; *) pdp_req="ipv4v6:" ;; esac
     case "$auth" in pap|chap|both) m_auth="$auth" ;; *) [ -n "$username$password" ] && m_auth="pap" || m_auth="none" ;; esac
     set -- -n -t "$tid" -d "$CTRL_DEV" connect "$pdp_req$apn"
     [ "$m_auth" != "none" ] && [ -n "$username$password" ] && set -- "$@" "$m_auth" "$username" "$password"
-    timeout 12 umbim "$@" >/dev/null 2>&1 || {
+    timeout 8 umbim "$@" >/dev/null 2>&1 || {
         tid=$((tid + 1))
-        timeout 12 umbim -n -t "$tid" -d "$CTRL_DEV" connect "$apn" "none" >/dev/null 2>&1 || { UMBIM_ACTIVE=0; return 1; }
+        timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" connect "$apn" "none" >/dev/null 2>&1 || { UMBIM_ACTIVE=0; return 1; }
     }
     tid=$((tid + 1))
     UMBIM_TID="$tid"
-    mbimconfig=$(timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" config 2>/dev/null)
+    mbimconfig=$(timeout 5 umbim -n -t "$tid" -d "$CTRL_DEV" config 2>/dev/null)
     UMBIM_TID=$((tid + 1))
 
     publish_umbim_config "$mbimconfig" || {
@@ -1783,8 +1810,8 @@ while [ "$STOP_REQ" = "0" ]; do
     fi
 
     [ "$STOP_REQ" = "0" ] || break
-    backoff=$((4 + fail_streak * 2))
-    [ "$backoff" -gt 15 ] && backoff=15
+    backoff=$((2 + fail_streak))
+    [ "$backoff" -gt 8 ] && backoff=8
     sleep "$backoff"
 done
 # [/VERIFIED-GOLDEN]
