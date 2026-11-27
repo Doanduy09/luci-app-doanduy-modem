@@ -45,10 +45,10 @@ safe_wifi_reload() {
 
 run_locked() {
 	mkdir -p /var/lock 2>/dev/null
-	(
-		flock -w 15 206 || exit 0
+	{
+		flock -w 15 9 || return 0
 		"$@"
-	) 206>"$RECONCILE_LOCK"
+	} 9>"$RECONCILE_LOCK"
 }
 
 get_upstream_gateway() {
