@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.7.0)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.7.6)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -355,15 +355,35 @@ get_best_mesh_radio() {
 	echo "$best_radio"
 }
 
-# Chọn radio 5GHz/6GHz KHÁC radio uplink cho Relay AP trên router Tri-Band (tránh nghẽn cùng kênh uplink)
+# Kiểm tra radio có hỗ trợ băng thông siêu rộng >=160MHz (160/320MHz) và có kênh tương thích (không bị kẹt UNII-3 80MHz)
+radio_supports_wide_bw() {
+	local radio="$1" wif hlist band
+	[ -n "$radio" ] || return 1
+	band=$(uci -q get "wireless.${radio}.band")
+	[ "$band" = "5g" ] || [ "$band" = "6g" ] || return 1
+	wif=$(get_radio_ifname "$radio")
+	if [ -n "$wif" ] && command -v iwinfo >/dev/null 2>&1; then
+		hlist=$(iwinfo "$wif" htmodelist 2>/dev/null)
+	fi
+	[ -n "$hlist" ] || hlist=$(uci -q get "wireless.${radio}.htmode")
+	printf '%s' "$hlist" | grep -qE 'EHT320|EHT160|HE160|VHT160' || return 1
+	[ "$band" = "6g" ] && return 0
+	radio_supports_channel "$radio" 36 || radio_supports_channel "$radio" 52 || radio_supports_channel "$radio" 100
+}
+
+# Chọn radio Relay AP tối ưu: CHỈ tách radio phụ nếu radio phụ CŨNG hỗ trợ >=160MHz (tránh bị bóp 721-1201Mbps trên radio 80MHz như IPQ6018 radio0)
 get_best_relay_radio() {
-	local uplink_radio="$1" dev dis band
+	local uplink_radio="$1" dev dis band uplink_wide=0
+	radio_supports_wide_bw "$uplink_radio" && uplink_wide=1
 	for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
 		[ "$dev" = "$uplink_radio" ] && continue
 		dis=$(uci -q get "wireless.${dev}.disabled")
 		[ "$dis" = "1" ] && continue
 		band=$(uci -q get "wireless.${dev}.band")
 		if [ "$band" = "5g" ] || [ "$band" = "6g" ]; then
+			if [ "$uplink_wide" = "1" ] && ! radio_supports_wide_bw "$dev"; then
+				continue
+			fi
 			echo "$dev"
 			return 0
 		fi
@@ -550,11 +570,12 @@ scan_for_master_mesh() {
 					function flush_cell() {
 						if ((essid == s1 || essid == s2 || essid == s3) && bssid != "" && index(own, "," bssid ",") == 0) {
 							s = sig + 0
+							wbon = (chan+0 >= 36 && chan+0 < 149) ? 40 : 0
 							if (pref_r == "1" && essid == s3) {
-								tier = 2; sc = 2000 + s
+								tier = 2; sc = 2000 + wbon + s
 							} else {
 								tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
-								sc = (tier == 1 ? 1000 : 0) + s
+								sc = (tier == 1 ? 1000 : 0) + wbon + s
 							}
 							if (sc > best_score) {
 								best_score = sc
@@ -589,11 +610,12 @@ scan_for_master_mesh() {
 					function flush_bss() {
 						if ((essid == s1 || essid == s2 || essid == s3) && bssid != "" && index(own, "," bssid ",") == 0) {
 							s = sig + 0
+							wbon = (chan+0 >= 36 && chan+0 < 149) ? 40 : 0
 							if (pref_r == "1" && essid == s3) {
-								tier = 2; sc = 2000 + s
+								tier = 2; sc = 2000 + wbon + s
 							} else {
 								tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
-								sc = (tier == 1 ? 1000 : 0) + s
+								sc = (tier == 1 ? 1000 : 0) + wbon + s
 							}
 							if (sc > best_score) {
 								best_score = sc
@@ -939,7 +961,21 @@ ensure_node_relay_ap() {
 	if [ "$radio" != "$uplink_radio" ]; then
 		relay_ch=$(uci -q get "wireless.${radio}.channel")
 		case "$relay_ch" in ''|auto|0)
-			if radio_supports_channel "$radio" 149; then
+			local rband up_ch
+			rband=$(uci -q get "wireless.${radio}.band")
+			up_ch=$(uci -q get "wireless.${uplink_radio}.channel")
+			if [ "$rband" = "5g" ] && radio_supports_wide_bw "$radio"; then
+				if [ "${up_ch:-36}" -lt 100 ] 2>/dev/null && radio_supports_channel "$radio" 100; then
+					uci set "wireless.${radio}.channel=100"
+					changed=1
+				elif radio_supports_channel "$radio" 36; then
+					uci set "wireless.${radio}.channel=36"
+					changed=1
+				elif radio_supports_channel "$radio" 149; then
+					uci set "wireless.${radio}.channel=149"
+					changed=1
+				fi
+			elif radio_supports_channel "$radio" 149; then
 				uci set "wireless.${radio}.channel=149"
 				changed=1
 			elif radio_supports_channel "$radio" 36; then
@@ -981,7 +1017,11 @@ ensure_node_relay_ap() {
 	if [ "$changed" = "1" ]; then
 		uci commit wireless
 		safe_wifi_reload 0
-		log_mesh "Router Phụ đã thông mạng -> Bật tiếp sóng Mesh ($target_ssid trên $radio, tách biệt uplink $uplink_radio)."
+		if [ "$radio" != "$uplink_radio" ]; then
+			log_mesh "Router Phụ đã thông mạng -> Bật tiếp sóng Mesh ($target_ssid trên $radio >=160MHz, tách biệt uplink $uplink_radio)."
+		else
+			log_mesh "Router Phụ đã thông mạng -> Bật tiếp sóng Mesh ($target_ssid trên $radio băng thông rộng cùng uplink để giữ tối đa >=2402/4804 Mbps)."
+		fi
 	fi
 }
 
@@ -1291,15 +1331,25 @@ get_local_mesh_ap_bssid() {
 	echo "$bssid"
 }
 
+disable_mesh_sta_powersave() {
+	local sta_if
+	command -v iw >/dev/null 2>&1 || return 0
+	for sta_if in $(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i}'); do
+		iw dev "$sta_if" set power_save off 2>/dev/null || true
+	done
+}
+
 get_local_uplink_info() {
-	local sta_if ubssid="" usig="" urate="" link_out=""
+	local sta_if ubssid="" usig="" urate="" link_out="" dump_out=""
 	if command -v iw >/dev/null 2>&1; then
 		sta_if=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i; exit}')
 		if [ -n "$sta_if" ]; then
 			link_out=$(iw dev "$sta_if" link 2>/dev/null)
+			dump_out=$(iw dev "$sta_if" station dump 2>/dev/null)
 			ubssid=$(printf '%s\n' "$link_out" | awk '/Connected to /{print toupper($3); exit}')
 			usig=$(printf '%s\n' "$link_out" | awk '/signal:/{print $2; exit}')
-			urate=$(printf '%s\n' "$link_out" | awk '/rx bitrate:|tx bitrate:/{if($3+0 > m) m=$3+0} END{if(m > 6) printf "%.0f Mbps", m}')
+			[ -n "$usig" ] || usig=$(printf '%s\n' "$dump_out" | awk '/^[[:space:]]*signal:[[:space:]]/{print $2; exit}')
+			urate=$(printf '%s\n%s\n' "$link_out" "$dump_out" | awk '/rx bitrate:|tx bitrate:/{if($3+0 > m) m=$3+0} END{if(m > 6) printf "%.0f Mbps", m}')
 		fi
 	fi
 	if [ -z "$ubssid" ] && command -v iwinfo >/dev/null 2>&1; then
@@ -1366,7 +1416,14 @@ collect_relay_children_json() {
 				[ -n "$cm_m" ] && cmodel="$cm_m"
 				[ -n "$cm_h" ] && chost="$cm_h"
 				[ -n "$cm_a" ] && cmac="$cm_a"
-				[ -n "$cm_s" ] && sig_txt="$cm_s"
+				if [ -n "$cm_s" ]; then
+					sig_txt=$(awk -v a="$sig_txt" -v b="$cm_s" 'BEGIN{
+						ra=0; rb=0;
+						if (match(a, /[0-9]+ Mbps/)) ra = substr(a, RSTART, RLENGTH-5) + 0;
+						if (match(b, /[0-9]+ Mbps/)) rb = substr(b, RSTART, RLENGTH-5) + 0;
+						print (ra > rb ? a : b);
+					}')
+				fi
 			fi
 		fi
 		[ -n "$cip" ] || cip="192.168.10.x"
@@ -1697,6 +1754,7 @@ reconcile_once() {
 			rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" "$PAIR_UNTIL_FILE" "$SCAN_MISS_FILE"
 			verify_unique_node_ip
 			ensure_node_relay_ap
+			disable_mesh_sta_powersave
 			touch "$HAD_PEER_FILE"
 			if [ -f "$WIFI_HELPER" ] && command -v lua >/dev/null 2>&1; then
 				mwhash=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.wifi_hash' 2>/dev/null)
