@@ -546,7 +546,7 @@ get_local_client_count() {
 		for w_if in $(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type AP/{print i}'); do
 			w_ssid=$(iw dev "$w_if" info 2>/dev/null | awk '/ssid /{print $2; exit}')
 			case "$w_ssid" in "$CFG_SSID"|"$LEGACY_MESH_SSID") continue ;; esac
-			cnt=$((cnt + $(iw dev "$w_if" station dump 2>/dev/null | grep -c '^Station ' || echo 0)))
+			cnt=$((cnt + $(iw dev "$w_if" station dump 2>/dev/null | awk '/^Station /{c++} END{print c+0}')))
 		done
 	fi
 	if [ "$cnt" -eq 0 ] && [ -f /proc/net/arp ]; then
@@ -615,7 +615,7 @@ get_mesh_peers_json() {
 				wds_dump="${wds_dump}
 $(iw dev "$w_if" station dump 2>/dev/null)"
 			done
-			wds_cnt=$(printf '%s\n' "$wds_dump" | grep -c '^Station ' || echo 0)
+			wds_cnt=$(printf '%s\n' "$wds_dump" | awk '/^Station /{c++} END{print c+0}')
 		fi
 	fi
 
