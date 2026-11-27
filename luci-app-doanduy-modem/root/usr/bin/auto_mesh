@@ -628,7 +628,10 @@ pick_free_node_ip() {
 			;;
 	esac
 
-	if ping -c 1 -W 1 192.168.1.1 >/dev/null 2>&1; then
+	local up_dev real_lan
+	real_lan=$(uci -q get network.lan.ipaddr 2>/dev/null | cut -d/ -f1)
+	up_dev=$(ubus call network.interface.mesh_uplink status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	if [ "$real_lan" != "192.168.1.1" ] && [ -n "$up_dev" ] && ping -I "$up_dev" -c 1 -W 1 192.168.1.1 >/dev/null 2>&1; then
 		for oct in $(seq 10 49); do
 			cand="192.168.1.${oct}"
 			if ! ping -c 1 -W 1 "$cand" >/dev/null 2>&1; then
