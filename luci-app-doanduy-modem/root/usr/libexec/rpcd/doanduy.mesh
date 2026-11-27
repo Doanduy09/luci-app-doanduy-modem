@@ -11,7 +11,7 @@ run_bg() {
 
 case "$1" in
 	list)
-		echo '{"status":{},"setMode":{"mode":"string","node_ip":"string"}}'
+		echo '{"status":{},"setMode":{"mode":"string","node_ip":"string"},"setWifi":{"sync_mode":"string","ssid_2g":"string","ssid_5g":"string","key":"string","encryption":"string","keep_key":"boolean"}}'
 		;;
 	call)
 		input=""
@@ -30,7 +30,7 @@ case "$1" in
 				case "$mode" in
 					pair|auto)
 						run_bg /usr/bin/auto_mesh pair
-						echo '{"success":true,"message":"Đã bật phát sóng & tìm kiếm Mesh trong 5 phút! Máy có mạng làm Router Chính (192.168.1.1), máy không mạng làm Router Phụ (192.168.1.10); sau 5 phút nếu không có máy ghép sẽ tự tắt."}'
+						echo '{"success":true,"message":"Đã bật Auto-Mesh Tự Động (Always-Ready)! Thiết bị có mạng làm Router Chính (192.168.1.1), máy không mạng tự dò ghép Router Phụ (192.168.1.10..99)."}'
 						;;
 					controller)
 						run_bg /usr/bin/auto_mesh controller
@@ -49,6 +49,20 @@ case "$1" in
 						echo '{"success":false,"message":"Chế độ Mesh không hợp lệ"}'
 						;;
 				esac
+				;;
+			setWifi)
+				if [ -f /usr/lib/lua/doanduy/mesh_wifi.lua ] && command -v lua >/dev/null 2>&1; then
+					res=$(printf '%s' "$input" | /usr/bin/lua /usr/lib/lua/doanduy/mesh_wifi.lua set_wifi 2>/dev/null)
+					[ -n "$res" ] || res='{"success":false,"message":"Lỗi xử lý cấu hình Wi-Fi"}'
+					case "$res" in
+						*'"success":true'*)
+							[ -x /usr/bin/auto_mesh ] && run_bg /usr/bin/auto_mesh wifi_applied
+							;;
+					esac
+					printf '%s\n' "$res"
+				else
+					echo '{"success":false,"message":"Thiếu module đồng bộ Wi-Fi /usr/lib/lua/doanduy/mesh_wifi.lua"}'
+				fi
 				;;
 			*)
 				echo '{"success":false,"message":"Unknown method"}'

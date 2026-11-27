@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-doanduy-modem
-PKG_VERSION:=2.6.7
+PKG_VERSION:=2.7.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-3.0-or-later
@@ -19,6 +19,7 @@ LUCI_PKGARCH:=all
 
 define Package/$(PKG_NAME)/conffiles
 /etc/config/doanduy_mesh
+/etc/config/doanduy_mesh_orig_wifi.json
 /etc/config/doanduy_smarthome.json
 /etc/config/doanduy_smarthome_keys.json
 /etc/duytv_s06_config.json

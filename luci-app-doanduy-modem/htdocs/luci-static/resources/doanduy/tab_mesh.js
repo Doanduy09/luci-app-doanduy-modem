@@ -1,4 +1,4 @@
-// DOANDUY Minimalist Centered Multi-Tier Router Mesh Tree (v2.6.3)
+// DOANDUY Minimalist Centered Multi-Tier Router Mesh Tree & Wi-Fi Sync (v2.7.0)
 'use strict';
 'require baseclass';
 'require rpc';
@@ -6,6 +6,7 @@
 
 var callMeshStatus  = rpc.declare({ object: 'doanduy.mesh', method: 'status', expect: { } });
 var callMeshSetMode = rpc.declare({ object: 'doanduy.mesh', method: 'setMode', params: ['mode', 'node_ip'], expect: { } });
+var callMeshSetWifi = rpc.declare({ object: 'doanduy.mesh', method: 'setWifi', params: ['sync_mode', 'ssid_2g', 'ssid_5g', 'key', 'encryption', 'keep_key'], expect: { } });
 
 function ensureTreeStyles() {
     if (document.getElementById('dd-mesh-tree-css')) return;
@@ -217,7 +218,8 @@ return baseclass.extend({
         ensureTreeStyles();
 
         var latestState = null;
-        var localRemaining = 0;
+        var formDirty = false;
+        var uiSyncMode = null;
 
         var statusPill = E('span', {
             style: 'font-size: 12px; font-weight: 800; padding: 4px 12px; border-radius: 999px; background: #f1f5f9; color: #334155;'
@@ -236,6 +238,220 @@ return baseclass.extend({
         }, 'Tắt');
 
         var treeStage = E('div', { class: 'dd-tree-stage' }, '');
+
+        // --- Wi-Fi Mesh Sync / Custom Override Card ---
+        var wifiSummaryEl = E('div', {
+            style: 'display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; color: #334155;'
+        }, 'Đang tải thông tin Wi-Fi...');
+
+        var btnModeMaster = E('button', {
+            type: 'button',
+            class: 'btn cbi-button',
+            style: 'font-weight: 800; padding: 5px 12px; border-radius: 999px; font-size: 12px;',
+            click: function() { applyMasterSync(); }
+        }, '🔄 Đồng bộ Router Chính (Mặc định)');
+
+        var btnModeCustom = E('button', {
+            type: 'button',
+            class: 'btn cbi-button',
+            style: 'font-weight: 800; padding: 5px 12px; border-radius: 999px; font-size: 12px;',
+            click: function() {
+                uiSyncMode = 'custom';
+                formDirty = true;
+                updateWifiPanelVisibility();
+            }
+        }, '✏️ Tùy chỉnh Wi-Fi riêng');
+
+        var chkSameSsid = E('input', {
+            type: 'checkbox',
+            checked: false,
+            style: 'width: 15px; height: 15px; cursor: pointer;',
+            change: function() {
+                formDirty = true;
+                if (chkSameSsid.checked) {
+                    inSsid5g.value = inSsid2g.value;
+                    inSsid5g.disabled = true;
+                } else {
+                    inSsid5g.disabled = false;
+                }
+            }
+        });
+
+        var inSsid2g = E('input', {
+            type: 'text',
+            maxlength: '32',
+            placeholder: 'Tên Wi-Fi 2.4GHz',
+            style: 'width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px;',
+            input: function() {
+                formDirty = true;
+                if (chkSameSsid.checked) inSsid5g.value = inSsid2g.value;
+            }
+        });
+
+        var inSsid5g = E('input', {
+            type: 'text',
+            maxlength: '32',
+            placeholder: 'Tên Wi-Fi 5GHz',
+            style: 'width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px;',
+            input: function() { formDirty = true; }
+        });
+
+        var selEnc = E('select', {
+            style: 'width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; background: #fff;',
+            change: function() {
+                formDirty = true;
+                inKey.disabled = (selEnc.value === 'none');
+            }
+        }, [
+            E('option', { value: 'psk2' }, 'WPA2-PSK (Khuyên dùng)'),
+            E('option', { value: 'psk-mixed' }, 'WPA/WPA2 Hỗn hợp'),
+            E('option', { value: 'sae-mixed' }, 'WPA2/WPA3 Hỗn hợp'),
+            E('option', { value: 'none' }, 'Không mật khẩu (Open)')
+        ]);
+
+        var keyVisible = false;
+        var inKey = E('input', {
+            type: 'password',
+            maxlength: '63',
+            placeholder: 'Nhập mật khẩu (8-63 ký tự)',
+            style: 'flex: 1; min-width: 0; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px;',
+            input: function() { formDirty = true; }
+        });
+
+        var btnToggleKey = E('button', {
+            type: 'button',
+            class: 'btn cbi-button',
+            style: 'padding: 6px 10px; border-radius: 8px; font-size: 12px;',
+            click: function() {
+                keyVisible = !keyVisible;
+                inKey.type = keyVisible ? 'text' : 'password';
+                btnToggleKey.textContent = keyVisible ? '🙈' : '👁️';
+            }
+        }, '👁️');
+
+        var btnSaveWifi = E('button', {
+            type: 'button',
+            class: 'btn cbi-button cbi-button-apply',
+            style: 'font-weight: 800; padding: 7px 18px; border-radius: 10px; font-size: 13px;',
+            click: function() { saveCustomWifi(); }
+        }, '💾 Lưu & Áp dụng Wi-Fi');
+
+        var customFormBox = E('div', {
+            style: 'display: none; margin-top: 12px; padding-top: 12px; border-top: 1px dashed #cbd5e1;'
+        }, [
+            E('label', { style: 'display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 700; color: #334155; margin-bottom: 10px; cursor: pointer;' }, [
+                chkSameSsid,
+                'Dùng chung 1 tên Wi-Fi cho cả 2.4G & 5G'
+            ]),
+            E('div', { style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px;' }, [
+                E('div', {}, [
+                    E('div', { style: 'font-size: 11.5px; font-weight: 700; color: #475569; margin-bottom: 4px;' }, 'Tên Wi-Fi 2.4G'),
+                    inSsid2g
+                ]),
+                E('div', {}, [
+                    E('div', { style: 'font-size: 11.5px; font-weight: 700; color: #475569; margin-bottom: 4px;' }, 'Tên Wi-Fi 5G'),
+                    inSsid5g
+                ]),
+                E('div', {}, [
+                    E('div', { style: 'font-size: 11.5px; font-weight: 700; color: #475569; margin-bottom: 4px;' }, 'Chuẩn bảo mật'),
+                    selEnc
+                ]),
+                E('div', {}, [
+                    E('div', { style: 'font-size: 11.5px; font-weight: 700; color: #475569; margin-bottom: 4px;' }, 'Mật khẩu Wi-Fi'),
+                    E('div', { style: 'display: flex; gap: 6px;' }, [inKey, btnToggleKey])
+                ])
+            ]),
+            E('div', { style: 'display: flex; justify-content: flex-end; margin-top: 12px;' }, [btnSaveWifi])
+        ]);
+
+        var wifiCard = E('div', {
+            style: 'margin-top: 8px; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; background: #f8fafc;'
+        }, [
+            E('div', { style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;' }, [
+                E('div', { style: 'display: flex; flex-direction: column; gap: 4px;' }, [
+                    E('div', { style: 'font-weight: 800; font-size: 13.5px; color: #0f172a;' }, '📶 Cấu hình Wi-Fi Mesh'),
+                    wifiSummaryEl
+                ]),
+                E('div', { style: 'display: flex; flex-wrap: wrap; gap: 6px;' }, [btnModeMaster, btnModeCustom])
+            ]),
+            customFormBox
+        ]);
+
+        function updateWifiPanelVisibility() {
+            var activeMode = uiSyncMode || (latestState && latestState.wifi && latestState.wifi.sync_mode) || 'master';
+            var isCustom = (activeMode === 'custom');
+            customFormBox.style.display = isCustom ? 'block' : 'none';
+            btnModeMaster.style.background = !isCustom ? '#2563eb' : '#ffffff';
+            btnModeMaster.style.color      = !isCustom ? '#ffffff' : '#334155';
+            btnModeMaster.style.border     = !isCustom ? '1px solid #2563eb' : '1px solid #cbd5e1';
+            btnModeCustom.style.background = isCustom ? '#0891b2' : '#ffffff';
+            btnModeCustom.style.color      = isCustom ? '#ffffff' : '#334155';
+            btnModeCustom.style.border     = isCustom ? '1px solid #0891b2' : '1px solid #cbd5e1';
+        }
+
+        function applyMasterSync() {
+            btnModeMaster.disabled = true;
+            btnModeCustom.disabled = true;
+            callMeshSetWifi('master', '', '', '', '', true).then(function(res) {
+                btnModeMaster.disabled = false;
+                btnModeCustom.disabled = false;
+                if (res && res.success === false) {
+                    ui.addNotification(null, E('p', '❌ ' + (res.message || 'Không thể bật đồng bộ Master')), 'error');
+                    return;
+                }
+                uiSyncMode = 'master';
+                formDirty = false;
+                updateWifiPanelVisibility();
+                ui.addNotification(null, E('p', '✅ ' + (res.message || 'Đã chuyển sang đồng bộ theo Router Chính')), 'info');
+                setTimeout(refreshMesh, 1200);
+            }).catch(function(err) {
+                btnModeMaster.disabled = false;
+                btnModeCustom.disabled = false;
+                ui.addNotification(null, E('p', '❌ ' + err), 'error');
+            });
+        }
+
+        function saveCustomWifi() {
+            var s2 = (inSsid2g.value || '').trim();
+            var s5 = chkSameSsid.checked ? s2 : (inSsid5g.value || '').trim();
+            var enc = selEnc.value || 'psk2';
+            var ky = inKey.value || '';
+            var hasExistingKey = !!(latestState && latestState.wifi && latestState.wifi.has_key);
+
+            if (!s2 && !s5) {
+                ui.addNotification(null, E('p', '❌ Vui lòng nhập tên Wi-Fi!'), 'error');
+                return;
+            }
+            if (enc !== 'none' && ky.length > 0 && (ky.length < 8 || ky.length > 63)) {
+                ui.addNotification(null, E('p', '❌ Mật khẩu Wi-Fi phải từ 8 đến 63 ký tự!'), 'error');
+                return;
+            }
+            if (enc !== 'none' && ky.length === 0 && !hasExistingKey) {
+                ui.addNotification(null, E('p', '❌ Vui lòng nhập mật khẩu Wi-Fi (8-63 ký tự)!'), 'error');
+                return;
+            }
+
+            btnSaveWifi.disabled = true;
+            btnSaveWifi.textContent = '⏳ Đang lưu...';
+            callMeshSetWifi('custom', s2 || s5, s5 || s2, ky, enc, true).then(function(res) {
+                btnSaveWifi.disabled = false;
+                btnSaveWifi.textContent = '💾 Lưu & Áp dụng Wi-Fi';
+                if (!res || res.success === false) {
+                    ui.addNotification(null, E('p', '❌ ' + ((res && res.message) || 'Lưu Wi-Fi thất bại')), 'error');
+                    return;
+                }
+                uiSyncMode = 'custom';
+                formDirty = false;
+                inKey.value = '';
+                ui.addNotification(null, E('p', '✅ ' + res.message), 'info');
+                setTimeout(refreshMesh, 1500);
+                setTimeout(refreshMesh, 4000);
+            }).catch(function(err) {
+                btnSaveWifi.disabled = false;
+                btnSaveWifi.textContent = '💾 Lưu & Áp dụng Wi-Fi';
+                ui.addNotification(null, E('p', '❌ ' + err), 'error');
+            });
+        }
 
         function toggleMesh(action) {
             var isOn = (action === 'pair');
@@ -258,12 +474,10 @@ return baseclass.extend({
                     return;
                 }
                 if (isOn) {
-                    localRemaining = 300;
-                    statusPill.textContent = '📡 Đang tìm Mesh (' + formatMMSS(localRemaining) + ')';
+                    statusPill.textContent = '📡 Auto-Mesh Đang Bật (Tự động)';
                     statusPill.style.background = '#dbeafe';
                     statusPill.style.color = '#1d4ed8';
                 } else {
-                    localRemaining = 0;
                     statusPill.textContent = '⚪ Đã tắt';
                     statusPill.style.background = '#f1f5f9';
                     statusPill.style.color = '#64748b';
@@ -287,31 +501,58 @@ return baseclass.extend({
             }
 
             var peers       = Array.isArray(st.peers) ? st.peers : [];
-            var role        = st.role || 'auto_idle';
+            var role        = st.role || 'searching_node';
             var isSearching = !!st.searching;
-            var isEnabled   = !!st.enabled && role !== 'standalone' && role !== 'auto_idle';
-            localRemaining  = parseInt(st.search_remaining || 0, 10);
+            var isEnabled   = !!st.enabled && role !== 'standalone';
 
-            btnOn.style.opacity  = isSearching || isEnabled ? '1' : '0.88';
+            btnOn.style.opacity  = isEnabled ? '1' : '0.88';
             btnOff.style.opacity = (!st.enabled || role === 'standalone') ? '0.6' : '1';
 
-            if (peers.length > 0) {
+            if (role === 'controller' && peers.length > 0) {
                 statusPill.textContent = '🟢 Đang kết nối ' + peers.length + ' Router Phụ';
                 statusPill.style.background = '#dcfce7';
                 statusPill.style.color = '#15803d';
-            } else if (isSearching) {
-                statusPill.textContent = '📡 Đang tìm Mesh (' + formatMMSS(localRemaining) + ')';
+            } else if (role === 'node' && peers.length > 0) {
+                statusPill.textContent = '🟢 Đã kết nối Router Chính';
+                statusPill.style.background = '#dcfce7';
+                statusPill.style.color = '#15803d';
+            } else if (role === 'controller') {
+                statusPill.textContent = '📡 Sẵn sàng ghép Mesh (Tự động)';
                 statusPill.style.background = '#dbeafe';
                 statusPill.style.color = '#1d4ed8';
-            } else if (role === 'auto_idle') {
-                statusPill.textContent = '💤 Tự tắt sau 5 phút';
-                statusPill.style.background = '#f1f5f9';
-                statusPill.style.color = '#475569';
+            } else if (role === 'searching_node' || isSearching) {
+                statusPill.textContent = '📡 Đang tìm Router Chính...';
+                statusPill.style.background = '#dbeafe';
+                statusPill.style.color = '#1d4ed8';
             } else {
                 statusPill.textContent = '⚪ Đã tắt';
                 statusPill.style.background = '#f1f5f9';
                 statusPill.style.color = '#64748b';
             }
+
+            // Update Wi-Fi summary chips & populate form only if user isn't editing
+            var w = st.wifi || {};
+            var wMode = w.sync_mode || 'master';
+            while (wifiSummaryEl.firstChild) wifiSummaryEl.removeChild(wifiSummaryEl.firstChild);
+            wifiSummaryEl.appendChild(E('span', {
+                style: 'padding: 2px 8px; border-radius: 6px; background: ' + (wMode === 'custom' ? '#cffafe; color: #0e7490;' : '#dbeafe; color: #1d4ed8;') + ' font-weight: 800;'
+            }, wMode === 'custom' ? 'Tùy chỉnh riêng' : 'Đồng bộ Chính'));
+            wifiSummaryEl.appendChild(E('span', { style: 'font-weight: 700;' }, '2.4G: ' + (w.ssid_2g || '—')));
+            wifiSummaryEl.appendChild(E('span', { style: 'font-weight: 700;' }, '5G: ' + (w.ssid_5g || '—')));
+            wifiSummaryEl.appendChild(E('span', { style: 'color: #64748b;' }, w.has_key ? ('🔒 ' + (w.encryption || 'psk2')) : '🔓 Mở'));
+
+            if (!formDirty) {
+                uiSyncMode = wMode;
+                inSsid2g.value = w.ssid_2g || '';
+                inSsid5g.value = w.ssid_5g || '';
+                var same = !!(w.ssid_2g && w.ssid_2g === w.ssid_5g);
+                chkSameSsid.checked = same;
+                inSsid5g.disabled = same;
+                if (w.encryption) selEnc.value = w.encryption;
+                inKey.disabled = (selEnc.value === 'none');
+                inKey.placeholder = w.has_key ? 'Để trống nếu giữ mật khẩu hiện tại (8-63 ký tự)' : 'Nhập mật khẩu (8-63 ký tự)';
+            }
+            updateWifiPanelVisibility();
 
             var currentIp = st.local_ip || '192.168.1.1';
             var masterIp  = st.master_ip || '192.168.1.1';
@@ -406,17 +647,10 @@ return baseclass.extend({
                         btnOff
                     ])
                 ]),
-                treeStage
+                treeStage,
+                wifiCard
             ])
         ]);
-
-        setInterval(function() {
-            if (pane.style.display === 'none' || !document.body.contains(pane)) return;
-            if (latestState && latestState.searching && localRemaining > 0 && (!latestState.peers || latestState.peers.length === 0)) {
-                localRemaining = Math.max(0, localRemaining - 1);
-                statusPill.textContent = '📡 Đang tìm Mesh (' + formatMMSS(localRemaining) + ')';
-            }
-        }, 1000);
 
         setInterval(function() {
             if (pane.style.display !== 'none' && document.body.contains(pane)) {

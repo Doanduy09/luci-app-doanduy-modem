@@ -1,12 +1,17 @@
 {
   "id": "07-auto-mesh",
   "title": "Nhóm 07: Auto-Mesh Đa Chip Tự Động (Chính 192.168.1.1 <-> Phụ 192.168.1.10)",
-  "description": "Tự động ghép Mesh WDS xuyên chip (Qualcomm IPQ NSS/Mainline & MediaTek Filogic mt76/mt_wifi) ngay khi khởi động: thiết bị có mạng làm Router Chính (192.168.1.1, DHCP BẬT), thiết bị không mạng tự bắt sóng DOANDUY_MESH làm Router Phụ (192.168.1.10, tắt DHCP), hết Mesh tự hoàn trả IP mặc định 192.168.1.1.",
+  "description": "Auto-Mesh 3-Addr Always-Ready xuyên chip (Qualcomm IPQ NSS/Mainline & MediaTek Filogic mt76/mt_wifi) giữ nguyên Hardware Offload, tự tách Relay AP trên Tri-Band và đồng bộ Wi-Fi mã hóa từ Router Chính hoặc tùy chỉnh riêng.",
   "files": [
     {
       "repo": "luci-app-doanduy-modem/root/usr/bin/auto_mesh",
       "router": "/usr/bin/auto_mesh",
       "mode": "755"
+    },
+    {
+      "repo": "luci-app-doanduy-modem/root/usr/lib/lua/doanduy/mesh_wifi.lua",
+      "router": "/usr/lib/lua/doanduy/mesh_wifi.lua",
+      "mode": "644"
     },
     {
       "repo": "luci-app-doanduy-modem/root/etc/init.d/doanduy_mesh",
