@@ -17,7 +17,7 @@ start_service() {
 
 stop_service() {
 	local pid
-	for pid in $(pgrep -f "/usr/bin/auto_mesh daemon" 2>/dev/null); do
-		[ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
+	for pid in $(pgrep -f "/usr/bin/auto_mesh (daemon|watchdog)" 2>/dev/null); do
+		[ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null || true
 	done
 }
