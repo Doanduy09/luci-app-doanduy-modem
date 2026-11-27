@@ -46,7 +46,12 @@ safe_wifi_reload() {
 run_locked() {
 	mkdir -p /var/lock 2>/dev/null
 	{
-		flock -w 15 9 || return 0
+		local _t=0
+		while ! flock -n 9 2>/dev/null; do
+			_t=$((_t + 1))
+			[ "$_t" -ge 15 ] && return 0
+			sleep 1
+		done
 		"$@"
 	} 9>"$RECONCILE_LOCK"
 }
