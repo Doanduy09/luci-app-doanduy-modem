@@ -8,7 +8,7 @@ safe_at_cleanup() {
 
 release_ports() {
     killall -STOP ModemManager modemmanager 2>/dev/null
-    sleep 0.2
+    sleep 1
 }
 
 restore_ports() {
@@ -1088,7 +1088,7 @@ EOF
                     nr_line=$(echo "$qeng_out" | grep -i '+QENG:"NR5G-NSA"')
 
                     if [ -z "$lte_line" ]; then
-                        sleep 0.5
+                        sleep 1
                         qeng_out=$(send_at_direct "$port" 'AT+QENG="servingcell"')
                         lte_line=$(echo "$qeng_out" | grep -i '+QENG: "LTE"')
                         nr_line=$(echo "$qeng_out" | grep -i '+QENG:"NR5G-NSA"')

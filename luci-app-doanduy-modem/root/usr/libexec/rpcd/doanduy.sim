@@ -266,7 +266,11 @@ case "$1" in
 				fi
 				today_vn=$(TZ='<+07>-7' date '+%Y-%m-%d')
 				rm -f /tmp/daily_auto_renew.lock /tmp/daily_vip_renew.lock /tmp/sms_sending.lock "/tmp/sms_scheduled_sent_${today_vn}" 2>/dev/null
-				nohup /usr/bin/daily_vip_renew.sh --force >/tmp/sms_manual_test.log 2>&1 &
+				if command -v setsid >/dev/null 2>&1; then
+					setsid /usr/bin/daily_vip_renew.sh --force </dev/null >/tmp/sms_manual_test.log 2>&1 &
+				else
+					( /usr/bin/daily_vip_renew.sh --force </dev/null >/tmp/sms_manual_test.log 2>&1 ) &
+				fi
 				pkg=$(get_configured_pkg)
 				dest=$(get_configured_dest)
 				json_init

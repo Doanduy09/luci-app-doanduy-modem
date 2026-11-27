@@ -264,87 +264,94 @@ if [ "$is_manual" -ne 1 ]; then
 fi
 
 # ==============================================================================
-# 5. QUY TRÌNH GIA HẠN & ĐỔI IP THEO LỆNH CHUẨN CỦA ANH DUY:
-# 1. Gửi cú pháp 5G150N tới 191
-# 2. Sau 2s gửi xác nhận Y tới 191
-# 3. Tái kết nối mạng và nhận IP WAN mới sạch sẽ
+# 5. QUY TRÌNH GIA HẠN & ĐỔI IP THEO LỆNH CHUẨN CỦA ANH DUY (USB & PCIe):
+# - USB (/dev/ttyUSB* /dev/ttyACM*): AT+CMGD=1,4 -> sleep 3 -> sms_tool send PKG -> sleep 2 -> sms_tool send Y
+# - PCIe (/dev/mhi_DUN* /dev/wwan*at* /dev/ttyFMI*): AT+CMGD=1,4 -> AT+CMGF=1 + AT+CMGS + \x1A -> sleep 5 -> Y\x1A
 # ==============================================================================
-log "⚡ [Pha 1/4] Gửi SMS cú pháp [${renew_pkg}] tới tổng đài [${renew_dest}]..."
+log "⚡ [Pha 1/4] Bắt đầu gửi SMS gia hạn [${renew_pkg}] tới [${renew_dest}] qua cổng [${port}]..."
 touch /tmp/sms_sending.lock
+
+send_pcie_at_sms() {
+    local dev="$1" dest="$2" text="$3"
+    {
+        printf 'AT+CMGF=1\r'
+        sleep 1
+        printf 'AT+CMGS="%s"\r' "$dest"
+        sleep 1
+        printf '%s\032' "$text"
+    } > "$dev"
+}
 
 run_send_sms() {
     local dest="$1"
     local text="$2"
-    local out="" rc=1 is_utf8=0 sms_bin=""
-    printf '%s' "$text" | LC_ALL=C grep -q '[^ -~	]' && is_utf8=1
-    if [ "$is_utf8" -eq 0 ] && [ "${#text}" -le 160 ] && [ -c "/dev/wwan0qmi0" ] && command -v uqmi >/dev/null 2>&1; then
-        trap 'killall -CONT quectel-CM-M quectel-CM 2>/dev/null; rm -f /tmp/sms_sending.lock' EXIT INT TERM
-        killall -STOP quectel-CM-M quectel-CM 2>/dev/null
-        out=$(uqmi -s -t 3500 -d /dev/wwan0qmi0 --send-message "$text" --send-message-target "$dest" 2>&1)
-        rc=$?
-        killall -CONT quectel-CM-M quectel-CM 2>/dev/null
-        trap - EXIT INT TERM
-        if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -qiE 'error|failed'; then
-            return 0
-        fi
-    fi
+    local out="" rc=1
     case "$port" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
+            if send_pcie_at_sms "$port" "$dest" "$text" 2>/dev/null; then
+                return 0
+            fi
             if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                if command -v modem_lock_run >/dev/null 2>&1; then
-                    out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
-                else
-                    out=$(/usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
-                fi
+                out=$(/usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
                 rc=$?
                 [ "$rc" -eq 0 ] && return 0
-                log "❌ PCIe SMS ($port) lỗi: $out"
-                return 1
             fi
+            log "❌ PCIe SMS ($port) lỗi: $out"
+            return 1
+            ;;
+        *)
+            if command -v sms_tool >/dev/null 2>&1; then
+                if command -v modem_lock_run >/dev/null 2>&1; then
+                    out=$(modem_lock_run sms_tool -d "$port" send "$dest" "$text" 2>&1)
+                else
+                    out=$(sms_tool -d "$port" send "$dest" "$text" 2>&1)
+                fi
+                rc=$?
+                if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qiE 'sucessfully|successfully|\+CMGS:' && ! printf '%s' "$out" | grep -qiE 'not sent|error'; then
+                    return 0
+                fi
+            fi
+            log "❌ USB SMS ($port) lỗi: $out"
+            return 1
             ;;
     esac
-    command -v sms_tool_q >/dev/null 2>&1 && sms_bin="sms_tool_q"
-    [ -z "$sms_bin" ] && command -v sms_tool >/dev/null 2>&1 && sms_bin="sms_tool"
-    if [ "$is_utf8" -eq 0 ] && [ "${#text}" -le 160 ] && [ -n "$sms_bin" ]; then
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            out=$(modem_lock_run "$sms_bin" -d "$port" send "$dest" "$text" 2>&1)
-        else
-            out=$("$sms_bin" -d "$port" send "$dest" "$text" 2>&1)
-        fi
-        rc=$?
-        if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qiE 'sucessfully|successfully|\+CMGS:' && ! printf '%s' "$out" | grep -qiE 'not sent|error'; then
-            return 0
-        fi
-    fi
-    if [ -x /usr/bin/read_pcie_sms.lua ]; then
-        if command -v modem_lock_run >/dev/null 2>&1; then
-            out=$(modem_lock_run /usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
-        else
-            out=$(/usr/bin/read_pcie_sms.lua -p "$port" --send "$dest" "$text" 2>&1)
-        fi
-        rc=$?
-        [ "$rc" -eq 0 ] && return 0
-        log "❌ SMS engine ($port) lỗi: $out"
-        return 1
-    fi
-    log "❌ Không gửi được SMS qua $port: $out"
-    return 1
 }
 
-if run_send_sms "$renew_dest" "$renew_pkg"; then
-    log "✔️ [Pha 1/4] Đã gửi [${renew_pkg}] tới [${renew_dest}] qua [$port]. Chờ 2 giây..."
-else
-    log "⚠️ [Pha 1/4] Gửi [${renew_pkg}] tới [${renew_dest}] thất bại qua [$port]!"
-fi
-sleep 2
-
-# Pha 2: Sau 2s gửi Y tới 191
-log "⚡ [Pha 2/4] Gửi tin nhắn xác nhận [Y] tới tổng đài [${renew_dest}]..."
-if run_send_sms "$renew_dest" "Y"; then
-    log "✔️ [Pha 2/4] Đã gửi xác nhận [Y] tới [${renew_dest}] qua [$port]. Chờ 5 giây..."
-else
-    log "⚠️ [Pha 2/4] Gửi xác nhận [Y] thất bại qua [$port]!"
-fi
+case "$port" in
+    /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
+        printf 'AT+CMGD=1,4\r' > "$port" 2>/dev/null || true
+        if send_pcie_at_sms "$port" "$renew_dest" "$renew_pkg" 2>/dev/null; then
+            log "✔️ [Pha 1/4] Đã gửi PCIe AT [${renew_pkg}] tới [${renew_dest}] qua [$port]. Chờ 5 giây..."
+        else
+            log "⚠️ [Pha 1/4] Gửi PCIe AT [${renew_pkg}] thất bại qua [$port]!"
+        fi
+        sleep 5
+        if send_pcie_at_sms "$port" "$renew_dest" "Y" 2>/dev/null; then
+            log "✔️ [Pha 2/4] Đã gửi PCIe AT xác nhận [Y] tới [${renew_dest}] qua [$port]. Chờ 5 giây..."
+        else
+            log "⚠️ [Pha 2/4] Gửi PCIe AT xác nhận [Y] thất bại qua [$port]!"
+        fi
+        ;;
+    *)
+        if command -v atinout >/dev/null 2>&1; then
+            printf 'AT+CMGD=1,4\r' | timeout 3 atinout - "$port" - >/dev/null 2>&1 || true
+        elif command -v sms_tool >/dev/null 2>&1; then
+            timeout 3 sms_tool -d "$port" at "AT+CMGD=1,4" >/dev/null 2>&1 || true
+        fi
+        sleep 3
+        if run_send_sms "$renew_dest" "$renew_pkg"; then
+            log "✔️ [Pha 1/4] Đã gửi [${renew_pkg}] tới [${renew_dest}] qua [$port]. Chờ 2 giây..."
+        else
+            log "⚠️ [Pha 1/4] Gửi [${renew_pkg}] tới [${renew_dest}] thất bại qua [$port]!"
+        fi
+        sleep 2
+        if run_send_sms "$renew_dest" "Y"; then
+            log "✔️ [Pha 2/4] Đã gửi xác nhận [Y] tới [${renew_dest}] qua [$port]. Chờ 5 giây..."
+        else
+            log "⚠️ [Pha 2/4] Gửi xác nhận [Y] thất bại qua [$port]!"
+        fi
+        ;;
+esac
 sleep 5
 rm -f /tmp/sms_sending.lock
 
