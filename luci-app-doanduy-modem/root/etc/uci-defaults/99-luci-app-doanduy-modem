@@ -163,6 +163,11 @@ chmod +x /etc/hotplug.d/net/99_wwan_net.sh
 # 5. Kich hoat service smart_modem_watchdog, doanduy_mesh & doanduy_auto (tu dong Mesh, toi uu & AdShield)
 /etc/init.d/smart_modem_watchdog enable 2>/dev/null
 /etc/init.d/smart_modem_watchdog start >/dev/null 2>&1
+if [ -x /etc/init.d/sysfixtine_mesh ]; then
+    /etc/init.d/sysfixtine_mesh stop 2>/dev/null
+    /etc/init.d/sysfixtine_mesh disable 2>/dev/null
+    rm -f /etc/init.d/sysfixtine_mesh 2>/dev/null
+fi
 /etc/init.d/doanduy_mesh enable 2>/dev/null
 /etc/init.d/doanduy_mesh start >/dev/null 2>&1
 /etc/init.d/doanduy_auto enable 2>/dev/null
