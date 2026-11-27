@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.7.9)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.0)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -322,6 +322,18 @@ heal_invalid_radio_channels() {
 		fi
 	done
 	echo "$healed"
+}
+
+radio_channel_is_non_dfs() {
+	local radio="$1" chan="$2" phy line
+	[ -n "$radio" ] && [ -n "$chan" ] || return 1
+	phy=$(get_phy_for_radio "$radio")
+	if [ -n "$phy" ] && command -v iw >/dev/null 2>&1; then
+		line=$(iw phy "$phy" channels 2>/dev/null | grep -E "\[$chan\]($|[^0-9])" | head -n 1)
+		[ -n "$line" ] || return 1
+		printf '%s' "$line" | grep -qiE 'radar detection|disabled' && return 1
+	fi
+	return 0
 }
 
 # Chọn card Wi-Fi có băng thông & tốc độ cao nhất tương thích kênh (Ưu tiên 5GHz Low ch36 > 5GHz High > 6GHz)
@@ -814,9 +826,13 @@ configure_roaming_on_user_aps() {
 		enc=$(uci -q get "wireless.${iface}.encryption")
 		[ "$drv_type" = "mtwifi" ] && continue
 
-		# L3 NAT Mesh: tắt 802.11r (tránh giữ IP subnet cũ), bật 802.11k/v + BSS Transition
+		# L3 NAT Mesh: tắt 802.11r (tránh giữ IP subnet cũ), bật 802.11k/v + BSS Transition + đá client yếu
 		[ "$(uci -q get "wireless.${iface}.ieee80211r")" = "1" ] && {
 			uci -q set "wireless.${iface}.ieee80211r=0"
+			changed=1
+		}
+		[ "$(uci -q get "wireless.${iface}.disassoc_low_ack")" != "1" ] && {
+			uci -q set "wireless.${iface}.disassoc_low_ack=1"
 			changed=1
 		}
 		case "$enc" in
@@ -835,6 +851,130 @@ configure_roaming_on_user_aps() {
 		esac
 	done
 	echo "$changed"
+}
+
+# Tối ưu Hardware Offload chuẩn xác theo từng dòng chip:
+# - Qualcomm IPQ (qca-nss-ecm): Tắt nft flow_offloading để NSS ECM tăng tốc 100% không bị bypass
+# - MediaTek MT798x (WED / HNAT): Bật flow_offloading=1 + flow_offloading_hw=1
+optimize_hw_offload() {
+	local has_nss=0 has_hw=0 cur_fo cur_hw changed=0
+	if [ -d /sys/module/ecm ] || lsmod 2>/dev/null | grep -qE '^(ecm|qca_nss_drv)[[:space:]]'; then
+		has_nss=1
+	elif [ "$(cat /sys/module/mt7915e/parameters/wed_enable 2>/dev/null)" = "Y" ] || \
+	     [ -d /sys/kernel/debug/mtk_ppe ] || [ -d /sys/module/mtk_eth ]; then
+		has_hw=1
+	fi
+
+	cur_fo=$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null)
+	cur_hw=$(uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
+
+	if [ "$has_nss" = "1" ]; then
+		if [ "$cur_fo" = "1" ] || [ "$cur_hw" = "1" ]; then
+			uci set firewall.@defaults[0].flow_offloading='0'
+			uci set firewall.@defaults[0].flow_offloading_hw='0'
+			changed=1
+			log_mesh "Phát hiện Qualcomm NSS ECM -> Tắt flow_offloading để giữ NSS offload tối đa."
+		fi
+	else
+		local target_hw="0"
+		[ "$has_hw" = "1" ] && target_hw="1"
+		if [ "$cur_fo" != "1" ] || [ "$cur_hw" != "$target_hw" ]; then
+			uci set firewall.@defaults[0].flow_offloading='1'
+			uci set firewall.@defaults[0].flow_offloading_hw="$target_hw"
+			changed=1
+			log_mesh "Tối ưu Firewall Flow Offload (SW=1, HW=$target_hw)."
+		fi
+	fi
+
+	if [ "$changed" = "1" ]; then
+		uci commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	fi
+	touch /tmp/doanduy_mesh_offload_done 2>/dev/null || true
+}
+
+# Phân kênh 2.4 GHz xen kẽ không chồng lấn (1 / 6 / 11 @ 20MHz) giảm nhiễu đồng kênh giữa các tầng Mesh
+optimize_2g_channel() {
+	local role="${1:-controller}" lip up_gw oct p_oct target_2g=1 dev band cur_c cur_ht changed=0
+	if [ "$role" != "controller" ]; then
+		lip=$(get_node_ip)
+		up_gw=$(get_upstream_gateway)
+		oct="${lip##*.}"
+		case "$oct" in ''|*[!0-9]*) oct=10 ;; esac
+		if [ -z "$up_gw" ] || [ "$up_gw" = "192.168.1.1" ]; then
+			[ $((oct % 2)) -eq 0 ] && target_2g=6 || target_2g=11
+		else
+			p_oct=$(printf '%s' "$up_gw" | cut -d. -f3)
+			case "$p_oct" in ''|*[!0-9]*) p_oct=10 ;; esac
+			[ $((p_oct % 2)) -eq 0 ] && target_2g=11 || target_2g=6
+		fi
+	fi
+
+	for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+		band=$(uci -q get "wireless.${dev}.band")
+		[ "$band" = "2g" ] || continue
+		radio_supports_channel "$dev" "$target_2g" || continue
+		cur_c=$(uci -q get "wireless.${dev}.channel")
+		cur_ht=$(uci -q get "wireless.${dev}.htmode")
+		if [ "$cur_c" != "$target_2g" ]; then
+			uci set "wireless.${dev}.channel=$target_2g"
+			changed=1
+		fi
+		case "$cur_ht" in
+			HE40|EHT40)
+				uci set "wireless.${dev}.htmode=HE20"
+				changed=1
+				;;
+			HT40*|VHT40*)
+				uci set "wireless.${dev}.htmode=HT20"
+				changed=1
+				;;
+		esac
+	done
+	touch /tmp/doanduy_mesh_2g_opt_done 2>/dev/null || true
+	echo "$changed"
+}
+
+# Dọn vệ sinh hệ thống trên Router Phụ: chuẩn hóa múi giờ ICT-7, chống trùng hostname, tắt dnsmasq trên mesh_uplink
+ensure_node_system_hygiene() {
+	local sys_ch=0 dhcp_ch=0 tz host mac_tail bmodel pfx new_host
+	tz=$(uci -q get system.@system[0].timezone 2>/dev/null)
+	if [ "$tz" != "ICT-7" ]; then
+		uci set system.@system[0].timezone='ICT-7'
+		uci set system.@system[0].zonename='Asia/Ho Chi Minh'
+		echo 'ICT-7' > /tmp/TZ 2>/dev/null || true
+		sys_ch=1
+	fi
+
+	host=$(uci -q get system.@system[0].hostname 2>/dev/null)
+	case "$host" in
+		""|ImmortalWrt|OpenWrt|LEDE|Duydoan)
+			mac_tail=$(tr -d ':' < /sys/class/net/br-lan/address 2>/dev/null | tr 'a-z' 'A-Z' | tail -c 5)
+			[ -n "$mac_tail" ] || mac_tail="NODE"
+			bmodel=$(cat /tmp/sysinfo/model 2>/dev/null || echo "")
+			case "$bmodel" in
+				*SDMC*|*NR3053*) pfx="SDMC" ;;
+				*RE-CS-02*|*JDCloud*) pfx="JDCloud" ;;
+				*AX6000*|*ASUS*) pfx="ASUS" ;;
+				*) pfx="DOANDUY" ;;
+			esac
+			new_host="${pfx}-${mac_tail}"
+			uci set system.@system[0].hostname="$new_host"
+			hostname "$new_host" 2>/dev/null || true
+			sys_ch=1
+			;;
+	esac
+	[ "$sys_ch" = "1" ] && uci commit system
+
+	if [ -n "$(uci -q get network.mesh_uplink)" ] && [ "$(uci -q get dhcp.mesh_uplink.ignore)" != "1" ]; then
+		uci set dhcp.mesh_uplink=dhcp
+		uci set dhcp.mesh_uplink.interface='mesh_uplink'
+		uci set dhcp.mesh_uplink.ignore='1'
+		uci commit dhcp
+		dhcp_ch=1
+	fi
+	[ "$dhcp_ch" = "1" ] && /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+	touch /tmp/doanduy_mesh_hygiene_done 2>/dev/null || true
 }
 
 apply_controller_role() {
@@ -930,7 +1070,20 @@ apply_controller_role() {
 		fi
 	fi
 
+	if [ -f /tmp/doanduy_mesh_paused_aps ]; then
+		local puap
+		for puap in $(cat /tmp/doanduy_mesh_paused_aps 2>/dev/null); do
+			if [ -n "$(uci -q get "wireless.${puap}")" ] && [ "$(uci -q get "wireless.${puap}.disabled")" = "1" ]; then
+				uci -q set "wireless.${puap}.disabled=0"
+				wifi_changed=1
+			fi
+		done
+		rm -f /tmp/doanduy_mesh_paused_aps
+	fi
+
 	[ "$(configure_roaming_on_user_aps)" = "1" ] && wifi_changed=1
+	[ "$(optimize_2g_channel controller)" = "1" ] && wifi_changed=1
+	optimize_hw_offload
 
 	if [ "$net_changed" = "1" ]; then
 		flush_secondary_node_ips
@@ -995,6 +1148,7 @@ verify_unique_node_ip() {
 			uci set network.mesh_uplink.ipaddr="$new_ip"
 			uci set network.lan.ipaddr="192.168.${oct}.1"
 			uci commit network
+			rm -f /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done
 			/etc/init.d/network reload >/dev/null 2>&1 || true
 			/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 			log_mesh "Cấp phát IP tuần tự chính thức: $new_ip (LAN 192.168.${oct}.1)!"
@@ -1014,8 +1168,30 @@ ensure_node_relay_ap() {
 	target_ssid="${CFG_SSID}_R"
 	target_key="$CFG_KEY"
 
+	# Auto-pause user APs sharing uplink_radio if driver fails STA+AP (carrier=0 / Channel: 0) at 160MHz
+	if [ -f "$HAD_PEER_FILE" ]; then
+		local uap uap_if
+		for uap in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+			case "$uap" in mesh_backhaul_ap|mesh_sta) continue ;; esac
+			[ "$(uci -q get "wireless.${uap}.device")" = "$uplink_radio" ] || continue
+			[ "$(uci -q get "wireless.${uap}.mode")" = "ap" ] || continue
+			[ "$(uci -q get "wireless.${uap}.disabled")" = "1" ] && continue
+			uap_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${uplink_radio}.interfaces[@.section='${uap}'].ifname" 2>/dev/null | head -n 1)
+			if [ -n "$uap_if" ] && [ -d "/sys/class/net/$uap_if" ]; then
+				if [ "$(cat "/sys/class/net/${uap_if}/carrier" 2>/dev/null)" = "0" ] || \
+				   iwinfo "$uap_if" info 2>/dev/null | grep -q 'Channel: 0'; then
+					uci set "wireless.${uap}.disabled=1"
+					grep -qx "$uap" /tmp/doanduy_mesh_paused_aps 2>/dev/null || echo "$uap" >> /tmp/doanduy_mesh_paused_aps
+					changed=1
+					log_mesh "Radio $uplink_radio ($uap_if) không hỗ trợ STA+AP đồng thời -> Tạm ẩn AP '$uap' để dứt lỗi hostapd & giữ max băng thông."
+				fi
+			fi
+		done
+	fi
+
 	# Router Dual-Band dùng chung 1 radio 5G: đợi kết nối Uplink ổn định (>= 1 chu kỳ) rồi mới dựng Relay AP
 	if [ "$radio" = "$uplink_radio" ] && [ ! -f "$HAD_PEER_FILE" ]; then
+		[ "$changed" = "1" ] && { uci commit wireless; safe_wifi_reload 0; }
 		return 0
 	fi
 
@@ -1054,14 +1230,17 @@ ensure_node_relay_ap() {
 		up_ch=$(uci -q get "wireless.${uplink_radio}.channel")
 		case "$relay_ch" in ''|auto|0) need_ch=1 ;; esac
 		if [ "$need_ch" = "0" ] && [ "$rband" = "5g" ] && radio_supports_wide_bw "$radio" && [ "${relay_ch:-0}" -ge 149 ] 2>/dev/null; then
-			need_ch=1
+			if { [ ! -f "/tmp/doanduy_mesh_dfs_blocked_${radio}" ] && [ "${up_ch:-36}" -lt 100 ] 2>/dev/null && radio_supports_channel "$radio" 100 && radio_channel_is_non_dfs "$radio" 100; } || \
+			   { [ "${up_ch:-36}" != "36" ] && radio_supports_channel "$radio" 36 && radio_channel_is_non_dfs "$radio" 36; }; then
+				need_ch=1
+			fi
 		fi
 		if [ "$need_ch" = "1" ]; then
 			if [ "$rband" = "5g" ] && radio_supports_wide_bw "$radio"; then
-				if [ "${up_ch:-36}" -lt 100 ] 2>/dev/null && radio_supports_channel "$radio" 100; then
+				if [ ! -f "/tmp/doanduy_mesh_dfs_blocked_${radio}" ] && [ "${up_ch:-36}" -lt 100 ] 2>/dev/null && radio_supports_channel "$radio" 100 && radio_channel_is_non_dfs "$radio" 100; then
 					uci set "wireless.${radio}.channel=100"
 					changed=1
-				elif radio_supports_channel "$radio" 36; then
+				elif radio_supports_channel "$radio" 36 && radio_channel_is_non_dfs "$radio" 36; then
 					uci set "wireless.${radio}.channel=36"
 					changed=1
 				elif radio_supports_channel "$radio" 149; then
@@ -1080,6 +1259,27 @@ ensure_node_relay_ap() {
 			changed=1
 		fi
 		[ "$(maximize_mesh_radio_perf "$radio")" = "1" ] && changed=1
+
+		# Tự phục hồi nếu Relay AP bị treo do DFS (vd kênh 100 Radar detection làm ath11k dead AP)
+		if [ "$(uci -q get wireless.mesh_backhaul_ap.device)" = "$radio" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" != "1" ]; then
+			local rts_dfs now_dfs rap_dfs_if dfs_dead=0
+			now_dfs=$(date +%s)
+			rts_dfs=$(cat /tmp/doanduy_mesh_relay_ts 2>/dev/null || echo 0)
+			if [ "${rts_dfs:-0}" -gt 0 ] && [ $((now_dfs - rts_dfs)) -ge 15 ]; then
+				rap_dfs_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${radio}.interfaces[@.section='mesh_backhaul_ap'].ifname" 2>/dev/null | head -n 1)
+				if [ -n "$rap_dfs_if" ] && [ -d "/sys/class/net/$rap_dfs_if" ]; then
+					[ "$(cat "/sys/class/net/${rap_dfs_if}/carrier" 2>/dev/null)" = "0" ] && dfs_dead=1
+					iwinfo "$rap_dfs_if" info 2>/dev/null | grep -q 'Channel: 0' && dfs_dead=1
+				fi
+				if [ "$dfs_dead" = "1" ] && [ "$relay_ch" != "149" ] && radio_supports_channel "$radio" 149; then
+					touch "/tmp/doanduy_mesh_dfs_blocked_${radio}"
+					uci set "wireless.${radio}.channel=149"
+					case "$(uci -q get "wireless.${radio}.htmode")" in *160*) uci set "wireless.${radio}.htmode=HE80" ;; esac
+					changed=1
+					log_mesh "Relay Radio $radio ($rap_dfs_if) bị treo DFS trên kênh $relay_ch -> Tự động chuyển về kênh sạch non-DFS 149."
+				fi
+			fi
+		fi
 	fi
 
 	if [ -f /sys/class/net/br-lan/bridge/stp_state ]; then
@@ -1224,6 +1424,9 @@ apply_node_role() {
 		wifi_changed=1
 	fi
 	[ "$(configure_roaming_on_user_aps)" = "1" ] && wifi_changed=1
+	[ "$(optimize_2g_channel node)" = "1" ] && wifi_changed=1
+	optimize_hw_offload
+	ensure_node_system_hygiene
 
 	if [ -n "$(uci -q get network.lan_rescue)" ]; then
 		uci -q delete network.lan_rescue
@@ -1321,7 +1524,17 @@ apply_node_role() {
 restore_default_standalone() {
 	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0 fw_changed=0
 	ensure_mesh_uci
-	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts
+	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done
+	if [ -f /tmp/doanduy_mesh_paused_aps ]; then
+		local puap
+		for puap in $(cat /tmp/doanduy_mesh_paused_aps 2>/dev/null); do
+			if [ -n "$(uci -q get "wireless.${puap}")" ] && [ "$(uci -q get "wireless.${puap}.disabled")" = "1" ]; then
+				uci -q set "wireless.${puap}.disabled=0"
+				wifi_changed=1
+			fi
+		done
+		rm -f /tmp/doanduy_mesh_paused_aps
+	fi
 	if [ "$mode_after" = "disabled" ]; then
 		uci set "${MESH_UCI}.mesh.enabled=0"
 		uci set "${MESH_UCI}.mesh.mode=standalone"
@@ -1498,6 +1711,7 @@ collect_relay_children_json() {
 		cmodel="Router Phụ (Tầng 2)"
 		chost="DOANDUY"
 		cmac=$(printf '%s' "$smac" | tr 'a-z' 'A-Z')
+		local cm_sub=""
 		if [ -n "$cip" ]; then
 			cmeta=$(fetch_http_fast "http://${cip}/mesh_node_info.json")
 			if [ -n "$cmeta" ]; then
@@ -1505,9 +1719,13 @@ collect_relay_children_json() {
 				cm_h=$(printf '%s' "$cmeta" | jsonfilter -e '@.hostname' 2>/dev/null)
 				cm_a=$(printf '%s' "$cmeta" | jsonfilter -e '@.mac' 2>/dev/null | tr 'a-z' 'A-Z')
 				cm_s=$(printf '%s' "$cmeta" | jsonfilter -e '@.uplink_signal' 2>/dev/null)
+				cm_sub=$(printf '%s' "$cmeta" | jsonfilter -e '@.lan_subnet' 2>/dev/null)
 				[ -n "$cm_m" ] && cmodel="$cm_m"
 				[ -n "$cm_h" ] && chost="$cm_h"
 				[ -n "$cm_a" ] && cmac="$cm_a"
+				if [ -n "$cm_sub" ] && [ "$cm_sub" != "192.168.1.0/24" ]; then
+					ip route replace "$cm_sub" via "$cip" 2>/dev/null || true
+				fi
 				if [ -n "$cm_s" ]; then
 					sig_txt=$(awk -v a="$sig_txt" -v b="$cm_s" 'BEGIN{
 						ra=0; rb=0;
@@ -1520,7 +1738,7 @@ collect_relay_children_json() {
 		fi
 		[ -n "$cip" ] || cip="192.168.10.x"
 		[ -n "$sig_txt" ] || sig_txt="Online"
-		item="{\"ip\":\"$(json_esc "$cip")\",\"mac\":\"$(json_esc "$cmac")\",\"name\":\"$(json_esc "$chost")\",\"model\":\"$(json_esc "$cmodel")\",\"signal\":\"$(json_esc "$sig_txt")\",\"url\":\"http://${cip}\"}"
+		item="{\"ip\":\"$(json_esc "$cip")\",\"mac\":\"$(json_esc "$cmac")\",\"name\":\"$(json_esc "$chost")\",\"model\":\"$(json_esc "$cmodel")\",\"signal\":\"$(json_esc "$sig_txt")\",\"lan_subnet\":\"$(json_esc "$cm_sub")\",\"url\":\"http://${cip}\"}"
 		[ -z "$out" ] && out="$item" || out="${out},${item}"
 	done
 	echo "[${out}]"
@@ -1623,11 +1841,17 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 		rmbssid=$(printf '%s' "$pmeta" | jsonfilter -e '@.mesh_bssid' 2>/dev/null | tr 'a-z' 'A-Z')
 		rubssid=$(printf '%s' "$pmeta" | jsonfilter -e '@.uplink_bssid' 2>/dev/null | tr 'a-z' 'A-Z')
 		rusig=$(printf '%s' "$pmeta" | jsonfilter -e '@.uplink_signal' 2>/dev/null)
+		local rsub
+		rsub=$(printf '%s' "$pmeta" | jsonfilter -e '@.lan_subnet' 2>/dev/null)
+		case "$rsub" in
+			192.168.1.0/24|"") ;;
+			192.168.*.*/24) ip route replace "$rsub" via "$nip" dev br-lan 2>/dev/null || true ;;
+		esac
 		[ -z "$rusig" ] && rusig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2 " dBm"; exit}')
 		[ -z "$rusig" ] && rusig="Online"
 		echo "${nip}|${nmac:-NODE}|${rhost}|${rmodel}|${rmbssid}|${rubssid}|${rusig}" >> "$tmp_nodes"
 
-		# Gom thêm các Router Phụ tầng dưới đang gắn gián tiếp qua node này (NAT Relay)
+		# Gom thêm các Router Phụ tầng dưới đang gắn gián tiếp qua node này (NAT Relay) & tự động định tuyến xuyên tầng
 		case "$pmeta" in
 			*'"children":[{'*)
 				if command -v lua >/dev/null 2>&1; then
@@ -1635,10 +1859,21 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 						local ok,c=pcall(require,"cjson.safe"); if not ok then return end
 						local d=c.decode(io.read("*a") or ""); if not d or type(d.children)~="table" then return end
 						for _,ch in ipairs(d.children) do
-							if ch.ip then print((ch.ip or "").."|"..(ch.mac or "").."|"..(ch.name or "").."|"..(ch.model or "").."|"..(ch.signal or "")) end
+							if ch.ip then print((ch.ip or "").."|"..(ch.mac or "").."|"..(ch.name or "").."|"..(ch.model or "").."|"..(ch.signal or "").."|"..(ch.lan_subnet or "")) end
 						end
-					' 2>/dev/null | while IFS='|' read -r cip cmac chost cmodel csig; do
-						[ -n "$cip" ] && echo "${cip}|${nip}|${cmac}|${chost}|${cmodel}|${csig}" >> "$tmp_children"
+					' 2>/dev/null | while IFS='|' read -r cip cmac chost cmodel csig csub; do
+						if [ -n "$cip" ]; then
+							local c_net="${cip%.*}.0/24"
+							case "$c_net" in
+								192.168.1.0/24|*.x.*) ;;
+								192.168.*.*/24) ip route replace "$c_net" via "$nip" dev br-lan 2>/dev/null || true ;;
+							esac
+							case "$csub" in
+								192.168.1.0/24|"") ;;
+								192.168.*.*/24) ip route replace "$csub" via "$nip" dev br-lan 2>/dev/null || true ;;
+							esac
+							echo "${cip}|${nip}|${cmac}|${chost}|${cmodel}|${csig}" >> "$tmp_children"
+						fi
 					done
 				fi
 				;;
@@ -1689,7 +1924,7 @@ refresh_status_cache() {
 	get_mesh_cfg
 	local role radio chan htmode lip lmac lname has_dir=false pinfo pcnt pjson
 	local bmodel pair_rem searching=false mbssid uinfo ubssid usig urate usig_lbl=""
-	local up_gw wifi_js wifi_hash="" children_js="[]" root_master_ip=""
+	local up_gw wifi_js wifi_hash="" children_js="[]" root_master_ip="" lan_ip="" lan_sub=""
 
 	role=$(get_active_role)
 	pair_rem=$(get_pairing_remaining)
@@ -1697,6 +1932,8 @@ refresh_status_cache() {
 	chan=$(uci -q get "wireless.${radio}.channel" || echo "36")
 	htmode=$(uci -q get "wireless.${radio}.htmode" || echo "HE160")
 	lip=$(get_node_ip)
+	lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	[ "$role" = "node" ] && case "$lan_ip" in 192.168.*.*) lan_sub="${lan_ip%.*}.0/24" ;; esac
 	up_gw=$(get_upstream_gateway)
 	lmac=$(tr 'a-z' 'A-Z' < /sys/class/net/br-lan/address 2>/dev/null || echo "00:00:00:00:00:00")
 	lname=$(uci -q get system.@system[0].hostname || echo "DOANDUY")
@@ -1725,7 +1962,7 @@ refresh_status_cache() {
 	[ -n "$children_js" ] || children_js="[]"
 
 	cat <<EOF > /tmp/mesh_node_info.json.tmp
-{"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","ip":"$(json_esc "$lip")","mac":"$(json_esc "$lmac")","mesh_bssid":"$(json_esc "$mbssid")","uplink_bssid":"$(json_esc "$ubssid")","uplink_signal":"$(json_esc "$usig_lbl")","children":$children_js}
+{"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","ip":"$(json_esc "$lip")","lan_subnet":"$(json_esc "$lan_sub")","mac":"$(json_esc "$lmac")","mesh_bssid":"$(json_esc "$mbssid")","uplink_bssid":"$(json_esc "$ubssid")","uplink_signal":"$(json_esc "$usig_lbl")","children":$children_js}
 EOF
 	mv -f /tmp/mesh_node_info.json.tmp /tmp/mesh_node_info.json 2>/dev/null || true
 	[ -L /www/mesh_node_info.json ] || ln -sf /tmp/mesh_node_info.json /www/mesh_node_info.json 2>/dev/null || true
@@ -1828,6 +2065,11 @@ reconcile_once() {
 		fi
 		rm -f "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE"
 		apply_controller_role
+		[ ! -f /tmp/doanduy_mesh_offload_done ] && optimize_hw_offload
+		if [ ! -f /tmp/doanduy_mesh_2g_opt_done ] && [ "$(optimize_2g_channel controller)" = "1" ]; then
+			uci commit wireless
+			safe_wifi_reload 0
+		fi
 		if [ -f "$WIFI_HELPER" ] && command -v lua >/dev/null 2>&1; then
 			lua "$WIFI_HELPER" publish >/dev/null 2>&1 || true
 		fi
@@ -1845,6 +2087,12 @@ reconcile_once() {
 			is_epoch_current "$my_epoch" || return 0
 			rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" "$PAIR_UNTIL_FILE" "$SCAN_MISS_FILE"
 			verify_unique_node_ip
+			[ ! -f /tmp/doanduy_mesh_offload_done ] && optimize_hw_offload
+			if [ ! -f /tmp/doanduy_mesh_2g_opt_done ] && [ "$(optimize_2g_channel node)" = "1" ]; then
+				uci commit wireless
+				safe_wifi_reload 0
+			fi
+			[ ! -f /tmp/doanduy_mesh_hygiene_done ] && ensure_node_system_hygiene
 			ensure_node_relay_ap
 			disable_mesh_sta_powersave
 			touch "$HAD_PEER_FILE"
@@ -1900,7 +2148,7 @@ handle_pair_cmd() {
 	uci set "${MESH_UCI}.mesh.enabled=1"
 	uci set "${MESH_UCI}.mesh.mode=auto"
 	uci commit "$MESH_UCI"
-	rm -f "$IDLE_FLAG_FILE" "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts
+	rm -f "$IDLE_FLAG_FILE" "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done
 	start_pairing_window "$PAIR_WINDOW_SEC"
 	write_instant_status_cache
 	log_mesh "Bật Auto-Mesh Always-Ready -> Phát sóng công suất tối đa & tự động ghép nối!"
