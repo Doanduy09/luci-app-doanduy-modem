@@ -198,6 +198,8 @@ get_mesh_cfg() {
 	[ -z "$CFG_KEY" ] && CFG_KEY="$DEFAULT_MESH_KEY"
 	CFG_WIFI_SYNC_MODE=$(uci -q get "${MESH_UCI}.mesh.wifi_sync_mode" 2>/dev/null)
 	[ -z "$CFG_WIFI_SYNC_MODE" ] && CFG_WIFI_SYNC_MODE="master"
+	CFG_PREFER_RELAY=$(uci -q get "${MESH_UCI}.mesh.prefer_relay" 2>/dev/null)
+	[ -z "$CFG_PREFER_RELAY" ] && CFG_PREFER_RELAY="0"
 }
 
 # Tìm netdev interface đang chạy của một UCI radio (OpenWrt 25.12 iwinfo cần tên interface thay vì radioX)
@@ -450,7 +452,18 @@ maximize_mesh_radio_perf() {
 	echo "$changed"
 }
 
-check_direct_internet() {
+maximize_all_5g_radios() {
+	local dev dis band any=0
+	for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+		dis=$(uci -q get "wireless.${dev}.disabled")
+		[ "$dis" = "1" ] && continue
+		band=$(uci -q get "wireless.${dev}.band")
+		if [ "$band" = "5g" ] || [ "$band" = "6g" ]; then
+			[ "$(maximize_mesh_radio_perf "$dev")" = "1" ] && any=1
+		fi
+	done
+	echo "$any"
+}
 	DIRECT_SRC=""
 	local iface st up l3 d
 	if command -v ubus >/dev/null 2>&1; then
@@ -530,13 +543,17 @@ scan_for_master_mesh() {
 		if command -v iwinfo >/dev/null 2>&1; then
 			raw=$(iwinfo "$w_if" scan 2>/dev/null)
 			if [ -n "$raw" ]; then
-				best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v s3="$relay_ssid" -v own="$my_macs" '
+				best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v s3="$relay_ssid" -v own="$my_macs" -v pref_r="$CFG_PREFER_RELAY" '
 					BEGIN { best_score=-9999; bssid=""; essid=""; chan=""; sig=-95 }
 					function flush_cell() {
 						if ((essid == s1 || essid == s2 || essid == s3) && bssid != "" && index(own, "," bssid ",") == 0) {
 							s = sig + 0
-							tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
-							sc = (tier == 1 ? 1000 : 0) + s
+							if (pref_r == "1" && essid == s3) {
+								tier = 2; sc = 2000 + s
+							} else {
+								tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
+								sc = (tier == 1 ? 1000 : 0) + s
+							}
 							if (sc > best_score) {
 								best_score = sc
 								best_out = essid "|" (chan != "" ? chan : "36") "|" bssid "|" s "|" tier "|" sc
@@ -565,13 +582,17 @@ scan_for_master_mesh() {
 			ip link set "$w_if" up 2>/dev/null || true
 			raw=$(iw dev "$w_if" scan 2>/dev/null)
 			if [ -n "$raw" ]; then
-				best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v s3="$relay_ssid" -v own="$my_macs" '
+				best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v s3="$relay_ssid" -v own="$my_macs" -v pref_r="$CFG_PREFER_RELAY" '
 					BEGIN { best_score=-9999; bssid=""; essid=""; chan=""; sig=-95 }
 					function flush_bss() {
 						if ((essid == s1 || essid == s2 || essid == s3) && bssid != "" && index(own, "," bssid ",") == 0) {
 							s = sig + 0
-							tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
-							sc = (tier == 1 ? 1000 : 0) + s
+							if (pref_r == "1" && essid == s3) {
+								tier = 2; sc = 2000 + s
+							} else {
+								tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
+								sc = (tier == 1 ? 1000 : 0) + s
+							}
 							if (sc > best_score) {
 								best_score = sc
 								best_out = essid "|" (chan != "" ? chan : "36") "|" bssid "|" s "|" tier "|" sc
@@ -796,6 +817,7 @@ apply_controller_role() {
 	fi
 
 	[ "$(maximize_mesh_radio_perf "$radio")" = "1" ] && wifi_changed=1
+	[ "$(maximize_all_5g_radios)" = "1" ] && wifi_changed=1
 
 	if [ "$(uci -q get wireless.mesh_backhaul_ap.ssid)" != "$CFG_SSID" ] || \
 	   [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" = "1" ] || \
@@ -1036,6 +1058,7 @@ apply_node_role() {
 	fi
 
 	[ "$(maximize_mesh_radio_perf "$radio")" = "1" ] && wifi_changed=1
+	[ "$(maximize_all_5g_radios)" = "1" ] && wifi_changed=1
 
 	# Khi mới bắt đầu nối STA, tạm tắt relay AP cho tới khi ping thông uplink để chống loop
 	if [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ] && ! ping -c 1 -W 1 "$(get_upstream_gateway)" >/dev/null 2>&1; then
@@ -1302,13 +1325,60 @@ fetch_http_fast() {
 	fi
 }
 
-# Thu thập cây phân tầng đầy đủ của toàn bộ các Router Phụ (.10, .11, .12, .13, .14 ... .99)
-# Tự động xác định parent_ip: nối vào Router Chính -> parent_ip = 192.168.1.1 (Tầng 1); nối vào Router Phụ -> parent_ip = IP máy Phụ đó (Tầng 2, 3...)
+# Thu thập các Router Phụ tầng dưới đang gắn vào Relay AP (DOANDUY_MESH_R) trên node này
+collect_relay_children_json() {
+	local relay_if="" w_if dump="" macs="" smac sig_num rate_num sig_txt cip cmeta cmodel chost cmac csig out="" item
+	command -v iw >/dev/null 2>&1 || { echo "[]"; return 0; }
+	for w_if in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+		if iw dev "$w_if" info 2>/dev/null | grep -qE "ssid ${CFG_SSID}_R$"; then
+			relay_if="$w_if"
+			break
+		fi
+	done
+	[ -n "$relay_if" ] || { echo "[]"; return 0; }
+	dump=$(iw dev "$relay_if" station dump 2>/dev/null)
+	macs=$(printf '%s\n' "$dump" | awk '/^Station /{print tolower($2)}')
+	[ -n "$macs" ] || { echo "[]"; return 0; }
+
+	for smac in $macs; do
+		cip=""
+		[ -f /tmp/dhcp.leases ] && cip=$(awk -v m="$smac" 'tolower($2)==m {print $3; exit}' /tmp/dhcp.leases 2>/dev/null)
+		[ -z "$cip" ] && cip=$(awk -v m="$smac" 'tolower($4)==m && $3!="0x0" {print $1; exit}' /proc/net/arp 2>/dev/null)
+		sig_txt=$(printf '%s\n' "$dump" | awk -v m="$smac" '
+			/^Station /{in_s=(tolower($2)==m); s=""; r=0}
+			in_s && /signal:/{s=$2 " dBm"}
+			in_s && (/rx bitrate:/ || /tx bitrate:/){if($3+0 > r) r=$3+0}
+			END{if(r>6) printf "%s • %.0f Mbps", (s!=""?s:"-45 dBm"), r; else if(s!="") print s}
+		')
+		cmodel="Router Phụ (Tầng 2)"
+		chost="DOANDUY"
+		cmac=$(printf '%s' "$smac" | tr 'a-z' 'A-Z')
+		if [ -n "$cip" ]; then
+			cmeta=$(fetch_http_fast "http://${cip}/mesh_node_info.json")
+			if [ -n "$cmeta" ]; then
+				cm_m=$(printf '%s' "$cmeta" | jsonfilter -e '@.model' 2>/dev/null)
+				cm_h=$(printf '%s' "$cmeta" | jsonfilter -e '@.hostname' 2>/dev/null)
+				cm_a=$(printf '%s' "$cmeta" | jsonfilter -e '@.mac' 2>/dev/null | tr 'a-z' 'A-Z')
+				cm_s=$(printf '%s' "$cmeta" | jsonfilter -e '@.uplink_signal' 2>/dev/null)
+				[ -n "$cm_m" ] && cmodel="$cm_m"
+				[ -n "$cm_h" ] && chost="$cm_h"
+				[ -n "$cm_a" ] && cmac="$cm_a"
+				[ -n "$cm_s" ] && sig_txt="$cm_s"
+			fi
+		fi
+		[ -n "$cip" ] || cip="192.168.10.x"
+		[ -n "$sig_txt" ] || sig_txt="Online"
+		item="{\"ip\":\"$(json_esc "$cip")\",\"mac\":\"$(json_esc "$cmac")\",\"name\":\"$(json_esc "$chost")\",\"model\":\"$(json_esc "$cmodel")\",\"signal\":\"$(json_esc "$sig_txt")\",\"url\":\"http://${cip}\"}"
+		[ -z "$out" ] && out="$item" || out="${out},${item}"
+	done
+	echo "[${out}]"
+}
+
+# Thu thập cây phân tầng đầy đủ của toàn bộ các Router Phụ (.10, .11, .12 ... và các tầng dưới nối Relay)
 get_mesh_peers_json() {
 	local role="$1" lip="$2" master_bssid="$3" peer_count=0 peer_list="" up_gw
 	up_gw=$(get_upstream_gateway)
 	if [ "$role" = "node" ]; then
-		# Nếu đang xem trên Router Phụ: lưu cache cây phân tầng từ Router Chính để hiển thị đồng nhất!
 		if ping -c 1 -W 1 "$up_gw" >/dev/null 2>&1; then
 			local mtopo mpeers mcnt
 			mtopo=$(fetch_http_fast "http://${up_gw}/mesh_topology.json")
@@ -1380,8 +1450,8 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 	wait 2>/dev/null || true
 
 	# Sắp xếp danh sách IP ứng viên tăng dần theo số cuối (10, 11, 12, 13, 14...)
-	local sorted_ips tmp_nodes="/tmp/doanduy_mesh_nodes.$$"
-	rm -f "$tmp_nodes"
+	local sorted_ips tmp_nodes="/tmp/doanduy_mesh_nodes.$$" tmp_children="/tmp/doanduy_mesh_children.$$"
+	rm -f "$tmp_nodes" "$tmp_children"
 	sorted_ips=$(awk '$1 ~ /^192\.168\.1\.[1-9][0-9]$/ && $3!="0x0" {split($1,a,"."); printf "%03d %s\n", a[4], $1}' /proc/net/arp 2>/dev/null | sort -u | awk '{print $2}')
 
 	local pmeta rmodel rhost rmbssid rubssid rusig nmac
@@ -1404,6 +1474,23 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 		[ -z "$rusig" ] && rusig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2 " dBm"; exit}')
 		[ -z "$rusig" ] && rusig="Online"
 		echo "${nip}|${nmac:-NODE}|${rhost}|${rmodel}|${rmbssid}|${rubssid}|${rusig}" >> "$tmp_nodes"
+
+		# Gom thêm các Router Phụ tầng dưới đang gắn gián tiếp qua node này (NAT Relay)
+		case "$pmeta" in
+			*'"children":[{'*)
+				if command -v lua >/dev/null 2>&1; then
+					printf '%s' "$pmeta" | lua -e '
+						local ok,c=pcall(require,"cjson.safe"); if not ok then return end
+						local d=c.decode(io.read("*a") or ""); if not d or type(d.children)~="table" then return end
+						for _,ch in ipairs(d.children) do
+							if ch.ip then print((ch.ip or "").."|"..(ch.mac or "").."|"..(ch.name or "").."|"..(ch.model or "").."|"..(ch.signal or "")) end
+						end
+					' 2>/dev/null | while IFS='|' read -r cip cmac chost cmodel csig; do
+						[ -n "$cip" ] && echo "${cip}|${nip}|${cmac}|${chost}|${cmodel}|${csig}" >> "$tmp_children"
+					done
+				fi
+				;;
+		esac
 	done
 
 	if [ -f "$tmp_nodes" ]; then
@@ -1424,6 +1511,18 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 		rm -f "$tmp_nodes"
 	fi
 
+	if [ -f "$tmp_children" ]; then
+		while IFS='|' read -r cip cpar cmac chost cmodel csig; do
+			[ -n "$cip" ] || continue
+			peer_count=$((peer_count + 1))
+			[ -z "$cmodel" ] && cmodel="Router Phụ #${peer_count}"
+			[ -z "$chost" ] && chost="DOANDUY"
+			local citem="{\"ip\":\"$(json_esc "$cip")\",\"parent_ip\":\"$(json_esc "$cpar")\",\"mac\":\"$(json_esc "${cmac:-RELAY}")\",\"name\":\"$(json_esc "$chost")\",\"model\":\"$(json_esc "$cmodel")\",\"signal\":\"$(json_esc "${csig:-Online}")\",\"url\":\"http://${cip}\"}"
+			[ -z "$peer_list" ] && peer_list="$citem" || peer_list="${peer_list},${citem}"
+		done < "$tmp_children"
+		rm -f "$tmp_children"
+	fi
+
 	if [ "$peer_count" -eq 0 ] && [ "${wds_cnt:-0}" -gt 0 ]; then
 		local wmac wsig
 		wmac=$(printf '%s\n' "$wds_dump" | awk '/^Station /{print toupper($2); exit}')
@@ -1438,7 +1537,7 @@ refresh_status_cache() {
 	get_mesh_cfg
 	local role radio chan htmode lip lmac lname has_dir=false pinfo pcnt pjson
 	local bmodel pair_rem searching=false mbssid uinfo ubssid usig urate usig_lbl=""
-	local up_gw wifi_js wifi_hash=""
+	local up_gw wifi_js wifi_hash="" children_js="[]" root_master_ip=""
 
 	role=$(get_active_role)
 	pair_rem=$(get_pairing_remaining)
@@ -1470,8 +1569,11 @@ refresh_status_cache() {
 		has_dir=true
 	fi
 
+	[ "$role" = "node" ] && children_js=$(collect_relay_children_json)
+	[ -n "$children_js" ] || children_js="[]"
+
 	cat <<EOF > /tmp/mesh_node_info.json.tmp
-{"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","ip":"$(json_esc "$lip")","mac":"$(json_esc "$lmac")","mesh_bssid":"$(json_esc "$mbssid")","uplink_bssid":"$(json_esc "$ubssid")","uplink_signal":"$(json_esc "$usig_lbl")"}
+{"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","ip":"$(json_esc "$lip")","mac":"$(json_esc "$lmac")","mesh_bssid":"$(json_esc "$mbssid")","uplink_bssid":"$(json_esc "$ubssid")","uplink_signal":"$(json_esc "$usig_lbl")","children":$children_js}
 EOF
 	mv -f /tmp/mesh_node_info.json.tmp /tmp/mesh_node_info.json 2>/dev/null || true
 	[ -L /www/mesh_node_info.json ] || ln -sf /tmp/mesh_node_info.json /www/mesh_node_info.json 2>/dev/null || true
@@ -1494,10 +1596,15 @@ EOF
 		wifi_hash=$(cat /tmp/doanduy_mesh_applied_wifi_hash 2>/dev/null || true)
 	fi
 
-	local master_model="$bmodel" master_name="$lname"
+	local master_model="$bmodel" master_name="$lname" rm_ip=""
+	root_master_ip="$up_gw"
 	if [ "$role" = "node" ] && [ -s /tmp/master_topo_cache.json ]; then
-		master_model=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.board_model' 2>/dev/null)
-		master_name=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.local_name' 2>/dev/null)
+		master_model=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.master_model' 2>/dev/null)
+		[ -z "$master_model" ] && master_model=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.board_model' 2>/dev/null)
+		master_name=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.master_name' 2>/dev/null)
+		[ -z "$master_name" ] && master_name=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.local_name' 2>/dev/null)
+		rm_ip=$(jsonfilter -i /tmp/master_topo_cache.json -e '@.master_ip' 2>/dev/null)
+		[ -n "$rm_ip" ] && root_master_ip="$rm_ip"
 		[ -z "$master_model" ] && master_model="Router Chính"
 		[ -z "$master_name" ] && master_name="DOANDUY"
 	elif [ "$role" = "node" ]; then
@@ -1520,7 +1627,7 @@ EOF
   "local_mac": "$(json_esc "$lmac")",
   "local_name": "$(json_esc "$lname")",
   "board_model": "$(json_esc "$bmodel")",
-  "master_ip": "$(json_esc "$up_gw")",
+  "master_ip": "$(json_esc "$root_master_ip")",
   "master_model": "$(json_esc "$master_model")",
   "master_name": "$(json_esc "$master_name")",
   "has_internet": $has_dir,
