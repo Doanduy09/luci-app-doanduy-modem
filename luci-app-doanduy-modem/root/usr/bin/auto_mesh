@@ -773,6 +773,14 @@ apply_controller_role() {
 		wifi_changed=1
 	fi
 
+	if [ -f "$WIFI_HELPER" ] && command -v lua >/dev/null 2>&1; then
+		lua "$WIFI_HELPER" restore_orig >/dev/null 2>&1
+		if [ "$?" -eq 2 ]; then
+			wifi_changed=1
+			log_mesh "Thiết bị lên Router Chính -> Khôi phục Wi-Fi mặc định ban đầu trước khi phát sóng."
+		fi
+	fi
+
 	[ "$(configure_roaming_on_user_aps)" = "1" ] && wifi_changed=1
 
 	if [ "$net_changed" = "1" ]; then
@@ -1135,6 +1143,14 @@ restore_default_standalone() {
 	fi
 
 	[ "$fw_changed" = "1" ] && /etc/init.d/firewall reload >/dev/null 2>&1 || true
+
+	if [ -f "$WIFI_HELPER" ] && command -v lua >/dev/null 2>&1; then
+		lua "$WIFI_HELPER" restore_orig >/dev/null 2>&1
+		if [ "$?" -eq 2 ]; then
+			wifi_changed=1
+			log_mesh "Đã khôi phục cấu hình Wi-Fi mặc định ban đầu của thiết bị!"
+		fi
+	fi
 
 	if [ "$net_changed" = "1" ]; then
 		flush_secondary_node_ips

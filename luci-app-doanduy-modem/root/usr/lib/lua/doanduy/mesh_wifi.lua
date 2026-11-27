@@ -606,6 +606,25 @@ local function cmd_set_wifi()
 	}))
 end
 
+local function cmd_restore_orig()
+	local sync_mode = uci_get(MESH_UCI .. ".mesh.wifi_sync_mode")
+	if sync_mode == "custom" then
+		os.exit(0)
+	end
+	local raw = read_file(ORIG_BACKUP)
+	if not raw or trim(raw) == "" then
+		os.exit(0)
+	end
+	local prof = cjson.decode(raw)
+	if type(prof) ~= "table" or (not prof.ssid_2g and not prof.ssid_5g) then
+		os.exit(0)
+	end
+	local changed = apply_profile_to_local(prof)
+	os.remove(ORIG_BACKUP)
+	os.remove(APP_HASH_FILE)
+	os.exit(changed and 2 or 0)
+end
+
 local action = arg[1] or "summary"
 if action == "selftest" then
 	cmd_selftest()
@@ -617,6 +636,8 @@ elseif action == "summary" then
 	cmd_summary()
 elseif action == "set_wifi" then
 	cmd_set_wifi()
+elseif action == "restore_orig" then
+	cmd_restore_orig()
 else
 	io.stderr:write("Unknown action: " .. tostring(action) .. "\n")
 	os.exit(1)
