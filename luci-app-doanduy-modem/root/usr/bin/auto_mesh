@@ -475,27 +475,166 @@ restore_default_standalone() {
 	fi
 }
 
+json_esc() {
+	printf '%s' "$1" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+format_uptime_vi() {
+	local up_s d h m
+	up_s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
+	d=$((up_s / 86400))
+	h=$(((up_s % 86400) / 3600))
+	m=$(((up_s % 3600) / 60))
+	if [ "$d" -gt 0 ]; then
+		echo "${d} ngày ${h} giờ"
+	elif [ "$h" -gt 0 ]; then
+		echo "${h} giờ ${m} phút"
+	else
+		echo "${m} phút"
+	fi
+}
+
+get_local_wifi_summary() {
+	local ifc mode dis ssid list=""
+	for ifc in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$ifc" in mesh_backhaul_ap|mesh_sta) continue ;; esac
+		mode=$(uci -q get "wireless.${ifc}.mode")
+		[ "$mode" = "ap" ] || continue
+		dis=$(uci -q get "wireless.${ifc}.disabled")
+		[ "$dis" = "1" ] && continue
+		ssid=$(uci -q get "wireless.${ifc}.ssid")
+		case "$ssid" in ""|"$CFG_SSID"|"$LEGACY_MESH_SSID") continue ;; esac
+		case ",$list," in
+			*,"$ssid",*) ;;
+			*) [ -z "$list" ] && list="$ssid" || list="${list}, ${ssid}" ;;
+		esac
+	done
+	[ -z "$list" ] && list="Đang khởi tạo"
+	echo "$list"
+}
+
+get_local_client_count() {
+	local cnt=0 w_if w_ssid
+	if command -v iw >/dev/null 2>&1; then
+		for w_if in $(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type AP/{print i}'); do
+			w_ssid=$(iw dev "$w_if" info 2>/dev/null | awk '/ssid /{print $2; exit}')
+			case "$w_ssid" in "$CFG_SSID"|"$LEGACY_MESH_SSID") continue ;; esac
+			cnt=$((cnt + $(iw dev "$w_if" station dump 2>/dev/null | grep -c '^Station ' || echo 0)))
+		done
+	fi
+	if [ "$cnt" -eq 0 ] && [ -f /proc/net/arp ]; then
+		cnt=$(awk '$3!="0x0" && $6=="br-lan" && $1!="192.168.1.1" && $1!="192.168.1.254" {c++} END{print c+0}' /proc/net/arp 2>/dev/null || echo 0)
+	fi
+	echo "${cnt:-0}"
+}
+
+fetch_peer_meta() {
+	local ip="$1" url="http://${1}/mesh_node_info.json"
+	if command -v uclient-fetch >/dev/null 2>&1; then
+		uclient-fetch -q -T 1 -O - "$url" 2>/dev/null
+	elif command -v wget >/dev/null 2>&1; then
+		wget -q -T 1 -O - "$url" 2>/dev/null
+	elif command -v curl >/dev/null 2>&1; then
+		curl -fsSL --max-time 1 "$url" 2>/dev/null
+	fi
+}
+
 get_mesh_peers_json() {
-	local role="$1" peer_count=0 peer_list="" nip nmac sig="-45" host_lbl
+	local role="$1" lip="$2" peer_count=0 peer_list="" nip nmac sig rate pmeta rmodel rtarget rhost rssids rclients ruptime
 	if [ "$role" = "node" ]; then
 		if ping -c 1 -W 1 192.168.1.1 >/dev/null 2>&1; then
-			nmac=$(awk '$1=="192.168.1.1" && $3!="0x0" {print tolower($4)}' /proc/net/arp 2>/dev/null | head -n 1)
-			sig=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i}' | head -n 1 | xargs -r -I{} iw dev {} link 2>/dev/null | awk '/signal:/{print $2; exit}')
-			[ -z "$sig" ] && sig="-48"
+			nmac=$(awk '$1=="192.168.1.1" && $3!="0x0" {print toupper($4)}' /proc/net/arp 2>/dev/null | head -n 1)
+			local sta_if
+			sta_if=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i; exit}')
+			sig=""
+			rate=""
+			if [ -n "$sta_if" ]; then
+				sig=$(iw dev "$sta_if" link 2>/dev/null | awk '/signal:/{print $2; exit}')
+				rate=$(iw dev "$sta_if" link 2>/dev/null | sed -n 's/.*tx bitrate: \([0-9.]* [A-Za-z/]*\).*/\1/p' | head -n 1)
+			fi
+			[ -z "$sig" ] && sig="-46"
+			pmeta=$(fetch_peer_meta "192.168.1.1")
+			rmodel=$(printf '%s' "$pmeta" | jsonfilter -e '@.model' 2>/dev/null)
+			rtarget=$(printf '%s' "$pmeta" | jsonfilter -e '@.target' 2>/dev/null)
+			rhost=$(printf '%s' "$pmeta" | jsonfilter -e '@.hostname' 2>/dev/null)
+			rssids=$(printf '%s' "$pmeta" | jsonfilter -e '@.ssids' 2>/dev/null)
+			rclients=$(printf '%s' "$pmeta" | jsonfilter -e '@.clients' 2>/dev/null | tr -cd '0-9')
+			ruptime=$(printf '%s' "$pmeta" | jsonfilter -e '@.uptime' 2>/dev/null)
+			[ -z "$rmodel" ] && rmodel="Router Chính (Gateway)"
+			[ -z "$rhost" ] && rhost="DOANDUY"
+			local sig_lbl="${sig} dBm"
+			[ -n "$rate" ] && sig_lbl="${sig} dBm • ${rate}"
 			peer_count=1
-			peer_list="{\"ip\":\"192.168.1.1\",\"mac\":\"${nmac:-master}\",\"name\":\"Router Chính (Gateway)\",\"signal\":\"${sig} dBm\",\"url\":\"http://192.168.1.1\"}"
+			peer_list="{\"ip\":\"192.168.1.1\",\"mac\":\"$(json_esc "${nmac:-MASTER}")\",\"name\":\"$(json_esc "$rhost")\",\"model\":\"$(json_esc "$rmodel")\",\"target\":\"$(json_esc "$rtarget")\",\"ssids\":\"$(json_esc "$rssids")\",\"clients\":${rclients:-0},\"uptime\":\"$(json_esc "$ruptime")\",\"link_type\":\"Sóng Mesh WDS\",\"signal\":\"$(json_esc "$sig_lbl")\",\"url\":\"http://192.168.1.1\"}"
 		fi
 		echo "${peer_count}|[${peer_list}]"
 		return 0
 	fi
 
+	# Chỉ quét tìm Thiết Bị Phụ khi máy này đang ở chế độ Controller (Router Chính)
+	[ "$role" = "controller" ] || { echo "0|[]"; return 0; }
+
+	local mesh_if="" w_if wds_dump="" wds_cnt=0
+	if command -v iw >/dev/null 2>&1; then
+		for w_if in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+			if iw dev "$w_if" info 2>/dev/null | grep -qE "ssid (${CFG_SSID}|${LEGACY_MESH_SSID})$"; then
+				mesh_if="$w_if"
+				break
+			fi
+		done
+		if [ -n "$mesh_if" ]; then
+			wds_dump=$(iw dev "$mesh_if" station dump 2>/dev/null)
+			for w_if in $(iw dev 2>/dev/null | awk '/Interface/{print $2}' | grep "^${mesh_if}\." 2>/dev/null); do
+				wds_dump="${wds_dump}
+$(iw dev "$w_if" station dump 2>/dev/null)"
+			done
+			wds_cnt=$(printf '%s\n' "$wds_dump" | grep -c '^Station ' || echo 0)
+		fi
+	fi
+
+	# Đánh thức bảng ARP song song cho dải IP Router Phụ (.10 -> .14) trong <= 1s
+	for nip in 192.168.1.10 192.168.1.11 192.168.1.12 192.168.1.13 192.168.1.14; do
+		[ "$nip" = "$lip" ] && continue
+		ping -c 1 -W 1 "$nip" >/dev/null 2>&1 &
+	done
+	wait 2>/dev/null || true
+
 	for nip in 192.168.1.10 192.168.1.11 192.168.1.12 192.168.1.13 192.168.1.14 192.168.1.2; do
+		[ "$nip" = "$lip" ] && continue
 		awk -v ip="$nip" '$1==ip && $3!="0x0" {found=1} END{exit !found}' /proc/net/arp 2>/dev/null || continue
+		# Bỏ qua nếu IP này là thiết bị khách thuê DHCP bình thường
+		if [ -f /tmp/dhcp.leases ] && awk -v ip="$nip" '$3==ip {found=1} END{exit !found}' /tmp/dhcp.leases 2>/dev/null; then
+			continue
+		fi
 		ping -c 1 -W 1 "$nip" >/dev/null 2>&1 || continue
-		nmac=$(awk -v ip="$nip" '$1==ip && $3!="0x0" {print tolower($4)}' /proc/net/arp 2>/dev/null | head -n 1)
-		host_lbl="Router Phụ #$((peer_count + 1))"
+		nmac=$(awk -v ip="$nip" '$1==ip && $3!="0x0" {print toupper($4)}' /proc/net/arp 2>/dev/null | head -n 1)
+		pmeta=$(fetch_peer_meta "$nip")
+		# Chỉ xác nhận là Thiết Bị Phụ khi có phản hồi mesh_node_info.json HOẶC đang có trạm WDS ghép sóng thực tế
+		if [ -z "$pmeta" ] && [ "${wds_cnt:-0}" -eq 0 ]; then
+			continue
+		fi
+		rmodel=$(printf '%s' "$pmeta" | jsonfilter -e '@.model' 2>/dev/null)
+		rtarget=$(printf '%s' "$pmeta" | jsonfilter -e '@.target' 2>/dev/null)
+		rhost=$(printf '%s' "$pmeta" | jsonfilter -e '@.hostname' 2>/dev/null)
+		rssids=$(printf '%s' "$pmeta" | jsonfilter -e '@.ssids' 2>/dev/null)
+		rclients=$(printf '%s' "$pmeta" | jsonfilter -e '@.clients' 2>/dev/null | tr -cd '0-9')
+		ruptime=$(printf '%s' "$pmeta" | jsonfilter -e '@.uptime' 2>/dev/null)
+
+		sig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2; exit}')
+		rate=$(printf '%s\n' "$wds_dump" | sed -n 's/.*tx bitrate: \([0-9.]* [A-Za-z/]*\).*/\1/p' | head -n 1)
+		local link_type="Sóng Mesh 5GHz WDS" sig_lbl="Đang kết nối"
+		if [ -n "$sig" ]; then
+			sig_lbl="${sig} dBm"
+			[ -n "$rate" ] && sig_lbl="${sig} dBm • ${rate}"
+		elif [ "${wds_cnt:-0}" -eq 0 ]; then
+			link_type="Mạng Dây / Cầu Nối LAN"
+			sig_lbl="Full-Duplex Online"
+		fi
+
 		peer_count=$((peer_count + 1))
-		local item="{\"ip\":\"$nip\",\"mac\":\"${nmac:-node}\",\"name\":\"$host_lbl\",\"signal\":\"Mesh WDS Online\",\"url\":\"http://$nip\"}"
+		[ -z "$rmodel" ] && rmodel="Thiết Bị Phụ #${peer_count}"
+		[ -z "$rhost" ] && rhost="DOANDUY-NODE-${peer_count}"
+		local item="{\"ip\":\"$nip\",\"mac\":\"$(json_esc "${nmac:-NODE}")\",\"name\":\"$(json_esc "$rhost")\",\"model\":\"$(json_esc "$rmodel")\",\"target\":\"$(json_esc "$rtarget")\",\"ssids\":\"$(json_esc "$rssids")\",\"clients\":${rclients:-0},\"uptime\":\"$(json_esc "$ruptime")\",\"link_type\":\"$(json_esc "$link_type")\",\"signal\":\"$(json_esc "$sig_lbl")\",\"url\":\"http://$nip\"}"
 		[ -z "$peer_list" ] && peer_list="$item" || peer_list="${peer_list},${item}"
 	done
 	echo "${peer_count}|[${peer_list}]"
@@ -504,21 +643,40 @@ get_mesh_peers_json() {
 refresh_status_cache() {
 	get_mesh_cfg
 	local role radio chan htmode lip lmac lname has_dir=false net_src="Không có mạng" role_disp mesh_act=false pinfo pcnt pjson
+	local bmodel starget dhcp_on=true wan_ip="" ussids ccnt upstr
 	role=$(get_active_role)
 	radio=$(get_best_mesh_radio)
 	chan=$(uci -q get "wireless.${radio}.channel" || echo "36")
 	htmode=$(uci -q get "wireless.${radio}.htmode" || echo "HE160")
 	lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
-	lmac=$(cat /sys/class/net/br-lan/address 2>/dev/null || echo "00:00:00:00:00:00")
+	lmac=$(tr 'a-z' 'A-Z' < /sys/class/net/br-lan/address 2>/dev/null || echo "00:00:00:00:00:00")
 	lname=$(uci -q get system.@system[0].hostname || echo "DOANDUY")
+	bmodel=$(cat /tmp/sysinfo/model 2>/dev/null || echo "Router DOANDUY")
+	starget=$(sed -n "s/^DISTRIB_TARGET='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)
+	[ -z "$starget" ] && starget="OpenWrt"
+	[ "$(uci -q get dhcp.lan.ignore)" = "1" ] && dhcp_on=false
+	ussids=$(get_local_wifi_summary)
+	ccnt=$(get_local_client_count)
+	upstr=$(format_uptime_vi)
 
 	if check_direct_internet; then
 		has_dir=true
 		net_src="Trực tiếp: ${DIRECT_SRC}"
+		local wan_l3
+		wan_l3=$(printf '%s' "$DIRECT_SRC" | sed -n 's/.*(\([^)]*\)).*/\1/p')
+		[ -z "$wan_l3" ] && wan_l3="$DIRECT_SRC"
+		wan_ip=$(ip -4 addr show dev "$wan_l3" 2>/dev/null | awk '/inet /{split($2,a,"/"); print a[1]; exit}')
 	elif [ "$role" = "node" ] && ping -c 1 -W 1 192.168.1.1 >/dev/null 2>&1; then
 		has_dir=true
 		net_src="Qua sóng Mesh từ Router Chính (192.168.1.1)"
 	fi
+
+	# Xuất file thông tin công khai nhẹ trên RAM (/tmp -> /www/mesh_node_info.json) để các cục Mesh nhận diện tên/model của nhau
+	cat <<EOF > /tmp/mesh_node_info.json.tmp
+{"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","target":"$(json_esc "$starget")","ip":"$(json_esc "$lip")","ssids":"$(json_esc "$ussids")","clients":${ccnt:-0},"uptime":"$(json_esc "$upstr")"}
+EOF
+	mv -f /tmp/mesh_node_info.json.tmp /tmp/mesh_node_info.json 2>/dev/null || true
+	[ -L /www/mesh_node_info.json ] || ln -sf /tmp/mesh_node_info.json /www/mesh_node_info.json 2>/dev/null || true
 
 	case "$role" in
 		controller)
@@ -527,7 +685,7 @@ refresh_status_cache() {
 			;;
 		node)
 			mesh_act=true
-			role_disp="📡 ROUTER PHỤ (${lip} • Nhận mạng từ 192.168.1.1)"
+			role_disp="📡 THIẾT BỊ PHỤ (${lip} • Nhận mạng từ 192.168.1.1)"
 			;;
 		standalone_waiting)
 			mesh_act=true
@@ -539,7 +697,7 @@ refresh_status_cache() {
 			;;
 	esac
 
-	pinfo=$(get_mesh_peers_json "$role")
+	pinfo=$(get_mesh_peers_json "$role" "$lip")
 	pcnt="${pinfo%%|*}"
 	pjson="${pinfo#*|}"
 	[ -z "$pjson" ] && pjson="[]"
@@ -548,20 +706,27 @@ refresh_status_cache() {
 {
   "success": true,
   "enabled": $([ "$CFG_ENABLED" = "1" ] && echo true || echo false),
-  "mode": "$CFG_MODE",
-  "role": "$role",
-  "role_display": "$role_disp",
+  "mode": "$(json_esc "$CFG_MODE")",
+  "role": "$(json_esc "$role")",
+  "role_display": "$(json_esc "$role_disp")",
   "mesh_active": $mesh_act,
-  "mesh_ssid": "$CFG_SSID",
-  "radio": "$radio",
-  "channel": "$chan",
-  "htmode": "$htmode",
-  "local_ip": "$lip",
+  "mesh_ssid": "$(json_esc "$CFG_SSID")",
+  "radio": "$(json_esc "$radio")",
+  "channel": "$(json_esc "$chan")",
+  "htmode": "$(json_esc "$htmode")",
+  "local_ip": "$(json_esc "$lip")",
   "rescue_ip": "$RESCUE_IP",
-  "local_mac": "$lmac",
-  "local_name": "$lname",
+  "local_mac": "$(json_esc "$lmac")",
+  "local_name": "$(json_esc "$lname")",
+  "board_model": "$(json_esc "$bmodel")",
+  "soc_target": "$(json_esc "$starget")",
+  "dhcp_enabled": $dhcp_on,
+  "wan_ip": "$(json_esc "$wan_ip")",
+  "user_ssids": "$(json_esc "$ussids")",
+  "client_count": ${ccnt:-0},
+  "uptime_str": "$(json_esc "$upstr")",
   "has_internet": $has_dir,
-  "internet_source": "$net_src",
+  "internet_source": "$(json_esc "$net_src")",
   "peer_count": ${pcnt:-0},
   "peers": $pjson
 }
