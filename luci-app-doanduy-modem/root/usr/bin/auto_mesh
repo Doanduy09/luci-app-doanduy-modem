@@ -464,6 +464,8 @@ maximize_all_5g_radios() {
 	done
 	echo "$any"
 }
+
+check_direct_internet() {
 	DIRECT_SRC=""
 	local iface st up l3 d
 	if command -v ubus >/dev/null 2>&1; then
