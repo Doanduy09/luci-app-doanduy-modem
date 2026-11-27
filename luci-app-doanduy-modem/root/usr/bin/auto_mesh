@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.7.8)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.7.9)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -572,7 +572,7 @@ scan_for_master_mesh() {
 	FOUND_MESH_RADIO=""
 	FOUND_MESH_TIER="1"
 	local cand_ifs="" dev w_if raw my_macs best_line best_score=-9999 best_out="" best_wif="" score
-	local relay_ssid="${CFG_SSID}_R"
+	local relay_ssid="${CFG_SSID}_R" scanned_ok_radios=" " scan_any_ok r_ok need_fb b_ch b_tier
 	my_macs=$(get_all_local_macs)
 
 	for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
@@ -590,9 +590,11 @@ scan_for_master_mesh() {
 		[ -n "$w_if" ] || continue
 		raw=""
 		best_line=""
+		scan_any_ok=0
 		if command -v iwinfo >/dev/null 2>&1; then
 			raw=$(iwinfo "$w_if" scan 2>/dev/null)
 			if [ -n "$raw" ]; then
+				scan_any_ok=1
 				best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v s3="$relay_ssid" -v own="$my_macs" -v pref_r="$CFG_PREFER_RELAY" '
 					BEGIN { best_score=-9999; bssid=""; essid=""; chan=""; sig=-95 }
 					function flush_cell() {
@@ -633,8 +635,14 @@ scan_for_master_mesh() {
 			ip link set "$w_if" up 2>/dev/null || true
 			raw=$(iw dev "$w_if" scan 2>/dev/null)
 			if [ -n "$raw" ]; then
+				scan_any_ok=1
 				best_line=$(printf '%s\n' "$raw" | parse_iw_scan_mesh "$relay_ssid" "$my_macs")
 			fi
+		fi
+
+		if [ "$scan_any_ok" = "1" ]; then
+			r_ok=$(get_radio_for_ifname "$w_if")
+			[ -n "$r_ok" ] && scanned_ok_radios="${scanned_ok_radios}${r_ok} "
 		fi
 
 		if [ -n "$best_line" ]; then
@@ -647,11 +655,23 @@ scan_for_master_mesh() {
 		fi
 	done
 
+	need_fb=0
+	if [ -z "$best_out" ]; then
+		need_fb=1
+	else
+		b_ch=$(printf '%s' "$best_out" | cut -d'|' -f2)
+		b_tier=$(printf '%s' "$best_out" | cut -d'|' -f5)
+		if [ "${b_ch:-0}" -ge 149 ] 2>/dev/null || { [ "$CFG_PREFER_RELAY" != "1" ] && [ "${b_tier:-2}" != "1" ]; }; then
+			need_fb=1
+		fi
+	fi
+
 	# Fallback cho ath11k 5G-Low HE160 khi AP chặn scan (-EBUSY): tạm hạ AP tạo STA ảo dd_scan rồi khôi phục
-	if [ -z "$best_out" ] && command -v iw >/dev/null 2>&1; then
+	if [ "$need_fb" = "1" ] && command -v iw >/dev/null 2>&1; then
 		local phy_dev band
 		for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
 			[ "$(uci -q get "wireless.${dev}.disabled")" = "1" ] && continue
+			case "$scanned_ok_radios" in *" $dev "*) continue ;; esac
 			band=$(uci -q get "wireless.${dev}.band")
 			[ "$band" = "5g" ] || [ "$band" = "6g" ] || continue
 			phy_dev=$(get_phy_for_radio "$dev")
@@ -1028,11 +1048,15 @@ ensure_node_relay_ap() {
 	fi
 
 	if [ "$radio" != "$uplink_radio" ]; then
+		local rband up_ch need_ch=0
 		relay_ch=$(uci -q get "wireless.${radio}.channel")
-		case "$relay_ch" in ''|auto|0)
-			local rband up_ch
-			rband=$(uci -q get "wireless.${radio}.band")
-			up_ch=$(uci -q get "wireless.${uplink_radio}.channel")
+		rband=$(uci -q get "wireless.${radio}.band")
+		up_ch=$(uci -q get "wireless.${uplink_radio}.channel")
+		case "$relay_ch" in ''|auto|0) need_ch=1 ;; esac
+		if [ "$need_ch" = "0" ] && [ "$rband" = "5g" ] && radio_supports_wide_bw "$radio" && [ "${relay_ch:-0}" -ge 149 ] 2>/dev/null; then
+			need_ch=1
+		fi
+		if [ "$need_ch" = "1" ]; then
 			if [ "$rband" = "5g" ] && radio_supports_wide_bw "$radio"; then
 				if [ "${up_ch:-36}" -lt 100 ] 2>/dev/null && radio_supports_channel "$radio" 100; then
 					uci set "wireless.${radio}.channel=100"
@@ -1051,12 +1075,10 @@ ensure_node_relay_ap() {
 				uci set "wireless.${radio}.channel=36"
 				changed=1
 			fi
-		;; *)
-			if ! radio_supports_channel "$radio" "$relay_ch"; then
-				uci set "wireless.${radio}.channel=auto"
-				changed=1
-			fi
-		;; esac
+		elif ! radio_supports_channel "$radio" "$relay_ch"; then
+			uci set "wireless.${radio}.channel=auto"
+			changed=1
+		fi
 		[ "$(maximize_mesh_radio_perf "$radio")" = "1" ] && changed=1
 	fi
 
