@@ -48,6 +48,16 @@ is_epoch_current() {
 	[ "$cur" = "${1:-0}" ]
 }
 
+get_node_ip() {
+	local uip
+	uip=$(uci -q get network.mesh_uplink.ipaddr 2>/dev/null | cut -d/ -f1)
+	if [ -n "$uip" ]; then
+		echo "$uip"
+		return 0
+	fi
+	uci -q get network.lan.ipaddr 2>/dev/null | cut -d/ -f1 || echo "192.168.1.1"
+}
+
 write_instant_status_cache() {
 	get_mesh_cfg
 	local role pair_rem radio chan htmode lip lmac lname bmodel searching=false has_dir=false
@@ -56,7 +66,7 @@ write_instant_status_cache() {
 	radio=$(get_best_mesh_radio)
 	chan=$(uci -q get "wireless.${radio}.channel" || echo "36")
 	htmode=$(uci -q get "wireless.${radio}.htmode" || echo "HE160")
-	lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
+	lip=$(get_node_ip)
 	lmac=$(tr 'a-z' 'A-Z' < /sys/class/net/br-lan/address 2>/dev/null || echo "00:00:00:00:00:00")
 	lname=$(uci -q get system.@system[0].hostname || echo "DOANDUY")
 	bmodel=$(cat /tmp/sysinfo/model 2>/dev/null || echo "Router DOANDUY")
@@ -335,8 +345,11 @@ maximize_mesh_radio_perf() {
 		[ "$(uci -q get "wireless.${radio}.ldpc")" != "1" ] && { uci -q set "wireless.${radio}.ldpc=1"; changed=1; }
 	fi
 
-	# Bật STP trên br-lan để chống vòng lặp gói tin tuyệt đối khi chạy đa tầng (Phụ mesh Phụ)
-	[ -f /sys/class/net/br-lan/bridge/stp_state ] && echo 1 > /sys/class/net/br-lan/bridge/stp_state 2>/dev/null || true
+	# Bật STP trên br-lan (forward_delay 2s) để chống vòng lặp khi chạy đa tầng mà không chờ 30s
+	if [ -f /sys/class/net/br-lan/bridge/stp_state ]; then
+		echo 1 > /sys/class/net/br-lan/bridge/stp_state 2>/dev/null || true
+		echo 200 > /sys/class/net/br-lan/bridge/forward_delay 2>/dev/null || true
+	fi
 
 	echo "$changed"
 }
@@ -483,15 +496,18 @@ scan_for_master_mesh() {
 
 # Cấp phát IP tuần tự tự động tăng dần cho Router Phụ: 192.168.1.10, 11, 12, 13, 14 ... 99
 pick_free_node_ip() {
-	local cur_lan my_mac arp_mac oct cand
-	cur_lan=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
-	my_mac=$(tr 'A-Z' 'a-z' < /sys/class/net/br-lan/address 2>/dev/null)
+	local cur_lan my_macs arp_mac oct cand
+	cur_lan=$(get_node_ip)
+	my_macs=$(get_all_local_macs | tr 'A-Z' 'a-z')
 
 	# Nếu máy này đang giữ sẵn 1 IP trong dải .10..99 không đụng ai -> giữ nguyên không nhảy IP
 	case "$cur_lan" in
 		192.168.1.[1-9][0-9])
 			arp_mac=$(awk -v ip="$cur_lan" '$1==ip && $3!="0x0" {print tolower($4)}' /proc/net/arp 2>/dev/null | head -n 1)
-			if [ -z "$arp_mac" ] || [ "$arp_mac" = "$my_mac" ]; then
+			case "$my_macs" in
+				*,"${arp_mac}",*) echo "$cur_lan"; return 0 ;;
+			esac
+			if [ -z "$arp_mac" ]; then
 				echo "$cur_lan"
 				return 0
 			fi
@@ -505,10 +521,9 @@ pick_free_node_ip() {
 			return 0
 		fi
 		arp_mac=$(awk -v ip="$cand" '$1==ip && $3!="0x0" {print tolower($4)}' /proc/net/arp 2>/dev/null | head -n 1)
-		if [ -n "$my_mac" ] && [ "$arp_mac" = "$my_mac" ]; then
-			echo "$cand"
-			return 0
-		fi
+		case "$my_macs" in
+			*,"${arp_mac}",*) echo "$cand"; return 0 ;;
+		esac
 	done
 	echo "192.168.1.10"
 }
@@ -547,6 +562,10 @@ get_active_role() {
 		return 0
 	fi
 	if [ -n "$(uci -q get wireless.mesh_sta)" ] && [ "$(uci -q get wireless.mesh_sta.disabled)" != "1" ]; then
+		echo "node"
+		return 0
+	fi
+	if [ -n "$(uci -q get network.mesh_uplink)" ]; then
 		echo "node"
 		return 0
 	fi
@@ -618,13 +637,22 @@ apply_controller_role() {
 	cur_ignore=$(uci -q get dhcp.lan.ignore)
 	rm -f "$LOST_TS_FILE"
 
-	if [ "$cur_ip" != "192.168.1.1" ] || [ -n "$(uci -q get network.lan.gateway)" ]; then
+	if [ "$cur_ip" != "192.168.1.1" ] || [ -n "$(uci -q get network.lan.gateway)" ] || [ -n "$(uci -q get network.mesh_uplink)" ]; then
+		uci -q delete network.mesh_uplink
 		uci -q delete network.lan.gateway
 		uci -q delete network.lan.dns
+		uci -q delete network.lan.metric
 		uci set network.lan.ipaddr='192.168.1.1'
 		uci set network.lan.netmask='255.255.255.0'
 		uci set network.lan.force_link='1'
 		net_changed=1
+	fi
+	if [ -n "$(uci -q get firewall.mesh_uplink_zone)" ] || [ -n "$(uci -q get firewall.mesh_lan_to_uplink)" ] || [ -n "$(uci -q get firewall.mesh_uplink_to_lan)" ]; then
+		uci -q delete firewall.mesh_uplink_zone
+		uci -q delete firewall.mesh_lan_to_uplink
+		uci -q delete firewall.mesh_uplink_to_lan
+		uci commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1 || true
 	fi
 	if [ "$(uci -q get network.lan_rescue.ipaddr)" != "$RESCUE_IP" ]; then
 		uci set network.lan_rescue=interface
@@ -646,10 +674,12 @@ apply_controller_role() {
 		net_changed=1
 	fi
 
-	if [ -n "$(uci -q get wireless.mesh_sta)" ]; then
-		uci -q delete wireless.mesh_sta
-		wifi_changed=1
-	fi
+	for mi in mesh_sta mesh_80211s; do
+		if [ -n "$(uci -q get "wireless.${mi}")" ]; then
+			uci -q delete "wireless.${mi}"
+			wifi_changed=1
+		fi
+	done
 
 	cur_ch=$(uci -q get "wireless.${radio}.channel")
 	if [ -z "$cur_ch" ] || [ "$cur_ch" = "auto" ] || [ "$cur_ch" = "0" ]; then
@@ -667,6 +697,7 @@ apply_controller_role() {
 
 	if [ "$(uci -q get wireless.mesh_backhaul_ap.ssid)" != "$CFG_SSID" ] || \
 	   [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" = "1" ] || \
+	   [ "$(uci -q get wireless.mesh_backhaul_ap.wds)" != "0" ] || \
 	   [ "$(uci -q get wireless.mesh_backhaul_ap.device)" != "$radio" ]; then
 		uci -q delete wireless.mesh_backhaul_ap
 		uci set wireless.mesh_backhaul_ap=wifi-iface
@@ -676,7 +707,7 @@ apply_controller_role() {
 		uci set wireless.mesh_backhaul_ap.ssid="$CFG_SSID"
 		uci set wireless.mesh_backhaul_ap.encryption='psk2'
 		uci set wireless.mesh_backhaul_ap.key="$CFG_KEY"
-		uci set wireless.mesh_backhaul_ap.wds='1'
+		uci set wireless.mesh_backhaul_ap.wds='0'
 		uci set wireless.mesh_backhaul_ap.hidden='0'
 		uci set wireless.mesh_backhaul_ap.disabled='0'
 		wifi_changed=1
@@ -702,19 +733,24 @@ apply_controller_role() {
 
 # Tự động giải quyết trùng IP sau khi đã ghép sóng (đảm bảo nhiều Router Phụ luôn xếp tuần tự 10, 11, 12, 13, 14...)
 verify_unique_node_ip() {
-	local cur_ip my_mac dup=0 oct new_ip
-	cur_ip=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
-	my_mac=$(tr 'a-z' 'A-Z' < /sys/class/net/br-lan/address 2>/dev/null)
+	local cur_ip my_macs dup=0 oct new_ip up_dev
+	cur_ip=$(get_node_ip)
+	my_macs=$(get_all_local_macs)
+	up_dev=$(ubus call network.interface.mesh_uplink status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	[ -n "$up_dev" ] || up_dev="br-lan"
 	if command -v arping >/dev/null 2>&1; then
-		arping -D -I br-lan -c 1 -w 1 "$cur_ip" >/dev/null 2>&1 || dup=1
+		arping -D -I "$up_dev" -c 1 -w 1 "$cur_ip" >/dev/null 2>&1 || dup=1
 	fi
 	if [ "$dup" -eq 0 ]; then
 		local mtopo owner_mac
 		mtopo=$(fetch_http_fast "http://192.168.1.1/mesh_topology.json")
 		if [ -n "$mtopo" ]; then
 			owner_mac=$(printf '%s' "$mtopo" | jsonfilter -e "@.peers[@.ip='${cur_ip}'].mac" 2>/dev/null | tr 'a-z' 'A-Z' | head -n 1)
-			if [ -n "$owner_mac" ] && [ -n "$my_mac" ] && [ "$owner_mac" != "$my_mac" ]; then
-				dup=1
+			if [ -n "$owner_mac" ]; then
+				case "$my_macs" in
+					*,"${owner_mac}",*) ;;
+					*) dup=1 ;;
+				esac
 			fi
 		fi
 	fi
@@ -724,14 +760,12 @@ verify_unique_node_ip() {
 		new_ip="192.168.1.${oct}"
 		[ "$new_ip" = "$cur_ip" ] && continue
 		if ! ping -c 1 -W 1 "$new_ip" >/dev/null 2>&1; then
-			uci set network.lan.ipaddr="$new_ip"
+			uci set network.mesh_uplink.ipaddr="$new_ip"
+			uci set network.lan.ipaddr="192.168.${oct}.1"
 			uci commit network
-			flush_secondary_node_ips
-			ip addr add "${new_ip}/24" dev br-lan 2>/dev/null || true
-			ip addr add "${RESCUE_IP}/24" dev br-lan 2>/dev/null || true
-			ip route replace default via 192.168.1.1 dev br-lan metric 50 2>/dev/null || true
 			/etc/init.d/network reload >/dev/null 2>&1 || true
-			log_mesh "Phát hiện trùng IP $cur_ip -> Đã tự động dời sang IP tuần tự tiếp theo: $new_ip!"
+			/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+			log_mesh "Phát hiện trùng IP $cur_ip -> Đã tự động dời sang IP tuần tự tiếp theo: $new_ip (LAN 192.168.${oct}.1)!"
 			return 0
 		fi
 	done
@@ -748,10 +782,14 @@ ensure_node_relay_ap() {
 	target_key="$CFG_KEY"
 	[ "$target_ssid" = "$LEGACY_MESH_SSID" ] && target_key="SysMeshKey@2026!Sec"
 
-	[ -f /sys/class/net/br-lan/bridge/stp_state ] && echo 1 > /sys/class/net/br-lan/bridge/stp_state 2>/dev/null || true
+	if [ -f /sys/class/net/br-lan/bridge/stp_state ]; then
+		echo 1 > /sys/class/net/br-lan/bridge/stp_state 2>/dev/null || true
+		echo 200 > /sys/class/net/br-lan/bridge/forward_delay 2>/dev/null || true
+	fi
 
 	if [ "$(uci -q get wireless.mesh_backhaul_ap.ssid)" != "$target_ssid" ] || \
 	   [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" = "1" ] || \
+	   [ "$(uci -q get wireless.mesh_backhaul_ap.wds)" != "0" ] || \
 	   [ "$(uci -q get wireless.mesh_backhaul_ap.device)" != "$radio" ]; then
 		uci -q delete wireless.mesh_backhaul_ap
 		uci set wireless.mesh_backhaul_ap=wifi-iface
@@ -761,7 +799,7 @@ ensure_node_relay_ap() {
 		uci set wireless.mesh_backhaul_ap.ssid="$target_ssid"
 		uci set wireless.mesh_backhaul_ap.encryption='psk2'
 		uci set wireless.mesh_backhaul_ap.key="$target_key"
-		uci set wireless.mesh_backhaul_ap.wds='1'
+		uci set wireless.mesh_backhaul_ap.wds='0'
 		uci set wireless.mesh_backhaul_ap.hidden='0'
 		uci set wireless.mesh_backhaul_ap.disabled='0'
 		uci commit wireless
@@ -773,7 +811,7 @@ ensure_node_relay_ap() {
 apply_node_role() {
 	get_mesh_cfg
 	local target_ssid="${1:-$CFG_SSID}" target_chan="${2:-36}" target_bssid="$3" target_radio="$4"
-	local radio target_ip cur_ip wifi_changed=0 net_changed=0 target_key="$CFG_KEY"
+	local radio target_ip cur_up_ip cur_lan_ip oct sub_lan_ip wifi_changed=0 net_changed=0 fw_changed=0 target_key="$CFG_KEY"
 	[ "$target_ssid" = "$LEGACY_MESH_SSID" ] && target_key="SysMeshKey@2026!Sec"
 	if [ -n "$target_radio" ] && radio_supports_channel "$target_radio" "$target_chan"; then
 		radio="$target_radio"
@@ -782,7 +820,10 @@ apply_node_role() {
 	fi
 	[ "$(heal_invalid_radio_channels)" = "1" ] && wifi_changed=1
 	target_ip=$(pick_free_node_ip)
-	cur_ip=$(uci -q get network.lan.ipaddr)
+	oct="${target_ip##*.}"
+	sub_lan_ip="192.168.${oct}.1"
+	cur_up_ip=$(uci -q get network.mesh_uplink.ipaddr)
+	cur_lan_ip=$(uci -q get network.lan.ipaddr)
 	rm -f "$LOST_TS_FILE"
 
 	if [ -n "$target_chan" ] && radio_supports_channel "$radio" "$target_chan" && [ "$(uci -q get "wireless.${radio}.channel")" != "$target_chan" ]; then
@@ -797,75 +838,110 @@ apply_node_role() {
 		uci -q delete wireless.mesh_backhaul_ap
 		wifi_changed=1
 	fi
+	if [ -n "$(uci -q get wireless.mesh_80211s)" ]; then
+		uci -q delete wireless.mesh_80211s
+		wifi_changed=1
+	fi
 
 	if [ "$(uci -q get wireless.mesh_sta.ssid)" != "$target_ssid" ] || \
 	   [ "$(uci -q get wireless.mesh_sta.disabled)" = "1" ] || \
+	   [ "$(uci -q get wireless.mesh_sta.network)" != "mesh_uplink" ] || \
+	   [ "$(uci -q get wireless.mesh_sta.wds)" != "0" ] || \
 	   [ "$(uci -q get wireless.mesh_sta.device)" != "$radio" ] || \
 	   { [ -n "$target_bssid" ] && [ "$(uci -q get wireless.mesh_sta.bssid | tr 'a-z' 'A-Z')" != "$target_bssid" ]; }; then
 		uci -q delete wireless.mesh_sta
 		uci set wireless.mesh_sta=wifi-iface
 		uci set wireless.mesh_sta.device="$radio"
 		uci set wireless.mesh_sta.mode='sta'
-		uci set wireless.mesh_sta.network='lan'
+		uci set wireless.mesh_sta.network='mesh_uplink'
 		uci set wireless.mesh_sta.ssid="$target_ssid"
 		[ -n "$target_bssid" ] && uci set wireless.mesh_sta.bssid="$target_bssid"
 		uci set wireless.mesh_sta.encryption='psk2'
 		uci set wireless.mesh_sta.key="$target_key"
-		uci set wireless.mesh_sta.wds='1'
+		uci set wireless.mesh_sta.wds='0'
 		uci set wireless.mesh_sta.disabled='0'
 		wifi_changed=1
 	fi
 	[ "$(configure_roaming_on_user_aps)" = "1" ] && wifi_changed=1
 
-	if [ "$cur_ip" != "$target_ip" ] || [ "$(uci -q get network.lan.gateway)" != "192.168.1.1" ]; then
-		uci set network.lan.ipaddr="$target_ip"
-		uci set network.lan.netmask='255.255.255.0'
-		uci set network.lan.gateway='192.168.1.1'
+	if [ -n "$(uci -q get network.lan_rescue)" ]; then
+		uci -q delete network.lan_rescue
+		net_changed=1
+	fi
+
+	if [ "$cur_up_ip" != "$target_ip" ] || [ "$cur_lan_ip" != "$sub_lan_ip" ] || [ "$(uci -q get network.mesh_uplink.gateway)" != "192.168.1.1" ] || [ -n "$(uci -q get network.lan.gateway)" ]; then
+		uci -q delete network.mesh_uplink
+		uci set network.mesh_uplink=interface
+		uci set network.mesh_uplink.proto='static'
+		uci set network.mesh_uplink.ipaddr="$target_ip"
+		uci set network.mesh_uplink.netmask='255.255.255.0'
+		uci set network.mesh_uplink.gateway='192.168.1.1'
+		uci add_list network.mesh_uplink.dns='192.168.1.1'
+		uci add_list network.mesh_uplink.dns='1.1.1.1'
+		uci set network.mesh_uplink.metric='50'
+		uci set network.mesh_uplink.force_link='1'
+
+		uci -q delete network.lan.gateway
 		uci -q delete network.lan.dns
-		uci add_list network.lan.dns='192.168.1.1'
-		uci add_list network.lan.dns='1.1.1.1'
-		uci set network.lan.metric='50'
+		uci -q delete network.lan.metric
+		uci set network.lan.ipaddr="$sub_lan_ip"
+		uci set network.lan.netmask='255.255.255.0'
 		uci set network.lan.force_link='1'
-		uci set network.lan_rescue=interface
-		uci set network.lan_rescue.device='br-lan'
-		uci set network.lan_rescue.proto='static'
-		uci set network.lan_rescue.ipaddr="$RESCUE_IP"
-		uci set network.lan_rescue.netmask='255.255.255.0'
-		uci set network.lan_rescue.force_link='1'
 		uci commit network
 		net_changed=1
 	fi
 
-	if [ "$(uci -q get dhcp.lan.ignore)" != "1" ]; then
-		uci set dhcp.lan.ignore='1'
+	if [ "$(uci -q get dhcp.lan.ignore)" = "1" ]; then
+		uci set dhcp.lan.ignore='0'
 		uci commit dhcp
 		net_changed=1
+	fi
+
+	if [ "$(uci -q get firewall.mesh_uplink_zone.name)" != "mesh_uplink" ] || \
+	   [ "$(uci -q get firewall.mesh_lan_to_uplink.dest)" != "mesh_uplink" ] || \
+	   [ "$(uci -q get firewall.mesh_uplink_to_lan.src)" != "mesh_uplink" ]; then
+		uci -q delete firewall.mesh_uplink_zone
+		uci -q delete firewall.mesh_lan_to_uplink
+		uci -q delete firewall.mesh_uplink_to_lan
+		uci set firewall.mesh_uplink_zone=zone
+		uci set firewall.mesh_uplink_zone.name='mesh_uplink'
+		uci add_list firewall.mesh_uplink_zone.network='mesh_uplink'
+		uci set firewall.mesh_uplink_zone.input='ACCEPT'
+		uci set firewall.mesh_uplink_zone.output='ACCEPT'
+		uci set firewall.mesh_uplink_zone.forward='ACCEPT'
+		uci set firewall.mesh_uplink_zone.masq='1'
+		uci set firewall.mesh_uplink_zone.mtu_fix='1'
+		uci set firewall.mesh_lan_to_uplink=forwarding
+		uci set firewall.mesh_lan_to_uplink.src='lan'
+		uci set firewall.mesh_lan_to_uplink.dest='mesh_uplink'
+		uci set firewall.mesh_uplink_to_lan=forwarding
+		uci set firewall.mesh_uplink_to_lan.src='mesh_uplink'
+		uci set firewall.mesh_uplink_to_lan.dest='lan'
+		uci commit firewall
+		fw_changed=1
 	fi
 
 	uci -q delete dropbear.main.Interface 2>/dev/null || true
 	uci -q delete dropbear.main.DirectInterface 2>/dev/null || true
 	uci -q commit dropbear 2>/dev/null || true
 
+	if [ "$fw_changed" = "1" ]; then
+		/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	fi
+
+	if [ "$net_changed" = "1" ]; then
+		( sleep 1; /etc/init.d/network reload >/dev/null 2>&1; /etc/init.d/dnsmasq restart >/dev/null 2>&1; /etc/init.d/dropbear restart >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+		log_mesh "Thiết lập ROUTER PHỤ 3-Addr Mesh (Uplink ${target_ip}, LAN ${sub_lan_ip}, kênh $target_chan, ưu tiên ${target_bssid:-auto})."
+	fi
+
 	if [ "$wifi_changed" = "1" ]; then
 		uci commit wireless
 		( /sbin/wifi reload >/dev/null 2>&1 & )
 	fi
-
-	if [ "$net_changed" = "1" ]; then
-		ip addr del 192.168.1.1/24 dev br-lan 2>/dev/null || true
-		flush_secondary_node_ips
-		ip addr add "${target_ip}/24" dev br-lan 2>/dev/null || true
-		ip addr add "${RESCUE_IP}/24" dev br-lan 2>/dev/null || true
-		ip route replace default via 192.168.1.1 dev br-lan metric 50 2>/dev/null || true
-		/etc/init.d/network reload >/dev/null 2>&1 || true
-		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-		/etc/init.d/dropbear restart >/dev/null 2>&1 || true
-		log_mesh "Thiết lập ROUTER PHỤ (IP ${target_ip}, kênh $target_chan, ưu tiên trạm sóng mạnh nhất ${target_bssid:-auto})."
-	fi
 }
 
 restore_default_standalone() {
-	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0
+	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0 fw_changed=0
 	ensure_mesh_uci
 	rm -f "$LOST_TS_FILE"
 	if [ "$mode_after" = "disabled" ]; then
@@ -877,7 +953,7 @@ restore_default_standalone() {
 	fi
 	uci commit "$MESH_UCI"
 
-	for mi in mesh_sta mesh_backhaul_ap mesh_backhaul mesh0 mesh1; do
+	for mi in mesh_sta mesh_backhaul_ap mesh_80211s mesh_backhaul mesh0 mesh1; do
 		if [ -n "$(uci -q get "wireless.${mi}")" ]; then
 			uci -q delete "wireless.${mi}"
 			wifi_changed=1
@@ -895,7 +971,16 @@ restore_default_standalone() {
 		done
 	fi
 
-	if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get network.lan.gateway)" ]; then
+	if [ -n "$(uci -q get firewall.mesh_uplink_zone)" ] || [ -n "$(uci -q get firewall.mesh_lan_to_uplink)" ] || [ -n "$(uci -q get firewall.mesh_uplink_to_lan)" ]; then
+		uci -q delete firewall.mesh_uplink_zone
+		uci -q delete firewall.mesh_lan_to_uplink
+		uci -q delete firewall.mesh_uplink_to_lan
+		uci commit firewall
+		fw_changed=1
+	fi
+
+	if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get network.lan.gateway)" ] || [ -n "$(uci -q get network.mesh_uplink)" ]; then
+		uci -q delete network.mesh_uplink
 		uci -q delete network.lan.gateway
 		uci -q delete network.lan.dns
 		uci -q delete network.lan.metric
@@ -911,6 +996,8 @@ restore_default_standalone() {
 		uci commit dhcp
 		net_changed=1
 	fi
+
+	[ "$fw_changed" = "1" ] && /etc/init.d/firewall reload >/dev/null 2>&1 || true
 
 	if [ "$net_changed" = "1" ]; then
 		flush_secondary_node_ips
@@ -1121,7 +1208,7 @@ refresh_status_cache() {
 	radio=$(get_best_mesh_radio)
 	chan=$(uci -q get "wireless.${radio}.channel" || echo "36")
 	htmode=$(uci -q get "wireless.${radio}.htmode" || echo "HE160")
-	lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
+	lip=$(get_node_ip)
 	lmac=$(tr 'a-z' 'A-Z' < /sys/class/net/br-lan/address 2>/dev/null || echo "00:00:00:00:00:00")
 	lname=$(uci -q get system.@system[0].hostname || echo "DOANDUY")
 	bmodel=$(cat /tmp/sysinfo/model 2>/dev/null || echo "Router DOANDUY")
@@ -1206,7 +1293,7 @@ reconcile_once() {
 	get_mesh_cfg
 	if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ]; then
 		rm -f "$PAIR_UNTIL_FILE" "$IDLE_FLAG_FILE" "$HAD_PEER_FILE"
-		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get network.mesh_uplink)" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ] || [ -n "$(uci -q get wireless.mesh_80211s)" ]; then
 			is_epoch_current "$my_epoch" || return 0
 			restore_default_standalone "disabled"
 		fi
@@ -1216,7 +1303,7 @@ reconcile_once() {
 	fi
 
 	if [ -f "$IDLE_FLAG_FILE" ]; then
-		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get network.mesh_uplink)" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ] || [ -n "$(uci -q get wireless.mesh_80211s)" ]; then
 			is_epoch_current "$my_epoch" || return 0
 			restore_default_standalone "auto"
 		fi
@@ -1234,7 +1321,7 @@ reconcile_once() {
 	if check_direct_internet; then
 		is_epoch_current "$my_epoch" || return 0
 		if [ "$cur_role" = "controller" ]; then
-			lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
+			lip=$(get_node_ip)
 			mbssid=$(get_local_mesh_ap_bssid)
 			pinfo=$(get_mesh_peers_json "controller" "$lip" "$mbssid")
 			is_epoch_current "$my_epoch" || return 0
@@ -1299,7 +1386,7 @@ reconcile_once() {
 			apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$FOUND_MESH_BSSID" "$FOUND_MESH_RADIO"
 		else
 			is_epoch_current "$my_epoch" || return 0
-			if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+			if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get network.mesh_uplink)" ] || [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
 				restore_default_standalone "auto"
 			fi
 		fi
