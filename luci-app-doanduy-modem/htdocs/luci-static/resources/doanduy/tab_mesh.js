@@ -1,4 +1,4 @@
-// DOANDUY Visual Router Topology & 5-Minute Smart Auto-Mesh LuCI Tab (v2.6.2)
+// DOANDUY Minimalist Centered Multi-Tier Router Mesh Tree (v2.6.3)
 'use strict';
 'require baseclass';
 'require rpc';
@@ -7,40 +7,62 @@
 var callMeshStatus  = rpc.declare({ object: 'doanduy.mesh', method: 'status', expect: { } });
 var callMeshSetMode = rpc.declare({ object: 'doanduy.mesh', method: 'setMode', params: ['mode', 'node_ip'], expect: { } });
 
-function ensureMeshStyles() {
-    if (document.getElementById('dd-mesh-anim-style')) return;
+function ensureTreeStyles() {
+    if (document.getElementById('dd-mesh-tree-css')) return;
     var st = document.createElement('style');
-    st.id = 'dd-mesh-anim-style';
+    st.id = 'dd-mesh-tree-css';
     st.textContent = [
-        '@keyframes ddWavePulse {',
-        '  0%   { opacity: 0.20; transform: scale(0.88); }',
-        '  50%  { opacity: 1.00; transform: scale(1.04); }',
-        '  100% { opacity: 0.20; transform: scale(0.88); }',
+        '@keyframes ddWaveArc {',
+        '  0%   { opacity: 0.18; transform: scale(0.88); }',
+        '  50%  { opacity: 1.00; transform: scale(1.05); }',
+        '  100% { opacity: 0.18; transform: scale(0.88); }',
         '}',
-        '@keyframes ddRadarRing {',
-        '  0%   { transform: translate(-50%, -50%) scale(0.55); opacity: 0.75; }',
-        '  100% { transform: translate(-50%, -50%) scale(1.65); opacity: 0; }',
+        '@keyframes ddRadar {',
+        '  0%   { transform: translate(-50%, -50%) scale(0.5); opacity: 0.7; }',
+        '  100% { transform: translate(-50%, -50%) scale(1.75); opacity: 0; }',
         '}',
-        '@keyframes ddLinkFlow {',
-        '  0%   { top: 4px; opacity: 0.2; }',
-        '  50%  { opacity: 1; }',
-        '  100% { top: 54px; opacity: 0.2; }',
+        '.dd-arc-1 { animation: ddWaveArc 1.4s infinite ease-in-out 0.0s; transform-origin: center bottom; }',
+        '.dd-arc-2 { animation: ddWaveArc 1.4s infinite ease-in-out 0.25s; transform-origin: center bottom; }',
+        '.dd-arc-3 { animation: ddWaveArc 1.4s infinite ease-in-out 0.5s; transform-origin: center bottom; }',
+        '.dd-radar-1 {',
+        '  position: absolute; left: 50%; top: 48%; width: 120px; height: 120px; border-radius: 50%;',
+        '  border: 2px solid #3b82f6; pointer-events: none; animation: ddRadar 2.1s infinite ease-out;',
         '}',
-        '.dd-wifi-arc-1 { animation: ddWavePulse 1.5s infinite ease-in-out 0.0s; transform-origin: center bottom; }',
-        '.dd-wifi-arc-2 { animation: ddWavePulse 1.5s infinite ease-in-out 0.25s; transform-origin: center bottom; }',
-        '.dd-wifi-arc-3 { animation: ddWavePulse 1.5s infinite ease-in-out 0.5s; transform-origin: center bottom; }',
-        '.dd-radar-ring-1 {',
-        '  position: absolute; left: 50%; top: 46%; width: 110px; height: 110px; border-radius: 50%;',
-        '  border: 2px solid #3b82f6; pointer-events: none; animation: ddRadarRing 2.2s infinite ease-out;',
+        '.dd-radar-2 {',
+        '  position: absolute; left: 50%; top: 48%; width: 120px; height: 120px; border-radius: 50%;',
+        '  border: 2px solid #06b6d4; pointer-events: none; animation: ddRadar 2.1s infinite ease-out 1.05s;',
         '}',
-        '.dd-radar-ring-2 {',
-        '  position: absolute; left: 50%; top: 46%; width: 110px; height: 110px; border-radius: 50%;',
-        '  border: 2px solid #06b6d4; pointer-events: none; animation: ddRadarRing 2.2s infinite ease-out 1.1s;',
+        // CSS Sơ đồ cây phân tầng tự động (Chính ở giữa trên -> Các Phụ cùng cấp nằm ngang chung 1 tầng -> Phụ mesh Phụ nằm ở tầng dưới)
+        '.dd-tree-stage { display: flex; justify-content: center; padding: 28px 12px 24px; overflow-x: auto; }',
+        '.dd-tree ul { padding-top: 26px; position: relative; display: flex; justify-content: center; margin: 0; padding-left: 0; list-style: none; }',
+        '.dd-tree li { display: flex; flex-direction: column; align-items: center; text-align: center; list-style-type: none; position: relative; padding: 26px 18px 0 18px; }',
+        '.dd-tree > ul { padding-top: 0; }',
+        '.dd-tree > ul > li { padding-top: 0; }',
+        '.dd-tree li::before, .dd-tree li::after {',
+        '  content: ""; position: absolute; top: 0; right: 50%; border-top: 2.5px solid #38bdf8; width: 50%; height: 26px;',
         '}',
-        '.dd-flow-dot {',
-        '  position: absolute; left: -4px; width: 10px; height: 10px; border-radius: 50%;',
-        '  background: #10b981; box-shadow: 0 0 8px #10b981; animation: ddLinkFlow 1.6s infinite linear;',
-        '}'
+        '.dd-tree li::after { right: auto; left: 50%; border-left: 2.5px solid #38bdf8; }',
+        '.dd-tree li:only-child::after, .dd-tree li:only-child::before { display: none; }',
+        '.dd-tree li:only-child { padding-top: 22px; }',
+        '.dd-tree > ul > li:only-child { padding-top: 0; }',
+        '.dd-tree li:first-child::before, .dd-tree li:last-child::after { border: 0 none; }',
+        '.dd-tree li:last-child::before { border-right: 2.5px solid #38bdf8; border-radius: 0 8px 0 0; }',
+        '.dd-tree li:first-child::after { border-radius: 8px 0 0 0; }',
+        '.dd-tree ul ul::before {',
+        '  content: ""; position: absolute; top: 0; left: 50%; border-left: 2.5px solid #38bdf8; width: 0; height: 26px; transform: translateX(-50%);',
+        '}',
+        '.dd-tree li:only-child::before {',
+        '  display: block; content: ""; position: absolute; top: 0; left: 50%; right: auto; width: 0; height: 22px; border-top: 0; border-left: 2.5px solid #38bdf8; transform: translateX(-50%);',
+        '}',
+        '.dd-tree > ul > li:only-child::before { display: none; }',
+        '.dd-router-node {',
+        '  display: flex; flex-direction: column; align-items: center; background: #ffffff; border-radius: 16px;',
+        '  padding: 14px 22px 14px; min-width: 196px; border: 2px solid #cbd5e1;',
+        '  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06); position: relative; transition: transform 0.18s ease;',
+        '}',
+        '.dd-router-node:hover { transform: translateY(-2px); }',
+        '.dd-router-node.is-main { border-color: #2563eb; }',
+        '.dd-router-node.is-sub  { border-color: #0891b2; }'
     ].join('\n');
     document.head.appendChild(st);
 }
@@ -52,498 +74,319 @@ function formatMMSS(sec) {
     return (m < 10 ? '0' + m : '' + m) + ':' + (r < 10 ? '0' + r : '' + r);
 }
 
-// Hình vẽ Vector chiếc Router Wi-Fi (Chính hoặc Phụ) kèm cột sóng Wi-Fi phát ra trên ăng-ten
-function createRouterIllustration(isPrimary, isSearching, isOnline) {
+// Hình ảnh chiếc Router giống nhau sắc nét cho cả Router Chính & Router Phụ + sóng Wi-Fi trên ăng-ten
+function createRouterSvg(isPrimary, isSearching, isActive, uid) {
     var wrap = E('div', {
-        style: 'position: relative; width: 156px; height: 126px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;'
+        style: 'position: relative; width: 164px; height: 126px; display: flex; align-items: center; justify-content: center;'
     });
 
     if (isSearching) {
-        wrap.appendChild(E('div', { class: 'dd-radar-ring-1' }));
-        wrap.appendChild(E('div', { class: 'dd-radar-ring-2' }));
+        wrap.appendChild(E('div', { class: 'dd-radar-1' }));
+        wrap.appendChild(E('div', { class: 'dd-radar-2' }));
     }
 
-    var bodyGrad1 = isPrimary ? '#1e3a8a' : '#0f766e';
-    var bodyGrad2 = isPrimary ? '#2563eb' : '#0ea5e9';
-    var antColor  = isPrimary ? '#1e293b' : '#334155';
-    var waveColor = isSearching ? '#2563eb' : (isOnline ? '#10b981' : '#94a3b8');
-    var ledColor  = isOnline ? '#22c55e' : '#f59e0b';
-    var gid       = isPrimary ? 'ddGradMain' : ('ddGradSub' + Math.floor(Math.random() * 10000));
+    var gradStart = isPrimary ? '#1e3a8a' : '#0f766e';
+    var gradEnd   = isPrimary ? '#2563eb' : '#06b6d4';
+    var waveCol   = isSearching ? '#2563eb' : (isActive ? '#10b981' : '#94a3b8');
+    var ledCol    = isActive ? '#22c55e' : '#94a3b8';
+    var gid       = 'ddRGrad_' + uid;
 
-    var waveGroup = '';
-    if (isSearching || isOnline) {
-        var anim1 = isSearching ? ' class="dd-wifi-arc-1"' : '';
-        var anim2 = isSearching ? ' class="dd-wifi-arc-2"' : '';
-        var anim3 = isSearching ? ' class="dd-wifi-arc-3"' : '';
-        waveGroup =
-            '<g fill="none" stroke="' + waveColor + '" stroke-linecap="round">' +
-                '<path' + anim1 + ' d="M68 28 Q78 20 88 28" stroke-width="2.8"/>' +
-                '<path' + anim2 + ' d="M61 21 Q78 9 95 21" stroke-width="2.6"/>' +
-                '<path' + anim3 + ' d="M54 14 Q78 -2 102 14" stroke-width="2.4"/>' +
-                '<circle cx="78" cy="33" r="2.8" fill="' + waveColor + '" stroke="none"/>' +
+    var wavePaths = '';
+    if (isSearching || isActive) {
+        var c1 = isSearching ? ' class="dd-arc-1"' : '';
+        var c2 = isSearching ? ' class="dd-arc-2"' : '';
+        var c3 = isSearching ? ' class="dd-arc-3"' : '';
+        wavePaths =
+            '<g fill="none" stroke="' + waveCol + '" stroke-linecap="round">' +
+                '<path' + c1 + ' d="M71 29 Q82 20 93 29" stroke-width="2.8"/>' +
+                '<path' + c2 + ' d="M63 21 Q82 8 101 21" stroke-width="2.6"/>' +
+                '<path' + c3 + ' d="M55 13 Q82 -3 109 13" stroke-width="2.4"/>' +
+                '<circle cx="82" cy="34" r="3" fill="' + waveCol + '" stroke="none"/>' +
             '</g>';
     }
 
     wrap.innerHTML +=
-        '<svg width="156" height="122" viewBox="0 0 156 122" xmlns="http://www.w3.org/2000/svg" style="position: relative; z-index: 2;">' +
+        '<svg width="164" height="122" viewBox="0 0 164 122" xmlns="http://www.w3.org/2000/svg" style="position: relative; z-index: 2;">' +
             '<defs>' +
                 '<linearGradient id="' + gid + '" x1="0%" y1="0%" x2="100%" y2="100%">' +
-                    '<stop offset="0%" stop-color="' + bodyGrad1 + '"/>' +
-                    '<stop offset="100%" stop-color="' + bodyGrad2 + '"/>' +
+                    '<stop offset="0%" stop-color="' + gradStart + '"/>' +
+                    '<stop offset="100%" stop-color="' + gradEnd + '"/>' +
                 '</linearGradient>' +
             '</defs>' +
-            waveGroup +
-            // 4 Râu ăng-ten Router
-            '<rect x="30" y="28" width="5" height="46" rx="2.5" transform="rotate(-12 32 70)" fill="' + antColor + '"/>' +
-            '<rect x="54" y="22" width="5" height="50" rx="2.5" transform="rotate(-4 56 70)" fill="' + antColor + '"/>' +
-            '<rect x="97" y="22" width="5" height="50" rx="2.5" transform="rotate(4 99 70)" fill="' + antColor + '"/>' +
-            '<rect x="121" y="28" width="5" height="46" rx="2.5" transform="rotate(12 123 70)" fill="' + antColor + '"/>' +
-            // Bóng đổ dưới chân máy
-            '<ellipse cx="78" cy="111" rx="56" ry="6" fill="rgba(15,23,42,0.12)"/>' +
-            // Thân trên vát cạnh hiện đại
-            '<polygon points="26,68 130,68 140,82 16,82" fill="url(#' + gid + ')" opacity="0.92"/>' +
-            // Mặt trước Router + dải đèn LED
-            '<rect x="16" y="80" width="124" height="24" rx="7" fill="#0f172a"/>' +
-            '<rect x="20" y="83" width="116" height="18" rx="5" fill="#1e293b"/>' +
-            // Đèn LED Nguồn, 5G, Wi-Fi, Mesh
-            '<circle cx="34" cy="92" r="3.2" fill="' + ledColor + '"/>' +
-            '<circle cx="46" cy="92" r="3.2" fill="' + ledColor + '"/>' +
-            '<circle cx="58" cy="92" r="3.2" fill="' + (isSearching ? '#38bdf8' : ledColor) + '"/>' +
-            '<circle cx="70" cy="92" r="3.2" fill="' + (isSearching ? '#60a5fa' : '#38bdf8') + '"/>' +
-            // Khe tản nhiệt bên phải mặt máy
-            '<rect x="96" y="88" width="28" height="2.5" rx="1.2" fill="#475569"/>' +
-            '<rect x="96" y="93" width="28" height="2.5" rx="1.2" fill="#475569"/>' +
-            // Chân đế trái/phải
-            '<rect x="26" y="104" width="12" height="5" rx="2" fill="#334155"/>' +
-            '<rect x="118" y="104" width="12" height="5" rx="2" fill="#334155"/>' +
+            wavePaths +
+            '<rect x="34" y="28" width="5" height="46" rx="2.5" transform="rotate(-12 36 70)" fill="#1e293b"/>' +
+            '<rect x="58" y="22" width="5" height="50" rx="2.5" transform="rotate(-4 60 70)" fill="#1e293b"/>' +
+            '<rect x="101" y="22" width="5" height="50" rx="2.5" transform="rotate(4 103 70)" fill="#1e293b"/>' +
+            '<rect x="125" y="28" width="5" height="46" rx="2.5" transform="rotate(12 127 70)" fill="#1e293b"/>' +
+            '<ellipse cx="82" cy="112" rx="58" ry="6" fill="rgba(15,23,42,0.12)"/>' +
+            '<polygon points="30,68 134,68 144,82 20,82" fill="url(#' + gid + ')"/>' +
+            '<rect x="20" y="80" width="124" height="24" rx="7" fill="#0f172a"/>' +
+            '<rect x="24" y="83" width="116" height="18" rx="5" fill="#1e293b"/>' +
+            '<circle cx="38" cy="92" r="3.2" fill="' + ledCol + '"/>' +
+            '<circle cx="50" cy="92" r="3.2" fill="' + ledCol + '"/>' +
+            '<circle cx="62" cy="92" r="3.2" fill="' + (isSearching ? '#38bdf8' : ledCol) + '"/>' +
+            '<circle cx="74" cy="92" r="3.2" fill="' + (isSearching ? '#60a5fa' : '#38bdf8') + '"/>' +
+            '<rect x="100" y="88" width="28" height="2.5" rx="1.2" fill="#475569"/>' +
+            '<rect x="100" y="93" width="28" height="2.5" rx="1.2" fill="#475569"/>' +
+            '<rect x="30" y="104" width="12" height="5" rx="2" fill="#334155"/>' +
+            '<rect x="122" y="104" width="12" height="5" rx="2" fill="#334155"/>' +
         '</svg>';
 
     return wrap;
 }
 
-// Hình biểu tượng Cột Sóng Wi-Fi 4 vạch trực quan
-function createWifiSignalBadge(signalText) {
-    var box = E('span', {
-        style: 'display: inline-flex; align-items: center; gap: 6px; padding: 5px 14px; border-radius: 999px; background: #ecfdf5; border: 1.5px solid #6ee7b7; color: #047857; font-size: 12.5px; font-weight: 800; box-shadow: 0 2px 6px rgba(16,185,129,0.14);'
-    });
-    box.innerHTML =
-        '<svg width="18" height="16" viewBox="0 0 24 20" fill="none" stroke="#059669" stroke-width="2.4" stroke-linecap="round">' +
-            '<path d="M2 7 C7.5 1.8 16.5 1.8 22 7"/>' +
-            '<path d="M5.5 11 C9.2 7.5 14.8 7.5 18.5 11"/>' +
-            '<path d="M9 15 C10.8 13.3 13.2 13.3 15 15"/>' +
-            '<circle cx="12" cy="18" r="1.6" fill="#059669" stroke="none"/>' +
-        '</svg>';
-    box.appendChild(document.createTextNode(signalText));
-    return box;
-}
+function createVisualNodeBox(opts) {
+    var isPrimary = !!opts.isPrimary;
+    var badgeGrad = isPrimary
+        ? 'linear-gradient(135deg, #1d4ed8, #2563eb)'
+        : 'linear-gradient(135deg, #0e7490, #06b6d4)';
 
-function metricCell(label, primary, sub) {
-    return E('div', {
-        style: 'background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 9px 12px; min-width: 0;'
-    }, [
-        E('div', { style: 'font-size: 10.5px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 3px;' }, label),
-        E('div', { style: 'font-size: 13px; font-weight: 800; color: #0f172a; word-break: break-word;' }, primary || '—'),
-        sub ? E('div', { style: 'font-size: 11.5px; color: #475569; margin-top: 2px; word-break: break-word;' }, sub) : E('span')
-    ]);
-}
-
-function buildVisualRouterCard(opts) {
-    var isPrimary   = !!opts.isPrimary;
-    var isSearching = !!opts.isSearching;
-    var isOnline    = opts.isOnline !== false;
-    var borderCol   = isPrimary ? '#2563eb' : '#0891b2';
-    var badgeBg     = isPrimary ? 'linear-gradient(135deg, #1d4ed8, #2563eb)' : 'linear-gradient(135deg, #0e7490, #0891b2)';
-
-    var rightActions = [];
-    if (opts.quickMeshBtn) {
-        rightActions.push(opts.quickMeshBtn);
-    }
-    if (opts.isCurrent) {
-        rightActions.push(E('span', {
-            style: 'display: inline-flex; align-items: center; gap: 5px; padding: 5px 11px; border-radius: 999px; font-size: 11.5px; font-weight: 800; background: #dcfce7; color: #15803d; border: 1px solid #86efac;'
-        }, '🟢 Thiết Bị Đang Xem'));
-    } else if (opts.url) {
-        rightActions.push(E('a', {
-            href: opts.url,
+    var ipEl = opts.clickableUrl
+        ? E('a', {
+            href: opts.clickableUrl,
             target: '_blank',
-            class: 'btn cbi-button cbi-button-apply',
-            style: 'padding: 6px 13px; font-size: 12px; font-weight: 800; border-radius: 7px; text-decoration: none;'
-        }, '🔗 Mở Quản Trị (' + (opts.ip || '') + ')'));
+            style: 'font-size: 13px; font-weight: 800; font-family: monospace; color: #0284c7; text-decoration: none; margin-top: 2px;'
+        }, (opts.ip || '') + ' ↗')
+        : E('div', {
+            style: 'font-size: 13px; font-weight: 800; font-family: monospace; color: #475569; margin-top: 2px;'
+        }, opts.ip || '192.168.1.1');
+
+    var card = E('div', {
+        class: 'dd-router-node ' + (isPrimary ? 'is-main' : 'is-sub')
+    }, [
+        opts.signal ? E('div', {
+            style: 'display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 999px; background: #ecfdf5; border: 1px solid #6ee7b7; color: #047857; font-size: 11px; font-weight: 800; margin-bottom: -4px;'
+        }, '📶 ' + opts.signal) : E('span'),
+
+        createRouterSvg(isPrimary, !!opts.isSearching, opts.isActive !== false, opts.uid || Math.floor(Math.random() * 99999)),
+
+        E('div', {
+            style: 'margin-top: -2px; padding: 5px 18px; border-radius: 999px; font-size: 12.5px; font-weight: 900; letter-spacing: 0.5px; color: #ffffff; background: ' + badgeGrad + '; box-shadow: 0 2px 8px rgba(15,23,42,0.18);'
+        }, opts.roleText || (isPrimary ? 'ROUTER CHÍNH' : 'ROUTER PHỤ')),
+
+        E('div', {
+            style: 'font-size: 14px; font-weight: 800; color: #0f172a; margin-top: 8px;'
+        }, opts.model || (isPrimary ? 'Router Chính' : 'Router Phụ')),
+
+        ipEl
+    ]);
+
+    if (opts.isCurrent) {
+        card.appendChild(E('span', {
+            title: 'Thiết bị đang mở trình duyệt',
+            style: 'position: absolute; top: 10px; right: 10px; width: 10px; height: 10px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 3px #dcfce7;'
+        }));
     }
 
-    return E('div', {
-        style: 'background: #ffffff; border: 2px solid ' + borderCol + '; border-radius: 14px; overflow: hidden; box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);'
-    }, [
-        E('div', {
-            style: 'display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding: 14px 18px; background: linear-gradient(135deg, #f8fafc 0%, #eff6ff 100%);'
-        }, [
-            // Cột trái: Hình vẽ chiếc Router + Nhãn lớn ROUTER CHÍNH / ROUTER PHỤ ngay dưới chân máy
-            E('div', {
-                style: 'display: flex; flex-direction: column; align-items: center; min-width: 164px; margin: 0 auto;'
-            }, [
-                createRouterIllustration(isPrimary, isSearching, isOnline),
-                E('div', {
-                    style: 'margin-top: -2px; padding: 5px 16px; border-radius: 999px; font-size: 12.5px; font-weight: 900; letter-spacing: 0.4px; color: #ffffff; background: ' + badgeBg + '; box-shadow: 0 2px 8px rgba(37,99,235,0.25); text-align: center;'
-                }, opts.roleLabel || (isPrimary ? 'ROUTER CHÍNH' : 'ROUTER PHỤ'))
-            ]),
-
-            // Cột phải: Tên máy + các ô thông số rõ ràng
-            E('div', { style: 'flex: 1 1 420px; min-width: 260px;' }, [
-                E('div', {
-                    style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 10px;'
-                }, [
-                    E('div', {}, [
-                        E('div', { style: 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
-                            E('span', { style: 'font-size: 17px; font-weight: 900; color: #0f172a;' }, opts.model || 'Router DOANDUY'),
-                            opts.hostname ? E('span', {
-                                style: 'font-size: 11.5px; font-weight: 800; padding: 2px 8px; border-radius: 5px; background: #dbeafe; color: #1e40af; font-family: monospace;'
-                            }, opts.hostname) : E('span')
-                        ]),
-                        E('div', { style: 'font-size: 12px; color: #475569; margin-top: 2px;' }, opts.subtitle || '')
-                    ]),
-                    E('div', { style: 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, rightActions)
-                ]),
-                E('div', {
-                    style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 9px;'
-                }, opts.cells || [])
-            ])
-        ])
-    ]);
+    return card;
 }
 
-function buildWifiMeshLinkConnector(labelText) {
-    return E('div', {
-        style: 'display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 4px 0;'
-    }, [
-        E('div', { style: 'position: relative; width: 2px; height: 22px; background: linear-gradient(180deg, #2563eb, #10b981);' }, [
-            E('div', { class: 'dd-flow-dot' })
-        ]),
-        createWifiSignalBadge(labelText),
-        E('div', { style: 'position: relative; width: 2px; height: 22px; background: linear-gradient(180deg, #10b981, #0891b2);' })
+// Dựng đệ quy các tầng cây Mesh:
+// - Cùng gắn vào Router Chính -> Nằm ngang chung Tầng 1
+// - Phụ gắn vào Phụ -> Tự động nằm ở Tầng dưới ngay dưới cục Phụ đó
+function buildSubtreeLi(nodeData, childrenMap, currentIp, idxSeed) {
+    var ip = nodeData.ip || '';
+    var li = E('li', {}, [
+        createVisualNodeBox({
+            isPrimary: !!nodeData.isPrimary,
+            isSearching: !!nodeData.isSearching,
+            isActive: nodeData.isActive !== false,
+            isCurrent: ip === currentIp,
+            roleText: nodeData.roleText,
+            model: nodeData.model,
+            ip: ip,
+            signal: nodeData.signal || '',
+            clickableUrl: (ip && ip !== currentIp) ? ('http://' + ip) : '',
+            uid: idxSeed + '_' + ip.replace(/\./g, '_')
+        })
     ]);
-}
 
-function buildSearchingWaveBanner(countdownNode) {
-    var waveSvg = E('div', { style: 'flex-shrink: 0; display: flex; align-items: center;' });
-    waveSvg.innerHTML =
-        '<svg width="42" height="36" viewBox="0 0 44 36" fill="none" stroke="#2563eb" stroke-linecap="round">' +
-            '<path class="dd-wifi-arc-1" d="M15 24 Q22 18 29 24" stroke-width="3"/>' +
-            '<path class="dd-wifi-arc-2" d="M10 18 Q22 8 34 18" stroke-width="2.8"/>' +
-            '<path class="dd-wifi-arc-3" d="M5 12 Q22 -1 39 12" stroke-width="2.6"/>' +
-            '<circle cx="22" cy="29" r="3.5" fill="#2563eb" stroke="none"/>' +
-        '</svg>';
-
-    return E('div', {
-        style: 'margin-top: 12px; padding: 12px 16px; border-radius: 12px; background: linear-gradient(90deg, #eff6ff 0%, #ecfeff 100%); border: 1.5px dashed #60a5fa; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;'
-    }, [
-        E('div', { style: 'display: flex; align-items: center; gap: 12px;' }, [
-            waveSvg,
-            E('div', {}, [
-                E('div', { style: 'font-size: 13.5px; font-weight: 800; color: #1e3a8a;' }, 'Đang phát sóng Wi-Fi & tìm kiếm thiết bị Mesh xung quanh...'),
-                E('div', { style: 'font-size: 12px; color: #475569; margin-top: 2px;' }, 'Bật router thứ 2 (không cắm dây mạng) hoặc bấm nút Mesh trên máy kia để tự động ghép làm Router Phụ (192.168.1.10).')
-            ])
-        ]),
-        countdownNode
-    ]);
+    var kids = childrenMap[ip] || [];
+    if (kids.length > 0) {
+        var ul = E('ul', {});
+        kids.forEach(function(child, cIdx) {
+            ul.appendChild(buildSubtreeLi(child, childrenMap, currentIp, idxSeed + '_' + cIdx));
+        });
+        li.appendChild(ul);
+    }
+    return li;
 }
 
 return baseclass.extend({
     renderPane: function() {
-        ensureMeshStyles();
+        ensureTreeStyles();
 
         var latestState = null;
         var localRemaining = 0;
 
-        var headerBadge = E('span', {
+        var statusPill = E('span', {
             style: 'font-size: 12px; font-weight: 800; padding: 4px 12px; border-radius: 999px; background: #f1f5f9; color: #334155;'
-        }, '⏳ Đang tải sơ đồ...');
+        }, '⏳');
 
-        var countdownBadge = E('span', {
-            style: 'padding: 6px 13px; border-radius: 999px; background: #1d4ed8; color: #ffffff; font-size: 12.5px; font-weight: 800; font-family: monospace;'
-        }, '⏱ Tự tắt sau 05:00');
+        var btnOn = E('button', {
+            class: 'btn cbi-button cbi-button-apply',
+            style: 'font-weight: 900; padding: 6px 18px; border-radius: 999px; font-size: 13px;',
+            click: function() { toggleMesh('pair'); }
+        }, 'Bật');
 
-        var topologyRoot = E('div', {}, '');
-        var nodeIpInput = E('input', {
-            type: 'text',
-            class: 'cbi-input-text',
-            value: '192.168.1.10',
-            style: 'width: 140px; height: 36px; font-weight: 800; text-align: center; border-radius: 6px; font-family: monospace;'
-        });
+        var btnOff = E('button', {
+            class: 'btn cbi-button cbi-button-reset',
+            style: 'font-weight: 900; padding: 6px 18px; border-radius: 999px; font-size: 13px;',
+            click: function() { toggleMesh('off'); }
+        }, 'Tắt');
 
-        function triggerPairNow() {
-            callMeshSetMode('pair', (nodeIpInput.value || '192.168.1.10').trim()).then(function(res) {
-                localRemaining = 300;
-                ui.addNotification(null, E('p', '📡 ' + ((res && res.message) || 'Đã bật tìm kiếm & ghép nối Mesh trong 5 phút!')), 'info');
-                setTimeout(refreshMesh, 1200);
+        var treeStage = E('div', { class: 'dd-tree-stage' }, '');
+
+        function toggleMesh(action) {
+            callMeshSetMode(action, '192.168.1.10').then(function() {
+                if (action === 'pair') localRemaining = 300;
+                setTimeout(refreshMesh, 1000);
             }).catch(function(err) {
-                ui.addNotification(null, E('p', '❌ Lỗi bật Mesh: ' + err), 'error');
+                ui.addNotification(null, E('p', '❌ ' + err), 'error');
             });
         }
 
         function renderState(st) {
             latestState = st;
-            while (topologyRoot.firstChild) topologyRoot.removeChild(topologyRoot.firstChild);
+            while (treeStage.firstChild) treeStage.removeChild(treeStage.firstChild);
 
             if (!st || st.success === false) {
-                headerBadge.textContent = '⚠️ Chưa đọc được trạng thái Mesh';
-                headerBadge.style.background = '#fef2f2';
-                headerBadge.style.color = '#b91c1c';
+                statusPill.textContent = '⚠️ Chưa sẵn sàng';
                 return;
             }
 
             var peers       = Array.isArray(st.peers) ? st.peers : [];
             var role        = st.role || 'auto_idle';
-            var isSearching = !!st.searching && peers.length === 0;
+            var isSearching = !!st.searching;
+            var isEnabled   = !!st.enabled && role !== 'standalone' && role !== 'auto_idle';
             localRemaining  = parseInt(st.search_remaining || 0, 10);
-            countdownBadge.textContent = '⏱ Tự tắt sau ' + formatMMSS(localRemaining);
 
-            if (role === 'controller' && peers.length > 0) {
-                headerBadge.textContent = '🟢 Đã ghép nối ' + peers.length + ' Router Phụ';
-                headerBadge.style.background = '#dcfce7';
-                headerBadge.style.color = '#15803d';
+            btnOn.style.opacity  = isSearching || isEnabled ? '1' : '0.88';
+            btnOff.style.opacity = (!st.enabled || role === 'standalone') ? '0.6' : '1';
+
+            if (peers.length > 0) {
+                statusPill.textContent = '🟢 Đang kết nối ' + peers.length + ' Router Phụ';
+                statusPill.style.background = '#dcfce7';
+                statusPill.style.color = '#15803d';
             } else if (isSearching) {
-                headerBadge.textContent = '📡 Đang dò sóng tìm Mesh (' + formatMMSS(localRemaining) + ')';
-                headerBadge.style.background = '#dbeafe';
-                headerBadge.style.color = '#1d4ed8';
-            } else if (role === 'node') {
-                headerBadge.textContent = peers.length > 0
-                    ? '🟢 Router Phụ đang kết nối Router Chính'
-                    : '📡 Router Phụ đang dò sóng Router Chính...';
-                headerBadge.style.background = '#dbeafe';
-                headerBadge.style.color = '#1d4ed8';
+                statusPill.textContent = '📡 Đang tìm Mesh (' + formatMMSS(localRemaining) + ')';
+                statusPill.style.background = '#dbeafe';
+                statusPill.style.color = '#1d4ed8';
             } else if (role === 'auto_idle') {
-                headerBadge.textContent = '💤 Tự tắt dò Mesh sau 5 phút (Chạy Độc Lập)';
-                headerBadge.style.background = '#f1f5f9';
-                headerBadge.style.color = '#334155';
-            } else if (role === 'controller') {
-                headerBadge.textContent = '🟢 Đang phát sóng Router Chính';
-                headerBadge.style.background = '#dcfce7';
-                headerBadge.style.color = '#15803d';
+                statusPill.textContent = '💤 Tự tắt sau 5 phút';
+                statusPill.style.background = '#f1f5f9';
+                statusPill.style.color = '#475569';
             } else {
-                headerBadge.textContent = '⚪ Đang tắt Mesh (Chạy Độc Lập)';
-                headerBadge.style.background = '#f1f5f9';
-                headerBadge.style.color = '#475569';
+                statusPill.textContent = '⚪ Đã tắt';
+                statusPill.style.background = '#f1f5f9';
+                statusPill.style.color = '#64748b';
             }
 
-            // TRƯỜNG HỢP 1: Đang mở trang trên ROUTER PHỤ (VD: 192.168.1.10)
-            // -> Ở TRÊN là hình ROUTER CHÍNH (192.168.1.1), ở DƯỚI là hình ROUTER PHỤ (máy này)
-            if (role === 'node') {
-                if (peers.length > 0) {
-                    var master = peers[0];
-                    topologyRoot.appendChild(buildVisualRouterCard({
-                        isPrimary: true,
-                        isCurrent: false,
-                        isSearching: false,
-                        isOnline: true,
-                        roleLabel: 'ROUTER CHÍNH',
-                        ip: master.ip || '192.168.1.1',
-                        url: master.url || 'http://192.168.1.1',
-                        model: master.model || 'Router Chính (Gateway)',
-                        hostname: master.name || 'DOANDUY',
-                        subtitle: 'Cấp mạng gốc & quản lý DHCP cho toàn bộ hệ thống' + (master.target ? (' • Chip: ' + master.target) : ''),
-                        cells: [
-                            metricCell('Địa Chỉ IP & DHCP', (master.ip || '192.168.1.1') + ' • DHCP BẬT', 'MAC: ' + (master.mac || '—')),
-                            metricCell('Tín Hiệu Sóng Mesh', master.signal || 'Online', master.link_type || 'Sóng Mesh 5GHz WDS'),
-                            metricCell('Sóng Wi-Fi Phát Ra', master.ssids || 'Đồng bộ cụm Mesh', 'Kênh Mesh: ' + (st.channel || '36') + ' (' + (st.htmode || 'HE160') + ')'),
-                            metricCell('Thiết Bị & Thời Gian Chạy', (master.clients !== undefined ? (master.clients + ' máy kết nối') : 'Đang hoạt động'), master.uptime ? ('Chạy: ' + master.uptime) : 'Online')
-                        ]
-                    }));
-                    topologyRoot.appendChild(buildWifiMeshLinkConnector((master.link_type || 'Sóng Mesh WDS') + ' • ' + (master.signal || 'Online') + ' • Kênh ' + (st.channel || '36')));
-                }
+            var currentIp = st.local_ip || '192.168.1.1';
+            var masterIp  = st.master_ip || '192.168.1.1';
 
-                topologyRoot.appendChild(buildVisualRouterCard({
-                    isPrimary: false,
-                    isCurrent: true,
-                    isSearching: peers.length === 0,
-                    isOnline: peers.length > 0,
-                    roleLabel: 'ROUTER PHỤ',
-                    ip: st.local_ip || '192.168.1.10',
-                    model: st.board_model || 'Router DOANDUY',
-                    hostname: st.local_name || 'DOANDUY',
-                    subtitle: 'Chip: ' + (st.soc_target || 'OpenWrt') + ' • MAC: ' + (st.local_mac || '—'),
-                    cells: [
-                        metricCell('Địa Chỉ IP Router Phụ', (st.local_ip || '192.168.1.10') + ' • DHCP TẮT', 'IP cứu hộ: ' + (st.rescue_ip || '192.168.1.254')),
-                        metricCell('Nguồn Mạng', st.internet_source || 'Đang kết nối Router Chính', 'Tự về 192.168.1.1 nếu hết Mesh'),
-                        metricCell('Sóng Wi-Fi Mở Rộng', st.user_ssids || '—', 'Kênh ' + (st.channel || '36') + ' (' + (st.htmode || 'HE160') + ')'),
-                        metricCell('Tải Kết Nối & Uptime', (st.client_count || 0) + ' thiết bị đang bắt sóng', 'Chạy liên tục: ' + (st.uptime_str || '—'))
-                    ]
-                }));
+            // Nếu máy chưa có mạng đang tự dò sóng (chưa ghép vào 192.168.1.1) -> Hiện đúng 1 hình Router ở chính giữa
+            if (role === 'searching_node' && peers.length === 0) {
+                var singleTree = E('div', { class: 'dd-tree' }, [
+                    E('ul', {}, [
+                        E('li', {}, [
+                            createVisualNodeBox({
+                                isPrimary: false,
+                                isSearching: true,
+                                isActive: true,
+                                isCurrent: true,
+                                roleText: 'ĐANG DÒ MESH',
+                                model: st.board_model || 'Router DOANDUY',
+                                ip: currentIp,
+                                uid: 'searching_self'
+                            })
+                        ])
+                    ])
+                ]);
+                treeStage.appendChild(singleTree);
                 return;
             }
 
-            // TRƯỜNG HỢP 2: Đang mở trên ROUTER CHÍNH (192.168.1.1) hoặc Độc Lập
-            // Nếu đã tự tắt sau 5p (auto_idle / standalone), gắn luôn nút "📡 Bấm Mesh" ngay trên góc thẻ để bấm nhanh 1 chạm!
-            var quickBtn = null;
-            if (!isSearching && peers.length === 0 && (role === 'auto_idle' || role === 'standalone')) {
-                quickBtn = E('button', {
-                    class: 'btn cbi-button cbi-button-apply',
-                    style: 'font-weight: 800; padding: 5px 13px; border-radius: 999px; font-size: 12px;',
-                    click: triggerPairNow
-                }, '📡 Bấm Mesh (Tìm 5 Phút)');
-            }
+            // Gom nhóm các Router Phụ theo tầng (parent_ip) và sắp xếp IP tăng dần .10, .11, .12, .13, .14...
+            var validIps = {};
+            validIps[masterIp] = true;
+            peers.forEach(function(p) {
+                if (p && p.ip) validIps[p.ip] = true;
+            });
 
-            var topLabel = (st.has_internet || role === 'controller')
-                ? 'ROUTER CHÍNH'
-                : (isSearching ? 'ĐANG TÌM MESH' : 'ROUTER ĐỘC LẬP');
+            var sortedPeers = peers.slice().sort(function(a, b) {
+                var oa = parseInt(String(a.ip || '0').split('.').pop(), 10) || 0;
+                var ob = parseInt(String(b.ip || '0').split('.').pop(), 10) || 0;
+                return oa - ob;
+            });
 
-            topologyRoot.appendChild(buildVisualRouterCard({
+            var childrenMap = {};
+            sortedPeers.forEach(function(p) {
+                if (!p || !p.ip) return;
+                var par = (p.parent_ip && validIps[p.parent_ip] && p.parent_ip !== p.ip) ? p.parent_ip : masterIp;
+                if (!childrenMap[par]) childrenMap[par] = [];
+                childrenMap[par].push({
+                    isPrimary: false,
+                    isSearching: false,
+                    isActive: true,
+                    roleText: 'ROUTER PHỤ',
+                    model: p.model || 'Router Phụ',
+                    ip: p.ip,
+                    signal: p.signal || ''
+                });
+            });
+
+            var rootNode = {
                 isPrimary: true,
-                isCurrent: true,
-                isSearching: isSearching,
-                isOnline: !!st.has_internet || role === 'controller',
-                roleLabel: topLabel,
-                quickMeshBtn: quickBtn,
-                ip: st.local_ip || '192.168.1.1',
-                model: st.board_model || 'Router DOANDUY',
-                hostname: st.local_name || 'DOANDUY',
-                subtitle: 'Chip: ' + (st.soc_target || 'OpenWrt') + ' • MAC: ' + (st.local_mac || '—'),
-                cells: [
-                    metricCell(
-                        'Địa Chỉ IP & DHCP',
-                        (st.local_ip || '192.168.1.1') + (st.dhcp_enabled !== false ? ' • DHCP BẬT' : ' • DHCP TẮT'),
-                        'IP cứu hộ: ' + (st.rescue_ip || '192.168.1.254')
-                    ),
-                    metricCell(
-                        'Nguồn Internet Gốc',
-                        st.internet_source || 'Chưa có mạng gốc',
-                        st.wan_ip ? ('WAN IP: ' + st.wan_ip) : 'Có mạng làm Chính • Không mạng làm Phụ'
-                    ),
-                    metricCell(
-                        'Sóng Wi-Fi Đang Phát',
-                        st.user_ssids || '—',
-                        (role === 'controller')
-                            ? ('Sóng Mesh: ' + (st.mesh_ssid || 'DOANDUY_MESH') + ' (Kênh ' + (st.channel || '36') + ')')
-                            : 'Sóng dò Mesh đang tắt gọn nhẹ'
-                    ),
-                    metricCell(
-                        'Thiết Bị Đang Nối & Uptime',
-                        (st.client_count || 0) + ' thiết bị đang kết nối',
-                        'Chạy liên tục: ' + (st.uptime_str || '—')
-                    )
-                ]
-            }));
+                isSearching: isSearching && peers.length === 0,
+                isActive: isEnabled || !!st.has_internet,
+                roleText: 'ROUTER CHÍNH',
+                model: (role === 'node' ? st.master_model : st.board_model) || 'Router Chính',
+                ip: (role === 'node' ? masterIp : currentIp)
+            };
 
-            // Khi đang trong 5 phút tìm kiếm Mesh và chưa có máy phụ -> Hiện dải sóng Wi-Fi tìm kiếm + đếm ngược 5 phút
-            if (isSearching) {
-                topologyRoot.appendChild(buildSearchingWaveBanner(countdownBadge));
-            }
+            var rootTree = E('div', { class: 'dd-tree' }, [
+                E('ul', {}, [
+                    buildSubtreeLi(rootNode, childrenMap, currentIp, 'root')
+                ])
+            ]);
 
-            // KHU VỰC HÌNH ROUTER PHỤ NẰM Ở DƯỚI: Chỉ hiện khi có kết nối (peers.length > 0), không có kết nối tự ẩn hoàn toàn!
-            if (peers.length > 0) {
-                topologyRoot.appendChild(buildWifiMeshLinkConnector(
-                    'Sóng Wi-Fi Mesh (' + (st.mesh_ssid || 'DOANDUY_MESH') + ' • Kênh ' + (st.channel || '36') + ') • Đang nối ' + peers.length + ' Router Phụ'
-                ));
-
-                var subGrid = E('div', {
-                    style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px;'
-                });
-
-                peers.forEach(function(p, idx) {
-                    var subRoleLbl = peers.length > 1 ? ('ROUTER PHỤ #' + (idx + 1)) : 'ROUTER PHỤ';
-                    subGrid.appendChild(buildVisualRouterCard({
-                        isPrimary: false,
-                        isCurrent: false,
-                        isSearching: false,
-                        isOnline: true,
-                        roleLabel: subRoleLbl,
-                        ip: p.ip || '192.168.1.10',
-                        url: p.url || ('http://' + p.ip),
-                        model: p.model || ('Router Phụ #' + (idx + 1)),
-                        hostname: p.name || ('NODE-' + (idx + 1)),
-                        subtitle: (p.target ? ('Chip: ' + p.target + ' • ') : '') + 'MAC: ' + (p.mac || '—'),
-                        cells: [
-                            metricCell('Địa Chỉ IP Router Phụ', (p.ip || '192.168.1.10') + ' • DHCP TẮT', 'Đồng bộ IP từ Router Chính'),
-                            metricCell('Cường Độ Sóng Mesh', p.signal || 'Online', p.link_type || 'Sóng Mesh 5GHz WDS'),
-                            metricCell('Sóng Wi-Fi Mở Rộng', p.ssids || st.user_ssids || 'Đồng bộ theo Router Chính', 'Chuyển vùng mượt 802.11k/v/r'),
-                            metricCell('Thiết Bị Kết Nối & Uptime', (p.clients !== undefined ? (p.clients + ' thiết bị bắt sóng') : 'Đang hoạt động'), p.uptime ? ('Chạy: ' + p.uptime) : 'Đang trực tuyến')
-                        ]
-                    }));
-                });
-
-                topologyRoot.appendChild(subGrid);
-            }
+            treeStage.appendChild(rootTree);
         }
 
         function refreshMesh() {
             return callMeshStatus().then(renderState).catch(function() {});
         }
 
-        function runMode(mode, confirmMsg) {
-            if (confirmMsg && !confirm(confirmMsg)) return;
-            var nip = (nodeIpInput.value || '192.168.1.10').trim();
-            callMeshSetMode(mode, nip).then(function(res) {
-                ui.addNotification(null, E('p', '✅ ' + ((res && res.message) || 'Đã áp dụng chế độ Mesh!')), 'info');
-                setTimeout(refreshMesh, 1800);
-            }).catch(function(err) {
-                ui.addNotification(null, E('p', '❌ Lỗi Mesh: ' + err), 'error');
-            });
-        }
-
         var pane = E('div', { style: 'display: none;' }, [
             E('div', {
-                style: 'border: 1px solid #cbd5e1; border-radius: 14px; padding: 16px; background: #f8fafc; margin-bottom: 16px;'
+                style: 'border: 1px solid #cbd5e1; border-radius: 16px; padding: 16px 20px; background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%); min-height: 300px;'
             }, [
+                // Thanh tiêu đề tối giản: chỉ có Trạng thái bên trái & nút Bật / Tắt ngay trên đầu
                 E('div', {
-                    style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 14px;'
+                    style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0;'
                 }, [
-                    E('div', { style: 'display: flex; align-items: center; gap: 10px; flex-wrap: wrap;' }, [
-                        E('span', { style: 'font-weight: 900; font-size: 15.5px; color: #0f172a;' }, '🌐 Sơ Đồ Router Chính & Router Phụ (Auto-Mesh)'),
-                        headerBadge
+                    E('div', { style: 'display: flex; align-items: center; gap: 10px;' }, [
+                        E('span', { style: 'font-weight: 900; font-size: 15.5px; color: #0f172a;' }, '🌐 Auto-Mesh'),
+                        statusPill
                     ]),
-                    E('button', {
-                        class: 'btn cbi-button',
-                        style: 'font-weight: 750; padding: 6px 14px; border-radius: 7px;',
-                        click: refreshMesh
-                    }, '🔄 Làm Mới')
+                    E('div', { style: 'display: flex; align-items: center; gap: 8px;' }, [
+                        btnOn,
+                        btnOff
+                    ])
                 ]),
-                topologyRoot
-            ]),
-
-            E('div', { style: 'border: 1px solid #e2e8f0; border-radius: 14px; padding: 16px; background: #ffffff; margin-bottom: 16px;' }, [
-                E('div', { style: 'font-weight: 800; font-size: 14px; margin-bottom: 10px; color: #1e293b;' }, '⚡ Bảng Điều Khiển Ghép Nối Mesh Thông Minh (Tự Bật 5 Phút Khi Khởi Động Hoặc Khi Bấm Nút):'),
-                E('div', { style: 'display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px;' }, [
-                    E('button', {
-                        class: 'btn cbi-button cbi-button-apply',
-                        style: 'font-weight: 900; padding: 9px 18px; border-radius: 8px; font-size: 13.5px;',
-                        click: triggerPairNow
-                    }, '📡 Bấm Mesh (Tự Động Tìm & Ghép Nối 5 Phút)'),
-                    E('button', {
-                        class: 'btn cbi-button cbi-button-action',
-                        style: 'font-weight: 750; padding: 8px 14px; border-radius: 7px;',
-                        click: function() { runMode('controller', 'Giữ cố định máy này luôn phát sóng làm Router Chính (192.168.1.1, không tự tắt sau 5 phút)?'); }
-                    }, '👑 Giữ Luôn Router Chính'),
-                    E('span', { style: 'font-size: 12.5px; font-weight: 700; color: #475569;' }, 'IP Phụ:'),
-                    nodeIpInput,
-                    E('button', {
-                        class: 'btn cbi-button',
-                        style: 'font-weight: 750; padding: 8px 14px; border-radius: 7px; border: 1px solid #93c5fd; color: #1d4ed8;',
-                        click: function() { runMode('node', 'Ép thiết bị này làm Router Phụ (IP ' + nodeIpInput.value + ', tắt DHCP, nối tới 192.168.1.1)?'); }
-                    }, '📡 Ép Làm Router Phụ'),
-                    E('button', {
-                        class: 'btn cbi-button cbi-button-reset',
-                        style: 'font-weight: 750; padding: 8px 14px; border-radius: 7px;',
-                        click: function() { runMode('unmesh', 'Tắt Mesh ngay lập tức và trả thiết bị về IP mặc định 192.168.1.1 + bật lại DHCP?'); }
-                    }, '🔌 Tắt Mesh Ngay')
-                ]),
-                E('div', { style: 'font-size: 12.5px; line-height: 1.65; color: #475569; background: #f8fafc; padding: 10px 13px; border-radius: 8px; border: 1px solid #e2e8f0;' }, [
-                    E('div', {}, '• Khi khởi động lên: Mọi router tự động bật phát sóng & tìm kiếm Mesh trong 5 phút (máy có mạng làm Router Chính 192.168.1.1, máy không mạng làm Router Phụ 192.168.1.10).'),
-                    E('div', {}, '• Nếu ghép nối thành công: Hình Router Phụ sẽ hiện ngay bên dưới hình Router Chính và giữ kết nối xuyên suốt.'),
-                    E('div', {}, '• Sau 5 phút nếu không có thiết bị Mesh nào kết nối: Hệ thống tự động tắt dò Mesh cho nhẹ Wi-Fi; bất kỳ lúc nào cần ghép thêm chỉ cần bấm nút "📡 Bấm Mesh" ở trên.')
-                ])
+                treeStage
             ])
         ]);
 
-        // Đếm ngược mượt từng giây trên giao diện khi đang dò sóng 5 phút
         setInterval(function() {
             if (pane.style.display === 'none' || !document.body.contains(pane)) return;
-            if (latestState && latestState.searching && localRemaining > 0) {
+            if (latestState && latestState.searching && localRemaining > 0 && (!latestState.peers || latestState.peers.length === 0)) {
                 localRemaining = Math.max(0, localRemaining - 1);
-                countdownBadge.textContent = '⏱ Tự tắt sau ' + formatMMSS(localRemaining);
-                headerBadge.textContent = '📡 Đang dò sóng tìm Mesh (' + formatMMSS(localRemaining) + ')';
+                statusPill.textContent = '📡 Đang tìm Mesh (' + formatMMSS(localRemaining) + ')';
             }
         }, 1000);
 
-        // Đồng bộ trạng thái thực tế từ Router mỗi 5 giây
         setInterval(function() {
             if (pane.style.display !== 'none' && document.body.contains(pane)) {
                 refreshMesh();

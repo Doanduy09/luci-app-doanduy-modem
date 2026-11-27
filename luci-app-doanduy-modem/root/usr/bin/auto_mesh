@@ -1,10 +1,10 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL CROSS-CHIP AUTO-MESH ENGINE (IPQ NSS/Mainline + MTK mt76/mt_wifi)
-# Quy tắc tự động khi khởi động & vận hành:
-# 1. Thiết bị CÓ MẠNG gốc (5G WWAN / WAN dây) -> Router Chính (192.168.1.1, DHCP BẬT, phát DOANDUY_MESH WDS)
-# 2. Thiết bị KHÔNG MẠNG gốc + Quét thấy DOANDUY_MESH -> Router Phụ (Tự đổi IP 192.168.1.10, tắt DHCP, nối Mesh)
-# 3. Khi HẾT MESH (mất kết nối tới 192.168.1.1 >= 30s hoặc tắt Mesh) -> Tự về mặc định 192.168.1.1 + DHCP BẬT
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.6.3)
+# - Tự động 100%: Khởi động (hoặc bấm Bật) dò 5 phút -> Có đôi giữ Mesh, không ai tự tắt
+# - Sóng Mesh tối đa công suất phát (Max TX Power) & băng thông rộng nhất (320/160/80 MHz)
+# - Cấp IP tuần tự tự động cho Router Phụ: 192.168.1.10, 11, 12, 13, 14 ... 99
+# - Hỗ trợ phân tầng đa cấp (Chính -> Nhiều Phụ tầng 1 -> Phụ mesh Phụ tầng 2, 3...)
 # ==============================================================================
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export TZ='ICT-7'
@@ -30,6 +30,10 @@ log_mesh() {
 	fi
 	echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
 	logger -t doanduy_mesh "$1" 2>/dev/null || true
+}
+
+json_esc() {
+	printf '%s' "$1" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 ensure_mesh_uci() {
@@ -60,6 +64,7 @@ get_mesh_cfg() {
 	[ -z "$CFG_KEY" ] && CFG_KEY="$DEFAULT_MESH_KEY"
 }
 
+# Chọn card Wi-Fi có băng thông & tốc độ cao nhất (Ưu tiên 5GHz/6GHz 320MHz -> 160MHz -> 80MHz)
 get_best_mesh_radio() {
 	local best_radio="" best_prio=0 dev band htmode dis prio
 	for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
@@ -68,10 +73,13 @@ get_best_mesh_radio() {
 		band=$(uci -q get "wireless.${dev}.band")
 		htmode=$(uci -q get "wireless.${dev}.htmode")
 		prio=1
-		if [ "$band" = "5g" ] || [ "$band" = "6g" ]; then
-			prio=2
-			echo "$htmode" | grep -qE "80" && prio=3
-			echo "$htmode" | grep -qE "160|320" && prio=4
+		if [ "$band" = "5g" ]; then
+			prio=3
+			echo "$htmode" | grep -qE "80" && prio=4
+			echo "$htmode" | grep -qE "160|320" && prio=6
+		elif [ "$band" = "6g" ]; then
+			prio=3
+			echo "$htmode" | grep -qE "160|320" && prio=5
 		fi
 		if [ "$prio" -gt "$best_prio" ]; then
 			best_prio="$prio"
@@ -83,7 +91,59 @@ get_best_mesh_radio() {
 	echo "$best_radio"
 }
 
-# Kiểm tra Internet GỐC trực tiếp (5G WWAN hoặc cổng WAN dây, KHÔNG tính qua br-lan của Mesh)
+# Tối ưu công suất phát cực đại (Max TX Power) & độ rộng kênh tốc độ cao nhất cho sóng Mesh
+maximize_mesh_radio_perf() {
+	local radio="$1" changed=0 drv_type band cur_ht best_ht max_tx hlist
+	[ -n "$radio" ] || return 0
+	drv_type=$(uci -q get "wireless.${radio}.type")
+	band=$(uci -q get "wireless.${radio}.band")
+	cur_ht=$(uci -q get "wireless.${radio}.htmode")
+
+	# Mở rộng băng thông tối đa nếu đang bị hẹp (20/40MHz trên 5GHz)
+	if [ "$band" = "5g" ] && command -v iwinfo >/dev/null 2>&1; then
+		hlist=$(iwinfo "$radio" htmodelist 2>/dev/null)
+		best_ht=""
+		for m in EHT160 HE160 VHT160 EHT80 HE80 VHT80; do
+			if echo " $hlist " | grep -q " $m "; then
+				best_ht="$m"
+				break
+			fi
+		done
+		if [ -n "$best_ht" ] && [ "$cur_ht" != "$best_ht" ]; then
+			case "$cur_ht" in *160*|*320*) ;; *)
+				uci -q set "wireless.${radio}.htmode=${best_ht}"
+				changed=1
+			;; esac
+		fi
+	fi
+
+	# Đẩy công suất phát (txpower) lên mức cao nhất phần cứng hỗ trợ
+	if command -v iwinfo >/dev/null 2>&1; then
+		max_tx=$(iwinfo "$radio" txpowerlist 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dBm" && $(i-1)+0>m) m=$(i-1)+0} END{if(m>0) print m}')
+		if [ -n "$max_tx" ] && [ "$(uci -q get "wireless.${radio}.txpower")" != "$max_tx" ]; then
+			uci -q set "wireless.${radio}.txpower=${max_tx}"
+			changed=1
+		fi
+	fi
+
+	[ "$(uci -q get "wireless.${radio}.cell_density")" != "0" ] && { uci -q set "wireless.${radio}.cell_density=0"; changed=1; }
+	[ "$(uci -q get "wireless.${radio}.noscan")" != "1" ] && { uci -q set "wireless.${radio}.noscan=1"; changed=1; }
+
+	if [ "$drv_type" = "mtwifi" ]; then
+		[ "$(uci -q get "wireless.${radio}.txburst")" != "1" ] && { uci -q set "wireless.${radio}.txburst=1"; changed=1; }
+		[ "$(uci -q get "wireless.${radio}.beamforming")" != "1" ] && { uci -q set "wireless.${radio}.beamforming=1"; changed=1; }
+	else
+		[ "$(uci -q get "wireless.${radio}.su_beamformer")" != "1" ] && { uci -q set "wireless.${radio}.su_beamformer=1"; changed=1; }
+		[ "$(uci -q get "wireless.${radio}.mu_beamformer")" != "1" ] && { uci -q set "wireless.${radio}.mu_beamformer=1"; changed=1; }
+		[ "$(uci -q get "wireless.${radio}.ldpc")" != "1" ] && { uci -q set "wireless.${radio}.ldpc=1"; changed=1; }
+	fi
+
+	# Bật STP trên br-lan để chống vòng lặp gói tin tuyệt đối khi chạy đa tầng (Phụ mesh Phụ)
+	[ -f /sys/class/net/br-lan/bridge/stp_state ] && echo 1 > /sys/class/net/br-lan/bridge/stp_state 2>/dev/null || true
+
+	echo "$changed"
+}
+
 check_direct_internet() {
 	DIRECT_SRC=""
 	local iface st up l3 d
@@ -116,12 +176,24 @@ check_direct_internet() {
 	return 1
 }
 
-# Quét tìm sóng DOANDUY_MESH của Router Chính (tương thích cả mac80211 ath11k/mt76 & MediaTek mt_wifi)
+get_all_local_macs() {
+	local f m list=","
+	for f in /sys/class/net/*/address; do
+		[ -f "$f" ] || continue
+		m=$(tr 'a-z' 'A-Z' < "$f" 2>/dev/null)
+		[ -n "$m" ] && list="${list}${m},"
+	done
+	echo "$list"
+}
+
+# Quét tất cả trạm DOANDUY_MESH xung quanh và CHỌN TRẠM SÓNG MẠNH NHẤT (RSSI cao nhất, hỗ trợ cả Chính & Phụ mesh Phụ)
 scan_for_master_mesh() {
 	FOUND_MESH_SSID=""
 	FOUND_MESH_CHAN=""
-	local radio="$1" cand_ifs="" ifc w_if raw line cur_ch=""
+	FOUND_MESH_BSSID=""
+	local radio="$1" cand_ifs="" ifc w_if raw my_macs best_line
 	[ -z "$radio" ] && radio=$(get_best_mesh_radio)
+	my_macs=$(get_all_local_macs)
 
 	for ifc in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
 		if [ "$(uci -q get "wireless.${ifc}.device")" = "$radio" ]; then
@@ -138,37 +210,91 @@ scan_for_master_mesh() {
 		raw=""
 		if command -v iwinfo >/dev/null 2>&1; then
 			raw=$(iwinfo "$w_if" scan 2>/dev/null)
+			if [ -n "$raw" ]; then
+				best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v own="$my_macs" '
+					BEGIN { best_sig=-999; bssid=""; essid=""; chan=""; sig=-95 }
+					function flush_cell() {
+						if ((essid == s1 || essid == s2) && bssid != "" && index(own, "," bssid ",") == 0) {
+							if (sig + 0 > best_sig) {
+								best_sig = sig + 0
+								best_out = essid "|" (chan != "" ? chan : "36") "|" bssid "|" best_sig
+							}
+						}
+					}
+					/^Cell / { flush_cell(); bssid=toupper($NF); essid=""; chan=""; sig=-95 }
+					/ESSID:/ {
+						p = index($0, "\"")
+						if (p > 0) {
+							rest = substr($0, p + 1)
+							q = index(rest, "\"")
+							if (q > 0) essid = substr(rest, 1, q - 1)
+						}
+					}
+					/Channel:/ { chan = $NF; gsub(/[^0-9]/, "", chan) }
+					/Signal:/ {
+						for (i = 1; i <= NF; i++) if ($i == "Signal:") { sig = $(i+1); gsub(/[^0-9-]/, "", sig) }
+					}
+					END { flush_cell(); if (best_out != "") print best_out }
+				')
+				if [ -n "$best_line" ]; then
+					FOUND_MESH_SSID=$(printf '%s' "$best_line" | cut -d'|' -f1)
+					FOUND_MESH_CHAN=$(printf '%s' "$best_line" | cut -d'|' -f2)
+					FOUND_MESH_BSSID=$(printf '%s' "$best_line" | cut -d'|' -f3)
+					return 0
+				fi
+			fi
 		fi
-		if [ -z "$raw" ] && command -v iw >/dev/null 2>&1 && [ -d "/sys/class/net/$w_if" ]; then
+
+		if command -v iw >/dev/null 2>&1 && [ -d "/sys/class/net/$w_if" ]; then
 			ip link set "$w_if" up 2>/dev/null || true
 			raw=$(iw dev "$w_if" scan 2>/dev/null)
-		fi
-		[ -n "$raw" ] || continue
-		if printf '%s\n' "$raw" | grep -qE "ESSID: \"(${CFG_SSID}|${LEGACY_MESH_SSID})\"|SSID: (${CFG_SSID}|${LEGACY_MESH_SSID})"; then
-			if printf '%s\n' "$raw" | grep -q "${CFG_SSID}"; then
-				FOUND_MESH_SSID="$CFG_SSID"
-			else
-				FOUND_MESH_SSID="$LEGACY_MESH_SSID"
+			[ -n "$raw" ] || continue
+			best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v own="$my_macs" '
+				BEGIN { best_sig=-999; bssid=""; essid=""; chan=""; sig=-95 }
+				function flush_bss() {
+					if ((essid == s1 || essid == s2) && bssid != "" && index(own, "," bssid ",") == 0) {
+						if (sig + 0 > best_sig) {
+							best_sig = sig + 0
+							best_out = essid "|" (chan != "" ? chan : "36") "|" bssid "|" best_sig
+						}
+					}
+				}
+				/^BSS / { flush_bss(); split($2, a, "("); bssid=toupper(a[1]); essid=""; chan=""; sig=-95 }
+				/^[[:space:]]*SSID: / { sub(/^[[:space:]]*SSID: /, ""); essid=$0 }
+				/primary channel:/ { chan=$NF; gsub(/[^0-9]/, "", chan) }
+				/^[[:space:]]*signal:/ { sig=$2; sub(/\..*/, "", sig) }
+				END { flush_bss(); if (best_out != "") print best_out }
+			')
+			if [ -n "$best_line" ]; then
+				FOUND_MESH_SSID=$(printf '%s' "$best_line" | cut -d'|' -f1)
+				FOUND_MESH_CHAN=$(printf '%s' "$best_line" | cut -d'|' -f2)
+				FOUND_MESH_BSSID=$(printf '%s' "$best_line" | cut -d'|' -f3)
+				return 0
 			fi
-			cur_ch=$(printf '%s\n' "$raw" | awk -v target="$FOUND_MESH_SSID" '
-				/Channel:/ { ch=$NF }
-				/primary channel:/ { ch=$NF }
-				$0 ~ target { if (ch != "") { print ch; exit } }
-			' | tr -cd '0-9')
-			FOUND_MESH_CHAN="${cur_ch:-36}"
-			return 0
 		fi
 	done
 	return 1
 }
 
-# Chọn IP không trùng cho Router Phụ (ưu tiên 192.168.1.10 -> .11 -> .12 -> .13)
+# Cấp phát IP tuần tự tự động tăng dần cho Router Phụ: 192.168.1.10, 11, 12, 13, 14 ... 99
 pick_free_node_ip() {
-	local pref="${1:-192.168.1.10}" cur_lan my_mac arp_mac cand oct
+	local cur_lan my_mac arp_mac oct cand
 	cur_lan=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
 	my_mac=$(tr 'A-Z' 'a-z' < /sys/class/net/br-lan/address 2>/dev/null)
-	[ "$cur_lan" = "$pref" ] && { echo "$pref"; return 0; }
-	for cand in "$pref" 192.168.1.10 192.168.1.11 192.168.1.12 192.168.1.13 192.168.1.14; do
+
+	# Nếu máy này đang giữ sẵn 1 IP trong dải .10..99 không đụng ai -> giữ nguyên không nhảy IP
+	case "$cur_lan" in
+		192.168.1.[1-9][0-9])
+			arp_mac=$(awk -v ip="$cur_lan" '$1==ip && $3!="0x0" {print tolower($4)}' /proc/net/arp 2>/dev/null | head -n 1)
+			if [ -z "$arp_mac" ] || [ "$arp_mac" = "$my_mac" ]; then
+				echo "$cur_lan"
+				return 0
+			fi
+			;;
+	esac
+
+	for oct in $(seq 10 99); do
+		cand="192.168.1.${oct}"
 		if ! ping -c 1 -W 1 "$cand" >/dev/null 2>&1; then
 			echo "$cand"
 			return 0
@@ -179,7 +305,18 @@ pick_free_node_ip() {
 			return 0
 		fi
 	done
-	echo "$pref"
+	echo "192.168.1.10"
+}
+
+flush_secondary_node_ips() {
+	local ip_cidr ip_only
+	for ip_cidr in $(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet 192\.168\.1\./{print $2}'); do
+		ip_only="${ip_cidr%%/*}"
+		case "$ip_only" in
+			192.168.1.1|"$RESCUE_IP") ;;
+			*) ip addr del "$ip_cidr" dev br-lan 2>/dev/null || true ;;
+		esac
+	done
 }
 
 start_pairing_window() {
@@ -267,7 +404,7 @@ configure_roaming_on_user_aps() {
 
 apply_controller_role() {
 	get_mesh_cfg
-	local radio cur_ip cur_ignore net_changed=0 wifi_changed=0 cur_ch
+	local radio cur_ip cur_ignore net_changed=0 wifi_changed=0 cur_ch dhcp_start
 	radio=$(get_best_mesh_radio)
 	cur_ip=$(uci -q get network.lan.ipaddr)
 	cur_ignore=$(uci -q get dhcp.lan.ignore)
@@ -292,8 +429,11 @@ apply_controller_role() {
 	fi
 	[ "$net_changed" = "1" ] && uci commit network
 
-	if [ "$cur_ignore" = "1" ]; then
+	# Giữ dải 192.168.1.10..99 dành riêng cho các Router Phụ, DHCP cấp từ .100 trở lên
+	dhcp_start=$(uci -q get dhcp.lan.start 2>/dev/null || echo 100)
+	if [ "$cur_ignore" = "1" ] || [ "${dhcp_start:-100}" -lt 100 ]; then
 		uci set dhcp.lan.ignore='0'
+		[ "${dhcp_start:-100}" -lt 100 ] && uci set dhcp.lan.start='100'
 		uci commit dhcp
 		net_changed=1
 	fi
@@ -315,6 +455,8 @@ apply_controller_role() {
 		fi
 	fi
 
+	[ "$(maximize_mesh_radio_perf "$radio")" = "1" ] && wifi_changed=1
+
 	if [ "$(uci -q get wireless.mesh_backhaul_ap.ssid)" != "$CFG_SSID" ] || \
 	   [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" = "1" ] || \
 	   [ "$(uci -q get wireless.mesh_backhaul_ap.device)" != "$radio" ]; then
@@ -335,15 +477,13 @@ apply_controller_role() {
 	[ "$(configure_roaming_on_user_aps)" = "1" ] && wifi_changed=1
 
 	if [ "$net_changed" = "1" ]; then
-		for oct in 10 11 12 13 14 2; do
-			ip addr del "192.168.1.${oct}/24" dev br-lan 2>/dev/null || true
-		done
+		flush_secondary_node_ips
 		ip addr add 192.168.1.1/24 dev br-lan 2>/dev/null || true
 		ip addr add "${RESCUE_IP}/24" dev br-lan 2>/dev/null || true
 		ip route del default via 192.168.1.1 dev br-lan 2>/dev/null || true
 		/etc/init.d/network reload >/dev/null 2>&1 || true
 		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-		log_mesh "Thiết lập ROUTER CHÍNH (IP 192.168.1.1, DHCP BẬT, phát sóng $CFG_SSID trên $radio)."
+		log_mesh "Thiết lập ROUTER CHÍNH (IP 192.168.1.1, công suất sóng Mesh tối đa trên $radio)."
 	fi
 
 	if [ "$wifi_changed" = "1" ]; then
@@ -352,23 +492,58 @@ apply_controller_role() {
 	fi
 }
 
+# Bật thêm trạm phát tiếp sóng Mesh (Relay AP) trên Router Phụ đã thông mạng để hỗ trợ "Phụ Mesh Phụ" (Tầng 2, Tầng 3...)
+ensure_node_relay_ap() {
+	get_mesh_cfg
+	local radio target_ssid target_key
+	radio=$(uci -q get wireless.mesh_sta.device)
+	[ -z "$radio" ] && radio=$(get_best_mesh_radio)
+	target_ssid=$(uci -q get wireless.mesh_sta.ssid)
+	[ -z "$target_ssid" ] && target_ssid="$CFG_SSID"
+	target_key="$CFG_KEY"
+	[ "$target_ssid" = "$LEGACY_MESH_SSID" ] && target_key="SysMeshKey@2026!Sec"
+
+	[ -f /sys/class/net/br-lan/bridge/stp_state ] && echo 1 > /sys/class/net/br-lan/bridge/stp_state 2>/dev/null || true
+
+	if [ "$(uci -q get wireless.mesh_backhaul_ap.ssid)" != "$target_ssid" ] || \
+	   [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" = "1" ] || \
+	   [ "$(uci -q get wireless.mesh_backhaul_ap.device)" != "$radio" ]; then
+		uci -q delete wireless.mesh_backhaul_ap
+		uci set wireless.mesh_backhaul_ap=wifi-iface
+		uci set wireless.mesh_backhaul_ap.device="$radio"
+		uci set wireless.mesh_backhaul_ap.mode='ap'
+		uci set wireless.mesh_backhaul_ap.network='lan'
+		uci set wireless.mesh_backhaul_ap.ssid="$target_ssid"
+		uci set wireless.mesh_backhaul_ap.encryption='psk2'
+		uci set wireless.mesh_backhaul_ap.key="$target_key"
+		uci set wireless.mesh_backhaul_ap.wds='1'
+		uci set wireless.mesh_backhaul_ap.hidden='0'
+		uci set wireless.mesh_backhaul_ap.disabled='0'
+		uci commit wireless
+		( /sbin/wifi reload >/dev/null 2>&1 & )
+		log_mesh "Router Phụ đã thông mạng -> Bật tiếp sóng Mesh ($target_ssid) hỗ trợ tầng dưới (Phụ mesh Phụ)."
+	fi
+}
+
 apply_node_role() {
 	get_mesh_cfg
-	local target_ssid="${1:-$CFG_SSID}" target_chan="${2:-36}" req_ip="$3"
+	local target_ssid="${1:-$CFG_SSID}" target_chan="${2:-36}" target_bssid="$3"
 	local radio target_ip cur_ip wifi_changed=0 net_changed=0 target_key="$CFG_KEY"
 	[ "$target_ssid" = "$LEGACY_MESH_SSID" ] && target_key="SysMeshKey@2026!Sec"
 	radio=$(get_best_mesh_radio)
-	target_ip=$(pick_free_node_ip "${req_ip:-$CFG_NODE_IP}")
+	target_ip=$(pick_free_node_ip)
 	cur_ip=$(uci -q get network.lan.ipaddr)
 	rm -f "$LOST_TS_FILE"
 
-	# Khóa cứng channel của radio theo Router Chính để chống loop quét kênh STA+AP trên mac80211/NSS/mt_wifi
 	if [ -n "$target_chan" ] && [ "$(uci -q get "wireless.${radio}.channel")" != "$target_chan" ]; then
 		uci set "wireless.${radio}.channel=${target_chan}"
 		wifi_changed=1
 	fi
 
-	if [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+	[ "$(maximize_mesh_radio_perf "$radio")" = "1" ] && wifi_changed=1
+
+	# Khi mới bắt đầu nối STA, tạm tắt relay AP cho tới khi ping thông 192.168.1.1 để chống loop
+	if [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ] && ! ping -c 1 -W 1 192.168.1.1 >/dev/null 2>&1; then
 		uci -q delete wireless.mesh_backhaul_ap
 		wifi_changed=1
 	fi
@@ -426,19 +601,19 @@ apply_node_role() {
 
 	if [ "$net_changed" = "1" ]; then
 		ip addr del 192.168.1.1/24 dev br-lan 2>/dev/null || true
+		flush_secondary_node_ips
 		ip addr add "${target_ip}/24" dev br-lan 2>/dev/null || true
 		ip addr add "${RESCUE_IP}/24" dev br-lan 2>/dev/null || true
 		ip route replace default via 192.168.1.1 dev br-lan metric 50 2>/dev/null || true
 		/etc/init.d/network reload >/dev/null 2>&1 || true
 		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 		/etc/init.d/dropbear restart >/dev/null 2>&1 || true
-		log_mesh "Thiết lập ROUTER PHỤ (IP ${target_ip}, tắt DHCP, nối sóng $target_ssid kênh $target_chan)."
+		log_mesh "Thiết lập ROUTER PHỤ (IP ${target_ip}, kênh $target_chan, ưu tiên trạm sóng mạnh nhất ${target_bssid:-auto})."
 	fi
 }
 
-# Khôi phục IP mặc định 192.168.1.1 + DHCP BẬT khi hết Mesh hoặc người dùng tắt Mesh
 restore_default_standalone() {
-	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0 oct
+	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0
 	ensure_mesh_uci
 	rm -f "$LOST_TS_FILE"
 	if [ "$mode_after" = "disabled" ]; then
@@ -485,15 +660,13 @@ restore_default_standalone() {
 	fi
 
 	if [ "$net_changed" = "1" ]; then
-		for oct in 10 11 12 13 14 2; do
-			ip addr del "192.168.1.${oct}/24" dev br-lan 2>/dev/null || true
-		done
+		flush_secondary_node_ips
 		ip addr add 192.168.1.1/24 dev br-lan 2>/dev/null || true
 		ip addr add "${RESCUE_IP}/24" dev br-lan 2>/dev/null || true
 		ip route del default via 192.168.1.1 dev br-lan 2>/dev/null || true
 		/etc/init.d/network reload >/dev/null 2>&1 || true
 		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-		log_mesh "Hết Mesh -> Đã khôi phục IP mặc định 192.168.1.1 và BẬT lại DHCP!"
+		log_mesh "Đã khôi phục IP mặc định 192.168.1.1 và BẬT lại DHCP!"
 	fi
 
 	if [ "$wifi_changed" = "1" ]; then
@@ -502,61 +675,34 @@ restore_default_standalone() {
 	fi
 }
 
-json_esc() {
-	printf '%s' "$1" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-format_uptime_vi() {
-	local up_s d h m
-	up_s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
-	d=$((up_s / 86400))
-	h=$(((up_s % 86400) / 3600))
-	m=$(((up_s % 3600) / 60))
-	if [ "$d" -gt 0 ]; then
-		echo "${d} ngày ${h} giờ"
-	elif [ "$h" -gt 0 ]; then
-		echo "${h} giờ ${m} phút"
-	else
-		echo "${m} phút"
-	fi
-}
-
-get_local_wifi_summary() {
-	local ifc mode dis ssid list=""
-	for ifc in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
-		case "$ifc" in mesh_backhaul_ap|mesh_sta) continue ;; esac
-		mode=$(uci -q get "wireless.${ifc}.mode")
-		[ "$mode" = "ap" ] || continue
-		dis=$(uci -q get "wireless.${ifc}.disabled")
-		[ "$dis" = "1" ] && continue
-		ssid=$(uci -q get "wireless.${ifc}.ssid")
-		case "$ssid" in ""|"$CFG_SSID"|"$LEGACY_MESH_SSID") continue ;; esac
-		case ",$list," in
-			*,"$ssid",*) ;;
-			*) [ -z "$list" ] && list="$ssid" || list="${list}, ${ssid}" ;;
-		esac
-	done
-	[ -z "$list" ] && list="Đang khởi tạo"
-	echo "$list"
-}
-
-get_local_client_count() {
-	local cnt=0 w_if w_ssid
+get_local_mesh_ap_bssid() {
+	local w_if bssid=""
 	if command -v iw >/dev/null 2>&1; then
-		for w_if in $(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type AP/{print i}'); do
-			w_ssid=$(iw dev "$w_if" info 2>/dev/null | awk '/ssid /{print $2; exit}')
-			case "$w_ssid" in "$CFG_SSID"|"$LEGACY_MESH_SSID") continue ;; esac
-			cnt=$((cnt + $(iw dev "$w_if" station dump 2>/dev/null | awk '/^Station /{c++} END{print c+0}')))
+		for w_if in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+			if iw dev "$w_if" info 2>/dev/null | grep -qE "ssid (${CFG_SSID}|${LEGACY_MESH_SSID})$"; then
+				bssid=$(iw dev "$w_if" info 2>/dev/null | awk '/addr /{print toupper($2); exit}')
+				[ -n "$bssid" ] && break
+			fi
 		done
 	fi
-	if [ "$cnt" -eq 0 ] && [ -f /proc/net/arp ]; then
-		cnt=$(awk '$3!="0x0" && $6=="br-lan" && $1!="192.168.1.1" && $1!="192.168.1.254" {c++} END{print c+0}' /proc/net/arp 2>/dev/null || echo 0)
-	fi
-	echo "${cnt:-0}"
+	echo "$bssid"
 }
 
-fetch_peer_meta() {
-	local ip="$1" url="http://${1}/mesh_node_info.json"
+get_local_uplink_info() {
+	local sta_if ubssid="" usig="" urate=""
+	if command -v iw >/dev/null 2>&1; then
+		sta_if=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i; exit}')
+		if [ -n "$sta_if" ]; then
+			ubssid=$(iw dev "$sta_if" link 2>/dev/null | awk '/Connected to /{print toupper($3); exit}')
+			usig=$(iw dev "$sta_if" link 2>/dev/null | awk '/signal:/{print $2; exit}')
+			urate=$(iw dev "$sta_if" link 2>/dev/null | sed -n 's/.*tx bitrate: \([0-9.]* [A-Za-z/]*\).*/\1/p' | head -n 1)
+		fi
+	fi
+	echo "${ubssid}|${usig}|${urate}"
+}
+
+fetch_http_fast() {
+	local url="$1"
 	if command -v uclient-fetch >/dev/null 2>&1; then
 		uclient-fetch -q -T 1 -O - "$url" 2>/dev/null
 	elif command -v wget >/dev/null 2>&1; then
@@ -566,39 +712,38 @@ fetch_peer_meta() {
 	fi
 }
 
+# Thu thập cây phân tầng đầy đủ của toàn bộ các Router Phụ (.10, .11, .12, .13, .14 ... .99)
+# Tự động xác định parent_ip: nối vào Router Chính -> parent_ip = 192.168.1.1 (Tầng 1); nối vào Router Phụ -> parent_ip = IP máy Phụ đó (Tầng 2, 3...)
 get_mesh_peers_json() {
-	local role="$1" lip="$2" peer_count=0 peer_list="" nip nmac sig rate pmeta rmodel rtarget rhost rssids rclients ruptime
+	local role="$1" lip="$2" master_bssid="$3" peer_count=0 peer_list=""
 	if [ "$role" = "node" ]; then
+		# Nếu đang xem trên Router Phụ: lấy toàn bộ cây phân tầng từ Router Chính 192.168.1.1 để hiển thị đồng nhất!
 		if ping -c 1 -W 1 192.168.1.1 >/dev/null 2>&1; then
-			nmac=$(awk '$1=="192.168.1.1" && $3!="0x0" {print toupper($4)}' /proc/net/arp 2>/dev/null | head -n 1)
-			local sta_if
-			sta_if=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i; exit}')
-			sig=""
-			rate=""
-			if [ -n "$sta_if" ]; then
-				sig=$(iw dev "$sta_if" link 2>/dev/null | awk '/signal:/{print $2; exit}')
-				rate=$(iw dev "$sta_if" link 2>/dev/null | sed -n 's/.*tx bitrate: \([0-9.]* [A-Za-z/]*\).*/\1/p' | head -n 1)
+			local mtopo mpeers mcnt
+			mtopo=$(fetch_http_fast "http://192.168.1.1/mesh_topology.json")
+			if [ -n "$mtopo" ]; then
+				mcnt=$(printf '%s' "$mtopo" | jsonfilter -e '@.peer_count' 2>/dev/null | tr -cd '0-9')
+				mpeers=$(printf '%s' "$mtopo" | jsonfilter -e '@.peers' 2>/dev/null)
+				MASTER_MODEL_FROM_TOPO=$(printf '%s' "$mtopo" | jsonfilter -e '@.board_model' 2>/dev/null)
+				MASTER_NAME_FROM_TOPO=$(printf '%s' "$mtopo" | jsonfilter -e '@.local_name' 2>/dev/null)
+				if [ -n "$mpeers" ] && [ "${mcnt:-0}" -gt 0 ]; then
+					echo "${mcnt}|${mpeers}"
+					return 0
+				fi
 			fi
-			[ -z "$sig" ] && sig="-46"
-			pmeta=$(fetch_peer_meta "192.168.1.1")
-			rmodel=$(printf '%s' "$pmeta" | jsonfilter -e '@.model' 2>/dev/null)
-			rtarget=$(printf '%s' "$pmeta" | jsonfilter -e '@.target' 2>/dev/null)
-			rhost=$(printf '%s' "$pmeta" | jsonfilter -e '@.hostname' 2>/dev/null)
-			rssids=$(printf '%s' "$pmeta" | jsonfilter -e '@.ssids' 2>/dev/null)
-			rclients=$(printf '%s' "$pmeta" | jsonfilter -e '@.clients' 2>/dev/null | tr -cd '0-9')
-			ruptime=$(printf '%s' "$pmeta" | jsonfilter -e '@.uptime' 2>/dev/null)
-			[ -z "$rmodel" ] && rmodel="Router Chính (Gateway)"
-			[ -z "$rhost" ] && rhost="DOANDUY"
-			local sig_lbl="${sig} dBm"
-			[ -n "$rate" ] && sig_lbl="${sig} dBm • ${rate}"
+			# Fallback nếu Router Chính chưa xuất mesh_topology.json
+			local uinfo usig
+			uinfo=$(get_local_uplink_info)
+			usig=$(printf '%s' "$uinfo" | cut -d'|' -f2)
 			peer_count=1
-			peer_list="{\"ip\":\"192.168.1.1\",\"mac\":\"$(json_esc "${nmac:-MASTER}")\",\"name\":\"$(json_esc "$rhost")\",\"model\":\"$(json_esc "$rmodel")\",\"target\":\"$(json_esc "$rtarget")\",\"ssids\":\"$(json_esc "$rssids")\",\"clients\":${rclients:-0},\"uptime\":\"$(json_esc "$ruptime")\",\"link_type\":\"Sóng Mesh WDS\",\"signal\":\"$(json_esc "$sig_lbl")\",\"url\":\"http://192.168.1.1\"}"
+			peer_list="{\"ip\":\"$(json_esc "$lip")\",\"parent_ip\":\"192.168.1.1\",\"mac\":\"$(json_esc "$LOCAL_MAC_CACHE")\",\"name\":\"$(json_esc "$LOCAL_NAME_CACHE")\",\"model\":\"$(json_esc "$LOCAL_MODEL_CACHE")\",\"signal\":\"${usig:--45} dBm\",\"url\":\"http://${lip}\"}"
+			echo "${peer_count}|[${peer_list}]"
+			return 0
 		fi
-		echo "${peer_count}|[${peer_list}]"
+		echo "0|[]"
 		return 0
 	fi
 
-	# Chỉ quét tìm Thiết Bị Phụ khi máy này đang ở chế độ Controller (Router Chính)
 	[ "$role" = "controller" ] || { echo "0|[]"; return 0; }
 
 	local mesh_if="" w_if wds_dump="" wds_cnt=0
@@ -619,69 +764,83 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 		fi
 	fi
 
-	# Đánh thức bảng ARP song song cho dải IP Router Phụ (.10 -> .14) trong <= 1s
-	for nip in 192.168.1.10 192.168.1.11 192.168.1.12 192.168.1.13 192.168.1.14; do
+	# Quét nhanh song song dải .10..24 + tất cả các IP .25..99 đang có mặt trong bảng ARP
+	local cand_ips="" oct nip extra_arp
+	for oct in $(seq 10 24); do
+		cand_ips="$cand_ips 192.168.1.${oct}"
+	done
+	extra_arp=$(awk '$1 ~ /^192\.168\.1\.([2-9][5-9]|[3-9][0-9])$/ && $3!="0x0" {print $1}' /proc/net/arp 2>/dev/null)
+	cand_ips="$cand_ips $extra_arp"
+
+	for nip in $cand_ips; do
 		[ "$nip" = "$lip" ] && continue
 		ping -c 1 -W 1 "$nip" >/dev/null 2>&1 &
 	done
 	wait 2>/dev/null || true
 
-	for nip in 192.168.1.10 192.168.1.11 192.168.1.12 192.168.1.13 192.168.1.14 192.168.1.2; do
+	# Sắp xếp danh sách IP ứng viên tăng dần theo số cuối (10, 11, 12, 13, 14...)
+	local sorted_ips tmp_nodes="/tmp/doanduy_mesh_nodes.$$"
+	rm -f "$tmp_nodes"
+	sorted_ips=$(awk '$1 ~ /^192\.168\.1\.[1-9][0-9]$/ && $3!="0x0" {split($1,a,"."); printf "%03d %s\n", a[4], $1}' /proc/net/arp 2>/dev/null | sort -u | awk '{print $2}')
+
+	local pmeta rmodel rhost rmbssid rubssid rusig nmac
+	for nip in $sorted_ips; do
 		[ "$nip" = "$lip" ] && continue
-		awk -v ip="$nip" '$1==ip && $3!="0x0" {found=1} END{exit !found}' /proc/net/arp 2>/dev/null || continue
-		# Bỏ qua nếu IP này là thiết bị khách thuê DHCP bình thường
 		if [ -f /tmp/dhcp.leases ] && awk -v ip="$nip" '$3==ip {found=1} END{exit !found}' /tmp/dhcp.leases 2>/dev/null; then
 			continue
 		fi
 		ping -c 1 -W 1 "$nip" >/dev/null 2>&1 || continue
 		nmac=$(awk -v ip="$nip" '$1==ip && $3!="0x0" {print toupper($4)}' /proc/net/arp 2>/dev/null | head -n 1)
-		pmeta=$(fetch_peer_meta "$nip")
-		# Chỉ xác nhận là Thiết Bị Phụ khi có phản hồi mesh_node_info.json HOẶC đang có trạm WDS ghép sóng thực tế
+		pmeta=$(fetch_http_fast "http://${nip}/mesh_node_info.json")
 		if [ -z "$pmeta" ] && [ "${wds_cnt:-0}" -eq 0 ]; then
 			continue
 		fi
 		rmodel=$(printf '%s' "$pmeta" | jsonfilter -e '@.model' 2>/dev/null)
-		rtarget=$(printf '%s' "$pmeta" | jsonfilter -e '@.target' 2>/dev/null)
 		rhost=$(printf '%s' "$pmeta" | jsonfilter -e '@.hostname' 2>/dev/null)
-		rssids=$(printf '%s' "$pmeta" | jsonfilter -e '@.ssids' 2>/dev/null)
-		rclients=$(printf '%s' "$pmeta" | jsonfilter -e '@.clients' 2>/dev/null | tr -cd '0-9')
-		ruptime=$(printf '%s' "$pmeta" | jsonfilter -e '@.uptime' 2>/dev/null)
-
-		sig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2; exit}')
-		rate=$(printf '%s\n' "$wds_dump" | sed -n 's/.*tx bitrate: \([0-9.]* [A-Za-z/]*\).*/\1/p' | head -n 1)
-		local link_type="Sóng Mesh 5GHz WDS" sig_lbl="Đang kết nối"
-		if [ -n "$sig" ]; then
-			sig_lbl="${sig} dBm"
-			[ -n "$rate" ] && sig_lbl="${sig} dBm • ${rate}"
-		elif [ "${wds_cnt:-0}" -eq 0 ]; then
-			link_type="Mạng Dây / Cầu Nối LAN"
-			sig_lbl="Full-Duplex Online"
-		fi
-
-		peer_count=$((peer_count + 1))
-		[ -z "$rmodel" ] && rmodel="Thiết Bị Phụ #${peer_count}"
-		[ -z "$rhost" ] && rhost="DOANDUY-NODE-${peer_count}"
-		local item="{\"ip\":\"$nip\",\"mac\":\"$(json_esc "${nmac:-NODE}")\",\"name\":\"$(json_esc "$rhost")\",\"model\":\"$(json_esc "$rmodel")\",\"target\":\"$(json_esc "$rtarget")\",\"ssids\":\"$(json_esc "$rssids")\",\"clients\":${rclients:-0},\"uptime\":\"$(json_esc "$ruptime")\",\"link_type\":\"$(json_esc "$link_type")\",\"signal\":\"$(json_esc "$sig_lbl")\",\"url\":\"http://$nip\"}"
-		[ -z "$peer_list" ] && peer_list="$item" || peer_list="${peer_list},${item}"
+		rmbssid=$(printf '%s' "$pmeta" | jsonfilter -e '@.mesh_bssid' 2>/dev/null | tr 'a-z' 'A-Z')
+		rubssid=$(printf '%s' "$pmeta" | jsonfilter -e '@.uplink_bssid' 2>/dev/null | tr 'a-z' 'A-Z')
+		rusig=$(printf '%s' "$pmeta" | jsonfilter -e '@.uplink_signal' 2>/dev/null)
+		[ -z "$rusig" ] && rusig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2 " dBm"; exit}')
+		[ -z "$rusig" ] && rusig="Online"
+		echo "${nip}|${nmac:-NODE}|${rhost}|${rmodel}|${rmbssid}|${rubssid}|${rusig}" >> "$tmp_nodes"
 	done
-	# Nếu có trạm WDS đã liên kết sóng thực tế nhưng chưa kịp cập nhật bảng ARP -> vẫn báo 1 Thiết Bị Phụ đang kết nối
+
+	if [ -f "$tmp_nodes" ]; then
+		while IFS='|' read -r nip nmac rhost rmodel rmbssid rubssid rusig; do
+			[ -n "$nip" ] || continue
+			local parent_ip="192.168.1.1"
+			# Nếu uplink_bssid của máy Phụ này trùng với mesh_bssid (hoặc MAC) của một máy Phụ khác -> Nằm ở Tầng dưới của máy Phụ đó!
+			if [ -n "$rubssid" ] && [ "$rubssid" != "$master_bssid" ]; then
+				local matched_parent
+				matched_parent=$(awk -F'|' -v ub="$rubssid" -v self="$nip" '$1!=self && (($5!="" && $5==ub) || ($2!="" && $2==ub)) {print $1; exit}' "$tmp_nodes")
+				[ -n "$matched_parent" ] && parent_ip="$matched_parent"
+			fi
+			peer_count=$((peer_count + 1))
+			[ -z "$rmodel" ] && rmodel="Router Phụ #${peer_count}"
+			[ -z "$rhost" ] && rhost="DOANDUY"
+			local item="{\"ip\":\"$(json_esc "$nip")\",\"parent_ip\":\"$(json_esc "$parent_ip")\",\"mac\":\"$(json_esc "$nmac")\",\"name\":\"$(json_esc "$rhost")\",\"model\":\"$(json_esc "$rmodel")\",\"signal\":\"$(json_esc "$rusig")\",\"url\":\"http://${nip}\"}"
+			[ -z "$peer_list" ] && peer_list="$item" || peer_list="${peer_list},${item}"
+		done < "$tmp_nodes"
+		rm -f "$tmp_nodes"
+	fi
+
 	if [ "$peer_count" -eq 0 ] && [ "${wds_cnt:-0}" -gt 0 ]; then
-		local wmac wsig wrate wlbl
+		local wmac wsig
 		wmac=$(printf '%s\n' "$wds_dump" | awk '/^Station /{print toupper($2); exit}')
-		wsig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2; exit}')
-		wrate=$(printf '%s\n' "$wds_dump" | sed -n 's/.*tx bitrate: \([0-9.]* [A-Za-z/]*\).*/\1/p' | head -n 1)
-		wlbl="${wsig:--48} dBm"
-		[ -n "$wrate" ] && wlbl="${wlbl} • ${wrate}"
+		wsig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2 " dBm"; exit}')
 		peer_count=1
-		peer_list="{\"ip\":\"192.168.1.10\",\"mac\":\"$(json_esc "${wmac:-WDS-NODE}")\",\"name\":\"DOANDUY-NODE\",\"model\":\"Router Phụ (Đang đồng bộ IP)\",\"target\":\"Mesh WDS\",\"ssids\":\"\",\"clients\":0,\"uptime\":\"Vừa ghép sóng\",\"link_type\":\"Sóng Mesh 5GHz WDS\",\"signal\":\"$(json_esc "$wlbl")\",\"url\":\"http://192.168.1.10\"}"
+		peer_list="{\"ip\":\"192.168.1.10\",\"parent_ip\":\"192.168.1.1\",\"mac\":\"$(json_esc "${wmac:-WDS}")\",\"name\":\"DOANDUY\",\"model\":\"Router Phụ\",\"signal\":\"$(json_esc "${wsig:--45 dBm}")\",\"url\":\"http://192.168.1.10\"}"
 	fi
 	echo "${peer_count}|[${peer_list}]"
 }
 
 refresh_status_cache() {
 	get_mesh_cfg
-	local role radio chan htmode lip lmac lname has_dir=false net_src="Không có mạng" role_disp mesh_act=false pinfo pcnt pjson
-	local bmodel starget dhcp_on=true wan_ip="" ussids ccnt upstr pair_rem searching=false
+	local role radio chan htmode lip lmac lname has_dir=false pinfo pcnt pjson
+	local bmodel pair_rem searching=false mbssid uinfo ubssid usig urate usig_lbl=""
+	MASTER_MODEL_FROM_TOPO=""
+	MASTER_NAME_FROM_TOPO=""
+
 	role=$(get_active_role)
 	pair_rem=$(get_pairing_remaining)
 	radio=$(get_best_mesh_radio)
@@ -691,104 +850,76 @@ refresh_status_cache() {
 	lmac=$(tr 'a-z' 'A-Z' < /sys/class/net/br-lan/address 2>/dev/null || echo "00:00:00:00:00:00")
 	lname=$(uci -q get system.@system[0].hostname || echo "DOANDUY")
 	bmodel=$(cat /tmp/sysinfo/model 2>/dev/null || echo "Router DOANDUY")
-	starget=$(sed -n "s/^DISTRIB_TARGET='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)
-	[ -z "$starget" ] && starget="OpenWrt"
-	[ "$(uci -q get dhcp.lan.ignore)" = "1" ] && dhcp_on=false
-	ussids=$(get_local_wifi_summary)
-	ccnt=$(get_local_client_count)
-	upstr=$(format_uptime_vi)
+	LOCAL_MAC_CACHE="$lmac"
+	LOCAL_NAME_CACHE="$lname"
+	LOCAL_MODEL_CACHE="$bmodel"
+
+	mbssid=$(get_local_mesh_ap_bssid)
+	uinfo=$(get_local_uplink_info)
+	ubssid=$(printf '%s' "$uinfo" | cut -d'|' -f1)
+	usig=$(printf '%s' "$uinfo" | cut -d'|' -f2)
+	urate=$(printf '%s' "$uinfo" | cut -d'|' -f3)
+	if [ -n "$usig" ]; then
+		usig_lbl="${usig} dBm"
+		[ -n "$urate" ] && usig_lbl="${usig_lbl} • ${urate}"
+	fi
 
 	if check_direct_internet; then
 		has_dir=true
-		net_src="Trực tiếp: ${DIRECT_SRC}"
-		local wan_l3
-		wan_l3=$(printf '%s' "$DIRECT_SRC" | sed -n 's/.*(\([^)]*\)).*/\1/p')
-		[ -z "$wan_l3" ] && wan_l3="$DIRECT_SRC"
-		wan_ip=$(ip -4 addr show dev "$wan_l3" 2>/dev/null | awk '/inet /{split($2,a,"/"); print a[1]; exit}')
 	elif [ "$role" = "node" ] && ping -c 1 -W 1 192.168.1.1 >/dev/null 2>&1; then
 		has_dir=true
-		net_src="Qua sóng Mesh từ Router Chính (192.168.1.1)"
 	fi
 
 	cat <<EOF > /tmp/mesh_node_info.json.tmp
-{"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","target":"$(json_esc "$starget")","ip":"$(json_esc "$lip")","ssids":"$(json_esc "$ussids")","clients":${ccnt:-0},"uptime":"$(json_esc "$upstr")"}
+{"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","ip":"$(json_esc "$lip")","mac":"$(json_esc "$lmac")","mesh_bssid":"$(json_esc "$mbssid")","uplink_bssid":"$(json_esc "$ubssid")","uplink_signal":"$(json_esc "$usig_lbl")"}
 EOF
 	mv -f /tmp/mesh_node_info.json.tmp /tmp/mesh_node_info.json 2>/dev/null || true
 	[ -L /www/mesh_node_info.json ] || ln -sf /tmp/mesh_node_info.json /www/mesh_node_info.json 2>/dev/null || true
 
-	pinfo=$(get_mesh_peers_json "$role" "$lip")
+	pinfo=$(get_mesh_peers_json "$role" "$lip" "$mbssid")
 	pcnt="${pinfo%%|*}"
 	pjson="${pinfo#*|}"
 	[ -z "$pjson" ] && pjson="[]"
 
-	if [ "${pair_rem:-0}" -gt 0 ] && [ "${pcnt:-0}" -eq 0 ]; then
+	if [ "${pair_rem:-0}" -gt 0 ] && [ "${pcnt:-0}" -eq 0 ] && [ "$role" != "node" ]; then
+		searching=true
+	elif [ "$role" = "searching_node" ]; then
 		searching=true
 	fi
 
-	case "$role" in
-		controller)
-			mesh_act=true
-			if [ "${pcnt:-0}" -gt 0 ]; then
-				role_disp="ROUTER CHÍNH (${lip} • Đang kết nối ${pcnt} Router Phụ)"
-			else
-				role_disp="ROUTER CHÍNH (${lip} • Đang phát sóng tìm Mesh...)"
-			fi
-			;;
-		node)
-			mesh_act=true
-			role_disp="ROUTER PHỤ (${lip} • Kết nối vào Router Chính 192.168.1.1)"
-			;;
-		searching_node)
-			mesh_act=true
-			searching=true
-			role_disp="ĐANG DÒ SÓNG MESH (${lip} • Tự nhận Router Phụ khi thấy sóng)"
-			;;
-		auto_idle)
-			mesh_act=false
-			role_disp="ROUTER ĐỘC LẬP (${lip} • Đã tự tắt dò Mesh sau 5 phút)"
-			;;
-		*)
-			mesh_act=false
-			role_disp="ROUTER ĐỘC LẬP (${lip} • Đã tắt Mesh)"
-			;;
-	esac
+	local master_model="$bmodel" master_name="$lname"
+	if [ "$role" = "node" ]; then
+		master_model="${MASTER_MODEL_FROM_TOPO:-Router Chính}"
+		master_name="${MASTER_NAME_FROM_TOPO:-DOANDUY}"
+	fi
 
 	cat <<EOF > "${CACHE_FILE}.tmp"
 {
   "success": true,
   "ts": $(date +%s),
   "enabled": $([ "$CFG_ENABLED" = "1" ] && echo true || echo false),
-  "mode": "$(json_esc "$CFG_MODE")",
   "role": "$(json_esc "$role")",
-  "role_display": "$(json_esc "$role_disp")",
-  "mesh_active": $mesh_act,
   "searching": $searching,
   "search_remaining": ${pair_rem:-0},
   "mesh_ssid": "$(json_esc "$CFG_SSID")",
-  "radio": "$(json_esc "$radio")",
   "channel": "$(json_esc "$chan")",
   "htmode": "$(json_esc "$htmode")",
   "local_ip": "$(json_esc "$lip")",
-  "rescue_ip": "$RESCUE_IP",
   "local_mac": "$(json_esc "$lmac")",
   "local_name": "$(json_esc "$lname")",
   "board_model": "$(json_esc "$bmodel")",
-  "soc_target": "$(json_esc "$starget")",
-  "dhcp_enabled": $dhcp_on,
-  "wan_ip": "$(json_esc "$wan_ip")",
-  "user_ssids": "$(json_esc "$ussids")",
-  "client_count": ${ccnt:-0},
-  "uptime_str": "$(json_esc "$upstr")",
+  "master_ip": "192.168.1.1",
+  "master_model": "$(json_esc "$master_model")",
+  "master_name": "$(json_esc "$master_name")",
   "has_internet": $has_dir,
-  "internet_source": "$(json_esc "$net_src")",
   "peer_count": ${pcnt:-0},
   "peers": $pjson
 }
 EOF
 	mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE" 2>/dev/null
+	[ -L /www/mesh_topology.json ] || ln -sf "$CACHE_FILE" /www/mesh_topology.json 2>/dev/null || true
 }
 
-# Bước tự động phân vai thông minh theo cửa sổ 5 phút (khởi động hoặc bấm nút Mesh)
 reconcile_once() {
 	get_mesh_cfg
 	if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ]; then
@@ -800,25 +931,6 @@ reconcile_once() {
 		return 0
 	fi
 
-	if [ "$CFG_MODE" = "controller" ]; then
-		rm -f "$IDLE_FLAG_FILE"
-		apply_controller_role
-		refresh_status_cache
-		return 0
-	fi
-
-	if [ "$CFG_MODE" = "node" ]; then
-		rm -f "$IDLE_FLAG_FILE"
-		if scan_for_master_mesh; then
-			apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$CFG_NODE_IP"
-		else
-			apply_node_role "$CFG_SSID" "36" "$CFG_NODE_IP"
-		fi
-		refresh_status_cache
-		return 0
-	fi
-
-	# CHẾ ĐỘ AUTO THÔNG MINH (Khởi động dò 5 phút -> Có đôi thì giữ Mesh, không có ai thì tự tắt!)
 	if [ -f "$IDLE_FLAG_FILE" ]; then
 		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
 			restore_default_standalone "auto"
@@ -827,16 +939,17 @@ reconcile_once() {
 		return 0
 	fi
 
-	local cur_role rem now_s lost_first pinfo pcnt lip
+	local cur_role rem now_s lost_first pinfo pcnt lip mbssid
 	cur_role=$(get_active_role)
 	rem=$(get_pairing_remaining)
 	now_s=$(date +%s)
 
-	# 1. Thiết bị CÓ MẠNG Internet gốc (5G hoặc WAN dây) -> Đóng vai ROUTER CHÍNH
+	# 1. Thiết bị CÓ MẠNG gốc (5G hoặc WAN dây) -> Tự động làm ROUTER CHÍNH (192.168.1.1)
 	if check_direct_internet; then
 		if [ "$cur_role" = "controller" ]; then
 			lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
-			pinfo=$(get_mesh_peers_json "controller" "$lip")
+			mbssid=$(get_local_mesh_ap_bssid)
+			pinfo=$(get_mesh_peers_json "controller" "$lip" "$mbssid")
 			pcnt="${pinfo%%|*}"
 			if [ "${pcnt:-0}" -gt 0 ]; then
 				touch "$HAD_PEER_FILE"
@@ -850,7 +963,7 @@ reconcile_once() {
 					touch "$IDLE_FLAG_FILE"
 					rm -f "$PAIR_UNTIL_FILE"
 					restore_default_standalone "auto"
-					log_mesh "Sau 5 phút không có Router Phụ kết nối -> Tự động tắt sóng dò Mesh (Chạy Độc Lập)."
+					log_mesh "Sau 5 phút không có thiết bị Mesh kết nối -> Tự động tắt sóng dò Mesh."
 				fi
 			fi
 		elif [ "$rem" -gt 0 ]; then
@@ -863,11 +976,13 @@ reconcile_once() {
 		return 0
 	fi
 
-	# 2. Thiết bị KHÔNG CÓ MẠNG gốc:
+	# 2. Thiết bị KHÔNG CÓ MẠNG gốc -> Tự động làm ROUTER PHỤ (192.168.1.10, 11, 12...)
 	if [ "$cur_role" = "node" ]; then
 		if ping -c 2 -W 1 192.168.1.1 >/dev/null 2>&1; then
 			rm -f "$LOST_TS_FILE" "$PAIR_UNTIL_FILE"
 			touch "$HAD_PEER_FILE"
+			# Bật tiếp sóng Mesh trên Router Phụ đã thông mạng để cho phép Phụ khác nối tiếp vào tầng dưới
+			ensure_node_relay_ap
 		else
 			[ -f "$LOST_TS_FILE" ] || echo "$now_s" > "$LOST_TS_FILE"
 			lost_first=$(cat "$LOST_TS_FILE" 2>/dev/null || echo "$now_s")
@@ -875,20 +990,19 @@ reconcile_once() {
 				rm -f "$HAD_PEER_FILE"
 				restore_default_standalone "auto"
 				start_pairing_window "$PAIR_WINDOW_SEC"
-				log_mesh "Mất kết nối Router Chính quá 30s -> Đã về IP mặc định 192.168.1.1 và dò lại trong 5 phút!"
+				log_mesh "Hết Mesh quá 30s -> Đã khôi phục IP mặc định 192.168.1.1 và dò lại trong 5 phút!"
 			fi
 		fi
 		refresh_status_cache
 		return 0
 	fi
 
-	# Đang chưa có mạng và chưa là Node -> Nếu còn trong 5 phút thì quét tìm sóng Router Chính
 	if [ "$rem" -gt 0 ]; then
 		if scan_for_master_mesh; then
-			log_mesh "Phát hiện sóng Router Chính ($FOUND_MESH_SSID kênh $FOUND_MESH_CHAN) -> Tự động ghép làm Router Phụ ($CFG_NODE_IP)!"
+			log_mesh "Phát hiện sóng mạnh nhất ($FOUND_MESH_SSID kênh $FOUND_MESH_CHAN BSSID $FOUND_MESH_BSSID) -> Tự động ghép làm Router Phụ!"
 			rm -f "$PAIR_UNTIL_FILE"
 			touch "$HAD_PEER_FILE"
-			apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$CFG_NODE_IP"
+			apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$FOUND_MESH_BSSID"
 		else
 			if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
 				restore_default_standalone "auto"
@@ -898,7 +1012,7 @@ reconcile_once() {
 		touch "$IDLE_FLAG_FILE"
 		rm -f "$PAIR_UNTIL_FILE"
 		restore_default_standalone "auto"
-		log_mesh "Sau 5 phút tìm kiếm không thấy Router Chính -> Tự động tắt dò Mesh (Giữ IP mặc định 192.168.1.1)."
+		log_mesh "Sau 5 phút không tìm thấy thiết bị Mesh -> Tự động tắt dò Mesh (IP mặc định 192.168.1.1)."
 	fi
 	refresh_status_cache
 }
@@ -907,16 +1021,17 @@ run_daemon() {
 	mkdir -p /var/lock
 	exec 205>"$LOCK_FILE"
 	flock -n 205 2>/dev/null || exit 0
-	# Chờ 25s sau khi khởi động để card Wi-Fi & trình quay số 5G lên mạng ổn định trước khi mở cửa sổ Mesh 5 phút
 	local up_s
 	up_s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 99)
 	if [ "${up_s:-99}" -lt 25 ]; then
 		sleep $((25 - up_s))
 	fi
 	get_mesh_cfg
-	if [ "$CFG_ENABLED" = "1" ] && [ "$CFG_MODE" = "auto" ]; then
+	if [ "$CFG_ENABLED" = "1" ]; then
+		uci set "${MESH_UCI}.mesh.mode=auto"
+		uci commit "$MESH_UCI"
 		start_pairing_window "$PAIR_WINDOW_SEC"
-		log_mesh "Khởi động Auto-Mesh -> Tự động bật phát sóng & tìm kiếm thiết bị Mesh trong 5 phút (300s)!"
+		log_mesh "Khởi động Auto-Mesh -> Tự động bật tìm kiếm & ghép nối Mesh công suất cao nhất trong 5 phút!"
 	fi
 	while true; do
 		reconcile_once >/dev/null 2>&1 || true
@@ -935,37 +1050,17 @@ case "$1" in
 	daemon|watchdog)
 		run_daemon
 		;;
-	auto|pair|reconcile)
+	auto|pair|on|start|reconcile)
 		ensure_mesh_uci
 		uci set "${MESH_UCI}.mesh.enabled=1"
 		uci set "${MESH_UCI}.mesh.mode=auto"
 		uci commit "$MESH_UCI"
 		start_pairing_window "$PAIR_WINDOW_SEC"
-		log_mesh "Người dùng bấm kích hoạt tìm kiếm & ghép nối Mesh trong 5 phút (300s)!"
+		log_mesh "Bật Auto-Mesh -> Phát sóng công suất tối đa & tìm ghép nối trong 5 phút!"
 		reconcile_once
 		cat "$CACHE_FILE" 2>/dev/null || echo '{"success":true,"searching":true}'
 		;;
-	controller|master|set_controller)
-		ensure_mesh_uci
-		rm -f "$IDLE_FLAG_FILE" "$PAIR_UNTIL_FILE"
-		uci set "${MESH_UCI}.mesh.enabled=1"
-		uci set "${MESH_UCI}.mesh.mode=controller"
-		uci commit "$MESH_UCI"
-		apply_controller_role
-		refresh_status_cache
-		cat "$CACHE_FILE" 2>/dev/null
-		;;
-	node|slave|set_node)
-		ensure_mesh_uci
-		rm -f "$IDLE_FLAG_FILE" "$PAIR_UNTIL_FILE"
-		[ -n "$2" ] && uci set "${MESH_UCI}.mesh.node_ip=$2"
-		uci set "${MESH_UCI}.mesh.enabled=1"
-		uci set "${MESH_UCI}.mesh.mode=node"
-		uci commit "$MESH_UCI"
-		reconcile_once
-		cat "$CACHE_FILE" 2>/dev/null
-		;;
-	unmesh|stop|reset)
+	unmesh|off|stop|reset)
 		rm -f "$IDLE_FLAG_FILE" "$PAIR_UNTIL_FILE" "$HAD_PEER_FILE"
 		restore_default_standalone "disabled"
 		refresh_status_cache
@@ -979,7 +1074,7 @@ case "$1" in
 			[ $((now_t - ${m_t:-0})) -gt 6 ] && ( /usr/bin/auto_mesh refresh_cache >/dev/null 2>&1 & )
 		else
 			refresh_status_cache
-			cat "$CACHE_FILE" 2>/dev/null || echo '{"success":true,"mesh_active":false}'
+			cat "$CACHE_FILE" 2>/dev/null || echo '{"success":true,"enabled":false}'
 		fi
 		;;
 	refresh_cache)
