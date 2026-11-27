@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.1)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.2)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -788,6 +788,14 @@ flush_secondary_node_ips() {
 	done
 }
 
+# Xóa sạch mọi IP 192.168.1.x (kể cả 192.168.1.1 và .254 còn sót) khỏi br-lan khi làm Router Phụ
+flush_brlan_master_subnet() {
+	local ip_cidr
+	for ip_cidr in $(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet 192\.168\.1\./{print $2}'); do
+		ip addr del "$ip_cidr" dev br-lan 2>/dev/null || true
+	done
+}
+
 start_pairing_window() {
 	local dur="${1:-$PAIR_WINDOW_SEC}"
 	rm -f "$IDLE_FLAG_FILE" "$LOST_TS_FILE"
@@ -1114,7 +1122,6 @@ apply_controller_role() {
 	if [ "$net_changed" = "1" ]; then
 		flush_secondary_node_ips
 		ip addr add 192.168.1.1/24 dev br-lan 2>/dev/null || true
-		ip addr add "${RESCUE_IP}/24" dev br-lan 2>/dev/null || true
 		ip route del default via 192.168.1.1 dev br-lan 2>/dev/null || true
 		/etc/init.d/network reload >/dev/null 2>&1 || true
 		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
@@ -1194,9 +1201,16 @@ ensure_node_relay_ap() {
 	target_ssid="${CFG_SSID}_R"
 	target_key="$CFG_KEY"
 
-	# Auto-pause user APs sharing uplink_radio only after 20s reload grace and real dead-AP proof (avoid false trigger on healthy dual-band APs)
-	if [ -f "$HAD_PEER_FILE" ]; then
-		local now_ap last_ap uap uap_if op_ap car_ap iwi_ap dead_uap
+	# Kiểm tra uplink STA đã thực sự lên carrier=1 trước khi đánh giá AP lỗi (tránh tắt nhầm AP khi đang reconnect)
+	local sta_if uplink_up=0
+	sta_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${uplink_radio}.interfaces[@.section='mesh_sta'].ifname" 2>/dev/null | head -n 1)
+	if [ -n "$sta_if" ] && [ -d "/sys/class/net/$sta_if" ] && [ "$(cat "/sys/class/net/${sta_if}/carrier" 2>/dev/null)" = "1" ]; then
+		uplink_up=1
+	fi
+
+	# Auto-pause user APs sharing uplink_radio only after 20s reload grace, uplink_up=1, and 3 consecutive dead checks
+	if [ -f "$HAD_PEER_FILE" ] && [ "$uplink_up" = "1" ]; then
+		local now_ap last_ap uap uap_if op_ap car_ap iwi_ap dead_uap dc_u
 		now_ap=$(date +%s)
 		last_ap=$(cat "$LAST_RELOAD_FILE" 2>/dev/null || echo 0)
 		if [ $((now_ap - ${last_ap:-0})) -ge 20 ]; then
@@ -1215,11 +1229,19 @@ ensure_node_relay_ap() {
 					iwi_ap=$(iwinfo "$uap_if" info 2>/dev/null)
 					printf '%s' "$iwi_ap" | grep -qE 'Channel: 0|Tx-Power: 0 dBm|HT Mode: NOHT' && dead_uap=1
 					if [ "$dead_uap" = "1" ]; then
-						uci set "wireless.${uap}.disabled=1"
-						mkdir -p /etc/config 2>/dev/null
-						grep -qx "$uap" "$PAUSED_APS_FILE" 2>/dev/null || echo "$uap" >> "$PAUSED_APS_FILE"
-						changed=1
-						log_mesh "Radio $uplink_radio ($uap_if) không hỗ trợ STA+AP đồng thời -> Tạm ẩn AP '$uap' để dứt lỗi hostapd & giữ max băng thông."
+						dc_u=$(cat "/tmp/doanduy_mesh_dead_cnt_${uap}" 2>/dev/null || echo 0)
+						dc_u=$((dc_u + 1))
+						echo "$dc_u" > "/tmp/doanduy_mesh_dead_cnt_${uap}" 2>/dev/null || true
+						if [ "$dc_u" -ge 3 ]; then
+							uci set "wireless.${uap}.disabled=1"
+							mkdir -p /etc/config 2>/dev/null
+							grep -qx "$uap" "$PAUSED_APS_FILE" 2>/dev/null || echo "$uap" >> "$PAUSED_APS_FILE"
+							rm -f "/tmp/doanduy_mesh_dead_cnt_${uap}"
+							changed=1
+							log_mesh "Radio $uplink_radio ($uap_if) không hỗ trợ STA+AP đồng thời -> Tạm ẩn AP '$uap' để dứt lỗi hostapd & giữ max băng thông."
+						fi
+					else
+						rm -f "/tmp/doanduy_mesh_dead_cnt_${uap}"
 					fi
 				fi
 			done
@@ -1232,12 +1254,12 @@ ensure_node_relay_ap() {
 		return 0
 	fi
 
-	# Nếu driver/phần cứng từ chối phát Relay AP cùng kênh 160MHz với STA (NO-CARRIER / Channel 0), tắt thay vì tạo AP chết hoặc hạ xuống 80MHz
+	# Nếu driver/phần cứng từ chối phát Relay AP cùng kênh 160MHz với STA (NO-CARRIER / Channel 0), tắt thay vì tạo AP chết (sau 3 lần lỗi liên tiếp khi uplink UP)
 	if [ "$radio" = "$uplink_radio" ] && [ -f "/tmp/doanduy_mesh_relay_blocked_${radio}" ]; then
 		return 0
 	fi
-	if [ "$radio" = "$uplink_radio" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.device)" = "$radio" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" != "1" ]; then
-		local rts now_s rap_if dead_ap=0
+	if [ "$radio" = "$uplink_radio" ] && [ "$uplink_up" = "1" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.device)" = "$radio" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" != "1" ]; then
+		local rts now_s rap_if dead_ap=0 op_r car_r dc_r
 		now_s=$(date +%s)
 		if [ ! -f /tmp/doanduy_mesh_relay_ts ]; then
 			echo "$now_s" > /tmp/doanduy_mesh_relay_ts 2>/dev/null || true
@@ -1246,16 +1268,27 @@ ensure_node_relay_ap() {
 		if [ "${rts:-0}" -gt 0 ] && [ $((now_s - rts)) -ge 12 ]; then
 			rap_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${radio}.interfaces[@.section='mesh_backhaul_ap'].ifname" 2>/dev/null | head -n 1)
 			if [ -n "$rap_if" ] && [ -d "/sys/class/net/$rap_if" ]; then
-				[ "$(cat "/sys/class/net/${rap_if}/carrier" 2>/dev/null)" = "0" ] && dead_ap=1
+				op_r=$(cat "/sys/class/net/${rap_if}/operstate" 2>/dev/null || echo "")
+				car_r=$(cat "/sys/class/net/${rap_if}/carrier" 2>/dev/null || echo "")
+				[ "$op_r" = "down" ] && dead_ap=1
+				[ "$car_r" = "0" ] && [ "$op_r" != "up" ] && dead_ap=1
 				iwinfo "$rap_if" info 2>/dev/null | grep -q 'Channel: 0' && dead_ap=1
 			fi
 			if [ "$dead_ap" = "1" ]; then
-				uci -q delete wireless.mesh_backhaul_ap
-				uci commit wireless
-				safe_wifi_reload 1
-				touch "/tmp/doanduy_mesh_relay_blocked_${radio}"
-				log_mesh "Radio $radio ($rap_if) không hỗ trợ STA+AP đồng thời ở HE160 -> Tắt Relay AP để giữ Uplink 4804 Mbps tối đa."
-				return 0
+				dc_r=$(cat "/tmp/doanduy_mesh_dead_cnt_relay_${radio}" 2>/dev/null || echo 0)
+				dc_r=$((dc_r + 1))
+				echo "$dc_r" > "/tmp/doanduy_mesh_dead_cnt_relay_${radio}" 2>/dev/null || true
+				if [ "$dc_r" -ge 3 ]; then
+					uci -q delete wireless.mesh_backhaul_ap
+					uci commit wireless
+					safe_wifi_reload 1
+					touch "/tmp/doanduy_mesh_relay_blocked_${radio}"
+					rm -f "/tmp/doanduy_mesh_dead_cnt_relay_${radio}"
+					log_mesh "Radio $radio ($rap_if) không hỗ trợ STA+AP đồng thời ở HE160 -> Tắt Relay AP để giữ Uplink 4804 Mbps tối đa."
+					return 0
+				fi
+			else
+				rm -f "/tmp/doanduy_mesh_dead_cnt_relay_${radio}"
 			fi
 		fi
 	fi
@@ -1555,7 +1588,8 @@ apply_node_role() {
 	fi
 
 	if [ "$net_changed" = "1" ]; then
-		( sleep 1; /etc/init.d/network reload >/dev/null 2>&1; /etc/init.d/dnsmasq restart >/dev/null 2>&1; /etc/init.d/dropbear restart >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+		flush_brlan_master_subnet
+		( sleep 1; /etc/init.d/network reload >/dev/null 2>&1; flush_brlan_master_subnet; /etc/init.d/dnsmasq restart >/dev/null 2>&1; /etc/init.d/dropbear restart >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
 		log_mesh "Thiết lập ROUTER PHỤ 3-Addr Mesh (Uplink ${target_ip}, LAN ${sub_lan_ip}, kênh $target_chan, ưu tiên ${target_bssid:-auto})."
 	fi
 
@@ -1568,7 +1602,7 @@ apply_node_role() {
 restore_default_standalone() {
 	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0 fw_changed=0
 	ensure_mesh_uci
-	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done
+	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done /tmp/doanduy_mesh_dead_cnt_*
 	[ "$(restore_paused_user_aps)" = "1" ] && wifi_changed=1
 	if [ "$mode_after" = "disabled" ]; then
 		uci set "${MESH_UCI}.mesh.enabled=0"
@@ -1637,7 +1671,6 @@ restore_default_standalone() {
 	if [ "$net_changed" = "1" ]; then
 		flush_secondary_node_ips
 		ip addr add 192.168.1.1/24 dev br-lan 2>/dev/null || true
-		ip addr add "${RESCUE_IP}/24" dev br-lan 2>/dev/null || true
 		ip route del default via 192.168.1.1 dev br-lan 2>/dev/null || true
 		/etc/init.d/network reload >/dev/null 2>&1 || true
 		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
@@ -2120,8 +2153,19 @@ reconcile_once() {
 
 	# 2. Thiết bị KHÔNG CÓ MẠNG gốc -> Tự động làm ROUTER PHỤ (192.168.1.10, 11, 12...)
 	if [ "$cur_role" = "node" ]; then
+		[ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] && flush_brlan_master_subnet
 		up_gw=$(get_upstream_gateway)
+		local up_ok=0 up_dev
 		if ping -c 2 -W 1 "$up_gw" >/dev/null 2>&1; then
+			up_ok=1
+		else
+			up_dev=$(ubus call network.interface.mesh_uplink status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+			if [ -n "$up_dev" ] && [ "$(cat "/sys/class/net/${up_dev}/carrier" 2>/dev/null)" = "1" ]; then
+				command -v arping >/dev/null 2>&1 && arping -U -I "$up_dev" -c 2 "$(get_node_ip)" >/dev/null 2>&1 || true
+				ping -c 1 -W 1 "$up_gw" >/dev/null 2>&1 && up_ok=1
+			fi
+		fi
+		if [ "$up_ok" = "1" ]; then
 			is_epoch_current "$my_epoch" || return 0
 			rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" "$PAIR_UNTIL_FILE" "$SCAN_MISS_FILE"
 			verify_unique_node_ip
