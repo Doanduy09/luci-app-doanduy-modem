@@ -19,13 +19,13 @@ case "$1" in
 				mode=$(printf '%s' "$input" | jsonfilter -e '$.mode' 2>/dev/null | tr -cd 'a-z_')
 				nip=$(printf '%s' "$input" | jsonfilter -e '$.node_ip' 2>/dev/null | tr -cd '0-9.')
 				case "$mode" in
-					auto)
-						( setsid /usr/bin/auto_mesh auto </dev/null >/dev/null 2>&1 & )
-						echo '{"success":true,"message":"Đã bật Auto-Mesh Tự Động! Router có mạng làm Chính (192.168.1.1), không mạng tự ghép làm Phụ (192.168.1.10)."}'
+					pair|auto)
+						( setsid /usr/bin/auto_mesh pair </dev/null >/dev/null 2>&1 & )
+						echo '{"success":true,"message":"Đã bật phát sóng & tìm kiếm Mesh trong 5 phút! Máy có mạng làm Router Chính (192.168.1.1), máy không mạng làm Router Phụ (192.168.1.10); sau 5 phút nếu không có máy ghép sẽ tự tắt."}'
 						;;
 					controller)
 						( setsid /usr/bin/auto_mesh controller </dev/null >/dev/null 2>&1 & )
-						echo '{"success":true,"message":"Đang thiết lập làm Router Chính (192.168.1.1, DHCP BẬT, phát sóng DOANDUY_MESH)..."}'
+						echo '{"success":true,"message":"Đang thiết lập cố định làm Router Chính (192.168.1.1, DHCP BẬT, phát sóng DOANDUY_MESH)..."}'
 						;;
 					node)
 						[ -n "$nip" ] || nip="192.168.1.10"

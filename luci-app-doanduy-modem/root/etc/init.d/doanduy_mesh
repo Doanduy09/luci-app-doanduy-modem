@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# DOANDUY Universal Auto-Mesh Procd Service (Chính 192.168.1.1 <-> Phụ 192.168.1.10)
+# DOANDUY Universal Auto-Mesh Procd Service (5-Min Auto-Pair | Chính 192.168.1.1 <-> Phụ 192.168.1.10)
 
 USE_PROCD=1
 START=99
@@ -13,4 +13,11 @@ start_service() {
 	procd_set_param stdout 0
 	procd_set_param stderr 0
 	procd_close_instance
+}
+
+stop_service() {
+	local pid
+	for pid in $(pgrep -f "/usr/bin/auto_mesh daemon" 2>/dev/null); do
+		[ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
+	done
 }

@@ -14,6 +14,10 @@ CACHE_FILE="/tmp/auto_mesh_status.json"
 LOG_FILE="/tmp/auto_mesh.log"
 LOCK_FILE="/var/lock/doanduy_auto_mesh.lock"
 LOST_TS_FILE="/tmp/doanduy_mesh_lost_ts"
+PAIR_UNTIL_FILE="/tmp/doanduy_mesh_pair_until"
+IDLE_FLAG_FILE="/tmp/doanduy_mesh_auto_idle"
+HAD_PEER_FILE="/tmp/doanduy_mesh_had_peer"
+PAIR_WINDOW_SEC=300
 DEFAULT_MESH_SSID="DOANDUY_MESH"
 DEFAULT_MESH_KEY="DoanduyMesh@2026!Sec"
 LEGACY_MESH_SSID="SysMesh_Athena"
@@ -178,9 +182,28 @@ pick_free_node_ip() {
 	echo "$pref"
 }
 
+start_pairing_window() {
+	local dur="${1:-$PAIR_WINDOW_SEC}"
+	rm -f "$IDLE_FLAG_FILE" "$LOST_TS_FILE"
+	echo $(( $(date +%s) + dur )) > "$PAIR_UNTIL_FILE"
+}
+
+get_pairing_remaining() {
+	[ -f "$PAIR_UNTIL_FILE" ] || { echo 0; return 0; }
+	local until now_s rem
+	until=$(cat "$PAIR_UNTIL_FILE" 2>/dev/null || echo 0)
+	now_s=$(date +%s)
+	rem=$((until - now_s))
+	[ "$rem" -gt 0 ] && echo "$rem" || echo 0
+}
+
 get_active_role() {
 	get_mesh_cfg
 	[ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ] && { echo "standalone"; return 0; }
+	if [ "$CFG_MODE" = "auto" ] && [ -f "$IDLE_FLAG_FILE" ]; then
+		echo "auto_idle"
+		return 0
+	fi
 	if [ -n "$(uci -q get wireless.mesh_sta)" ] && [ "$(uci -q get wireless.mesh_sta.disabled)" != "1" ]; then
 		echo "node"
 		return 0
@@ -193,7 +216,11 @@ get_active_role() {
 		echo "controller"
 		return 0
 	fi
-	echo "standalone_waiting"
+	if [ "$(get_pairing_remaining)" -gt 0 ]; then
+		echo "searching_node"
+		return 0
+	fi
+	echo "auto_idle"
 }
 
 configure_roaming_on_user_aps() {
@@ -637,14 +664,26 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 		local item="{\"ip\":\"$nip\",\"mac\":\"$(json_esc "${nmac:-NODE}")\",\"name\":\"$(json_esc "$rhost")\",\"model\":\"$(json_esc "$rmodel")\",\"target\":\"$(json_esc "$rtarget")\",\"ssids\":\"$(json_esc "$rssids")\",\"clients\":${rclients:-0},\"uptime\":\"$(json_esc "$ruptime")\",\"link_type\":\"$(json_esc "$link_type")\",\"signal\":\"$(json_esc "$sig_lbl")\",\"url\":\"http://$nip\"}"
 		[ -z "$peer_list" ] && peer_list="$item" || peer_list="${peer_list},${item}"
 	done
+	# Nếu có trạm WDS đã liên kết sóng thực tế nhưng chưa kịp cập nhật bảng ARP -> vẫn báo 1 Thiết Bị Phụ đang kết nối
+	if [ "$peer_count" -eq 0 ] && [ "${wds_cnt:-0}" -gt 0 ]; then
+		local wmac wsig wrate wlbl
+		wmac=$(printf '%s\n' "$wds_dump" | awk '/^Station /{print toupper($2); exit}')
+		wsig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2; exit}')
+		wrate=$(printf '%s\n' "$wds_dump" | sed -n 's/.*tx bitrate: \([0-9.]* [A-Za-z/]*\).*/\1/p' | head -n 1)
+		wlbl="${wsig:--48} dBm"
+		[ -n "$wrate" ] && wlbl="${wlbl} • ${wrate}"
+		peer_count=1
+		peer_list="{\"ip\":\"192.168.1.10\",\"mac\":\"$(json_esc "${wmac:-WDS-NODE}")\",\"name\":\"DOANDUY-NODE\",\"model\":\"Router Phụ (Đang đồng bộ IP)\",\"target\":\"Mesh WDS\",\"ssids\":\"\",\"clients\":0,\"uptime\":\"Vừa ghép sóng\",\"link_type\":\"Sóng Mesh 5GHz WDS\",\"signal\":\"$(json_esc "$wlbl")\",\"url\":\"http://192.168.1.10\"}"
+	fi
 	echo "${peer_count}|[${peer_list}]"
 }
 
 refresh_status_cache() {
 	get_mesh_cfg
 	local role radio chan htmode lip lmac lname has_dir=false net_src="Không có mạng" role_disp mesh_act=false pinfo pcnt pjson
-	local bmodel starget dhcp_on=true wan_ip="" ussids ccnt upstr
+	local bmodel starget dhcp_on=true wan_ip="" ussids ccnt upstr pair_rem searching=false
 	role=$(get_active_role)
+	pair_rem=$(get_pairing_remaining)
 	radio=$(get_best_mesh_radio)
 	chan=$(uci -q get "wireless.${radio}.channel" || echo "36")
 	htmode=$(uci -q get "wireless.${radio}.htmode" || echo "HE160")
@@ -671,45 +710,60 @@ refresh_status_cache() {
 		net_src="Qua sóng Mesh từ Router Chính (192.168.1.1)"
 	fi
 
-	# Xuất file thông tin công khai nhẹ trên RAM (/tmp -> /www/mesh_node_info.json) để các cục Mesh nhận diện tên/model của nhau
 	cat <<EOF > /tmp/mesh_node_info.json.tmp
 {"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","target":"$(json_esc "$starget")","ip":"$(json_esc "$lip")","ssids":"$(json_esc "$ussids")","clients":${ccnt:-0},"uptime":"$(json_esc "$upstr")"}
 EOF
 	mv -f /tmp/mesh_node_info.json.tmp /tmp/mesh_node_info.json 2>/dev/null || true
 	[ -L /www/mesh_node_info.json ] || ln -sf /tmp/mesh_node_info.json /www/mesh_node_info.json 2>/dev/null || true
 
-	case "$role" in
-		controller)
-			mesh_act=true
-			role_disp="👑 ROUTER CHÍNH (${lip} • DHCP BẬT • Đang phát ${CFG_SSID})"
-			;;
-		node)
-			mesh_act=true
-			role_disp="📡 THIẾT BỊ PHỤ (${lip} • Nhận mạng từ 192.168.1.1)"
-			;;
-		standalone_waiting)
-			mesh_act=true
-			role_disp="🔍 ĐỘC LẬP CHỜ MESH (${lip} • Tự động nối khi có Router Chính)"
-			;;
-		*)
-			mesh_act=false
-			role_disp="⚪ ĐỘC LẬP (Đã tắt Auto-Mesh • ${lip})"
-			;;
-	esac
-
 	pinfo=$(get_mesh_peers_json "$role" "$lip")
 	pcnt="${pinfo%%|*}"
 	pjson="${pinfo#*|}"
 	[ -z "$pjson" ] && pjson="[]"
 
+	if [ "${pair_rem:-0}" -gt 0 ] && [ "${pcnt:-0}" -eq 0 ]; then
+		searching=true
+	fi
+
+	case "$role" in
+		controller)
+			mesh_act=true
+			if [ "${pcnt:-0}" -gt 0 ]; then
+				role_disp="ROUTER CHÍNH (${lip} • Đang kết nối ${pcnt} Router Phụ)"
+			else
+				role_disp="ROUTER CHÍNH (${lip} • Đang phát sóng tìm Mesh...)"
+			fi
+			;;
+		node)
+			mesh_act=true
+			role_disp="ROUTER PHỤ (${lip} • Kết nối vào Router Chính 192.168.1.1)"
+			;;
+		searching_node)
+			mesh_act=true
+			searching=true
+			role_disp="ĐANG DÒ SÓNG MESH (${lip} • Tự nhận Router Phụ khi thấy sóng)"
+			;;
+		auto_idle)
+			mesh_act=false
+			role_disp="ROUTER ĐỘC LẬP (${lip} • Đã tự tắt dò Mesh sau 5 phút)"
+			;;
+		*)
+			mesh_act=false
+			role_disp="ROUTER ĐỘC LẬP (${lip} • Đã tắt Mesh)"
+			;;
+	esac
+
 	cat <<EOF > "${CACHE_FILE}.tmp"
 {
   "success": true,
+  "ts": $(date +%s),
   "enabled": $([ "$CFG_ENABLED" = "1" ] && echo true || echo false),
   "mode": "$(json_esc "$CFG_MODE")",
   "role": "$(json_esc "$role")",
   "role_display": "$(json_esc "$role_disp")",
   "mesh_active": $mesh_act,
+  "searching": $searching,
+  "search_remaining": ${pair_rem:-0},
   "mesh_ssid": "$(json_esc "$CFG_SSID")",
   "radio": "$(json_esc "$radio")",
   "channel": "$(json_esc "$chan")",
@@ -734,11 +788,12 @@ EOF
 	mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE" 2>/dev/null
 }
 
-# Bước tự động phân vai 1 nhịp (dùng cho cả khởi động, daemon & bấm nút Auto)
+# Bước tự động phân vai thông minh theo cửa sổ 5 phút (khởi động hoặc bấm nút Mesh)
 reconcile_once() {
 	get_mesh_cfg
 	if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ]; then
-		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ]; then
+		rm -f "$PAIR_UNTIL_FILE" "$IDLE_FLAG_FILE" "$HAD_PEER_FILE"
+		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
 			restore_default_standalone "disabled"
 		fi
 		refresh_status_cache
@@ -746,12 +801,14 @@ reconcile_once() {
 	fi
 
 	if [ "$CFG_MODE" = "controller" ]; then
+		rm -f "$IDLE_FLAG_FILE"
 		apply_controller_role
 		refresh_status_cache
 		return 0
 	fi
 
 	if [ "$CFG_MODE" = "node" ]; then
+		rm -f "$IDLE_FLAG_FILE"
 		if scan_for_master_mesh; then
 			apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$CFG_NODE_IP"
 		else
@@ -761,42 +818,87 @@ reconcile_once() {
 		return 0
 	fi
 
-	# CHẾ ĐỘ TỰ ĐỘNG THÔNG MINH (mode = auto):
-	# 1. Nếu thiết bị CÓ MẠNG Internet gốc (5G hoặc WAN dây) -> Làm Router Chính (192.168.1.1)
+	# CHẾ ĐỘ AUTO THÔNG MINH (Khởi động dò 5 phút -> Có đôi thì giữ Mesh, không có ai thì tự tắt!)
+	if [ -f "$IDLE_FLAG_FILE" ]; then
+		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+			restore_default_standalone "auto"
+		fi
+		refresh_status_cache
+		return 0
+	fi
+
+	local cur_role rem now_s lost_first pinfo pcnt lip
+	cur_role=$(get_active_role)
+	rem=$(get_pairing_remaining)
+	now_s=$(date +%s)
+
+	# 1. Thiết bị CÓ MẠNG Internet gốc (5G hoặc WAN dây) -> Đóng vai ROUTER CHÍNH
 	if check_direct_internet; then
-		apply_controller_role
+		if [ "$cur_role" = "controller" ]; then
+			lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
+			pinfo=$(get_mesh_peers_json "controller" "$lip")
+			pcnt="${pinfo%%|*}"
+			if [ "${pcnt:-0}" -gt 0 ]; then
+				touch "$HAD_PEER_FILE"
+				rm -f "$PAIR_UNTIL_FILE"
+			elif [ "$rem" -le 0 ]; then
+				if [ -f "$HAD_PEER_FILE" ]; then
+					rm -f "$HAD_PEER_FILE"
+					start_pairing_window 60
+					log_mesh "Mất tín hiệu Router Phụ -> Giữ sóng chờ kết nối lại thêm 60 giây..."
+				else
+					touch "$IDLE_FLAG_FILE"
+					rm -f "$PAIR_UNTIL_FILE"
+					restore_default_standalone "auto"
+					log_mesh "Sau 5 phút không có Router Phụ kết nối -> Tự động tắt sóng dò Mesh (Chạy Độc Lập)."
+				fi
+			fi
+		elif [ "$rem" -gt 0 ]; then
+			apply_controller_role
+		else
+			touch "$IDLE_FLAG_FILE"
+			restore_default_standalone "auto"
+		fi
 		refresh_status_cache
 		return 0
 	fi
 
 	# 2. Thiết bị KHÔNG CÓ MẠNG gốc:
-	local cur_role now_s lost_first
-	cur_role=$(get_active_role)
-	now_s=$(date +%s)
-
 	if [ "$cur_role" = "node" ]; then
 		if ping -c 2 -W 1 192.168.1.1 >/dev/null 2>&1; then
-			rm -f "$LOST_TS_FILE"
+			rm -f "$LOST_TS_FILE" "$PAIR_UNTIL_FILE"
+			touch "$HAD_PEER_FILE"
 		else
 			[ -f "$LOST_TS_FILE" ] || echo "$now_s" > "$LOST_TS_FILE"
 			lost_first=$(cat "$LOST_TS_FILE" 2>/dev/null || echo "$now_s")
 			if [ $((now_s - lost_first)) -ge 30 ]; then
+				rm -f "$HAD_PEER_FILE"
 				restore_default_standalone "auto"
+				start_pairing_window "$PAIR_WINDOW_SEC"
+				log_mesh "Mất kết nối Router Chính quá 30s -> Đã về IP mặc định 192.168.1.1 và dò lại trong 5 phút!"
 			fi
 		fi
 		refresh_status_cache
 		return 0
 	fi
 
-	# Đang chưa có mạng và chưa là Node -> Quét tìm sóng DOANDUY_MESH của Router Chính
-	if scan_for_master_mesh; then
-		log_mesh "Phát hiện sóng Router Chính ($FOUND_MESH_SSID kênh $FOUND_MESH_CHAN) khi không có WAN gốc -> Tự động ghép làm Router Phụ ($CFG_NODE_IP)!"
-		apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$CFG_NODE_IP"
-	else
-		# Không có mạng và cũng không có Router Chính nào xung quanh -> Giữ an toàn 192.168.1.1 + DHCP BẬT
-		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
-			restore_default_standalone "auto"
+	# Đang chưa có mạng và chưa là Node -> Nếu còn trong 5 phút thì quét tìm sóng Router Chính
+	if [ "$rem" -gt 0 ]; then
+		if scan_for_master_mesh; then
+			log_mesh "Phát hiện sóng Router Chính ($FOUND_MESH_SSID kênh $FOUND_MESH_CHAN) -> Tự động ghép làm Router Phụ ($CFG_NODE_IP)!"
+			rm -f "$PAIR_UNTIL_FILE"
+			touch "$HAD_PEER_FILE"
+			apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$CFG_NODE_IP"
+		else
+			if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+				restore_default_standalone "auto"
+			fi
 		fi
+	else
+		touch "$IDLE_FLAG_FILE"
+		rm -f "$PAIR_UNTIL_FILE"
+		restore_default_standalone "auto"
+		log_mesh "Sau 5 phút tìm kiếm không thấy Router Chính -> Tự động tắt dò Mesh (Giữ IP mặc định 192.168.1.1)."
 	fi
 	refresh_status_cache
 }
@@ -805,22 +907,26 @@ run_daemon() {
 	mkdir -p /var/lock
 	exec 205>"$LOCK_FILE"
 	flock -n 205 2>/dev/null || exit 0
-	# Chờ 28s sau khi khởi động để card Wi-Fi & trình quay số 5G lên mạng ổn định trước khi phân vai Mesh
+	# Chờ 25s sau khi khởi động để card Wi-Fi & trình quay số 5G lên mạng ổn định trước khi mở cửa sổ Mesh 5 phút
 	local up_s
 	up_s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 99)
-	if [ "${up_s:-99}" -lt 28 ]; then
-		sleep $((28 - up_s))
+	if [ "${up_s:-99}" -lt 25 ]; then
+		sleep $((25 - up_s))
 	fi
-	log_mesh "Khởi chạy Daemon Auto-Mesh Đa Chip (Chính 192.168.1.1 <-> Phụ 192.168.1.10)."
+	get_mesh_cfg
+	if [ "$CFG_ENABLED" = "1" ] && [ "$CFG_MODE" = "auto" ]; then
+		start_pairing_window "$PAIR_WINDOW_SEC"
+		log_mesh "Khởi động Auto-Mesh -> Tự động bật phát sóng & tìm kiếm thiết bị Mesh trong 5 phút (300s)!"
+	fi
 	while true; do
 		reconcile_once >/dev/null 2>&1 || true
 		get_mesh_cfg
-		if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ]; then
-			sleep 45
-		elif [ "$(get_active_role)" = "node" ]; then
-			sleep 10
+		if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ] || [ -f "$IDLE_FLAG_FILE" ]; then
+			sleep 30
+		elif [ "$(get_pairing_remaining)" -gt 0 ]; then
+			sleep 8
 		else
-			sleep 25
+			sleep 12
 		fi
 	done
 }
@@ -834,11 +940,14 @@ case "$1" in
 		uci set "${MESH_UCI}.mesh.enabled=1"
 		uci set "${MESH_UCI}.mesh.mode=auto"
 		uci commit "$MESH_UCI"
+		start_pairing_window "$PAIR_WINDOW_SEC"
+		log_mesh "Người dùng bấm kích hoạt tìm kiếm & ghép nối Mesh trong 5 phút (300s)!"
 		reconcile_once
-		cat "$CACHE_FILE" 2>/dev/null || echo '{"success":true,"message":"Đã kích hoạt Auto-Mesh tự động!"}'
+		cat "$CACHE_FILE" 2>/dev/null || echo '{"success":true,"searching":true}'
 		;;
 	controller|master|set_controller)
 		ensure_mesh_uci
+		rm -f "$IDLE_FLAG_FILE" "$PAIR_UNTIL_FILE"
 		uci set "${MESH_UCI}.mesh.enabled=1"
 		uci set "${MESH_UCI}.mesh.mode=controller"
 		uci commit "$MESH_UCI"
@@ -848,6 +957,7 @@ case "$1" in
 		;;
 	node|slave|set_node)
 		ensure_mesh_uci
+		rm -f "$IDLE_FLAG_FILE" "$PAIR_UNTIL_FILE"
 		[ -n "$2" ] && uci set "${MESH_UCI}.mesh.node_ip=$2"
 		uci set "${MESH_UCI}.mesh.enabled=1"
 		uci set "${MESH_UCI}.mesh.mode=node"
@@ -856,6 +966,7 @@ case "$1" in
 		cat "$CACHE_FILE" 2>/dev/null
 		;;
 	unmesh|stop|reset)
+		rm -f "$IDLE_FLAG_FILE" "$PAIR_UNTIL_FILE" "$HAD_PEER_FILE"
 		restore_default_standalone "disabled"
 		refresh_status_cache
 		cat "$CACHE_FILE" 2>/dev/null
@@ -863,9 +974,9 @@ case "$1" in
 	status)
 		if [ -s "$CACHE_FILE" ]; then
 			now_t=$(date +%s)
-			m_t=$(date -r "$CACHE_FILE" +%s 2>/dev/null || echo 0)
+			m_t=$(jsonfilter -i "$CACHE_FILE" -e '@.ts' 2>/dev/null || echo 0)
 			cat "$CACHE_FILE"
-			[ $((now_t - m_t)) -gt 8 ] && ( /usr/bin/auto_mesh refresh_cache >/dev/null 2>&1 & )
+			[ $((now_t - ${m_t:-0})) -gt 6 ] && ( /usr/bin/auto_mesh refresh_cache >/dev/null 2>&1 & )
 		else
 			refresh_status_cache
 			cat "$CACHE_FILE" 2>/dev/null || echo '{"success":true,"mesh_active":false}'

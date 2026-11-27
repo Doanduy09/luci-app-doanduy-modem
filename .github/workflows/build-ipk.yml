@@ -152,6 +152,7 @@ jobs:
           rm -f /www/cgi-bin/sim_manager /usr/bin/wwan_smart_dialer.sh /tmp/luci-indexcache* 2>/dev/null || true
           rm -rf /tmp/luci-modulecache 2>/dev/null || true
           /etc/init.d/rpcd restart >/dev/null 2>&1 </dev/null || true
+          /etc/init.d/doanduy_mesh restart >/dev/null 2>&1 </dev/null || true
           /etc/init.d/uhttpd restart >/dev/null 2>&1 </dev/null || true
           exit 0
           EOF
