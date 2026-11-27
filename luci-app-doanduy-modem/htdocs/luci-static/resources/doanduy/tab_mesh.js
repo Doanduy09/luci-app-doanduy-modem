@@ -238,11 +238,42 @@ return baseclass.extend({
         var treeStage = E('div', { class: 'dd-tree-stage' }, '');
 
         function toggleMesh(action) {
-            callMeshSetMode(action, '192.168.1.10').then(function() {
-                if (action === 'pair') localRemaining = 300;
+            var isOn = (action === 'pair');
+            btnOn.disabled = true;
+            btnOff.disabled = true;
+            statusPill.textContent = isOn ? '⏳ Đang bật Mesh...' : '⏳ Đang tắt Mesh...';
+            statusPill.style.background = '#e0f2fe';
+            statusPill.style.color = '#0369a1';
+
+            function finish() {
+                btnOn.disabled = false;
+                btnOff.disabled = false;
+            }
+
+            callMeshSetMode(action, '192.168.1.10').then(function(res) {
+                finish();
+                if (res && res.success === false) {
+                    ui.addNotification(null, E('p', '❌ ' + (res.message || 'Thao tác Mesh thất bại')), 'error');
+                    refreshMesh();
+                    return;
+                }
+                if (isOn) {
+                    localRemaining = 300;
+                    statusPill.textContent = '📡 Đang tìm Mesh (' + formatMMSS(localRemaining) + ')';
+                    statusPill.style.background = '#dbeafe';
+                    statusPill.style.color = '#1d4ed8';
+                } else {
+                    localRemaining = 0;
+                    statusPill.textContent = '⚪ Đã tắt';
+                    statusPill.style.background = '#f1f5f9';
+                    statusPill.style.color = '#64748b';
+                }
                 setTimeout(refreshMesh, 1000);
+                setTimeout(refreshMesh, 3500);
             }).catch(function(err) {
+                finish();
                 ui.addNotification(null, E('p', '❌ ' + err), 'error');
+                refreshMesh();
             });
         }
 

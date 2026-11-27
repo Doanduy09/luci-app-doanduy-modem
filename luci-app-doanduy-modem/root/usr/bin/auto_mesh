@@ -17,6 +17,7 @@ LOST_TS_FILE="/tmp/doanduy_mesh_lost_ts"
 PAIR_UNTIL_FILE="/tmp/doanduy_mesh_pair_until"
 IDLE_FLAG_FILE="/tmp/doanduy_mesh_auto_idle"
 HAD_PEER_FILE="/tmp/doanduy_mesh_had_peer"
+ACTION_EPOCH_FILE="/tmp/doanduy_mesh_action_epoch"
 PAIR_WINDOW_SEC=300
 DEFAULT_MESH_SSID="DOANDUY_MESH"
 DEFAULT_MESH_KEY="DoanduyMesh@2026!Sec"
@@ -34,6 +35,64 @@ log_mesh() {
 
 json_esc() {
 	printf '%s' "$1" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+bump_action_epoch() {
+	mkdir -p /tmp 2>/dev/null
+	printf '%s_%s\n' "$(date +%s)" "$$" > "$ACTION_EPOCH_FILE"
+}
+
+is_epoch_current() {
+	local cur
+	cur=$(cat "$ACTION_EPOCH_FILE" 2>/dev/null || echo 0)
+	[ "$cur" = "${1:-0}" ]
+}
+
+write_instant_status_cache() {
+	get_mesh_cfg
+	local role pair_rem radio chan htmode lip lmac lname bmodel searching=false has_dir=false
+	role=$(get_active_role)
+	pair_rem=$(get_pairing_remaining)
+	radio=$(get_best_mesh_radio)
+	chan=$(uci -q get "wireless.${radio}.channel" || echo "36")
+	htmode=$(uci -q get "wireless.${radio}.htmode" || echo "HE160")
+	lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
+	lmac=$(tr 'a-z' 'A-Z' < /sys/class/net/br-lan/address 2>/dev/null || echo "00:00:00:00:00:00")
+	lname=$(uci -q get system.@system[0].hostname || echo "DOANDUY")
+	bmodel=$(cat /tmp/sysinfo/model 2>/dev/null || echo "Router DOANDUY")
+	if [ -s "$CACHE_FILE" ]; then
+		[ "$(jsonfilter -i "$CACHE_FILE" -e '@.has_internet' 2>/dev/null)" = "true" ] && has_dir=true
+	fi
+	if [ "${pair_rem:-0}" -gt 0 ] && [ "$role" != "node" ]; then
+		searching=true
+	elif [ "$role" = "searching_node" ]; then
+		searching=true
+	fi
+	cat <<EOF > "${CACHE_FILE}.tmp"
+{
+  "success": true,
+  "ts": $(date +%s),
+  "enabled": $([ "$CFG_ENABLED" = "1" ] && echo true || echo false),
+  "role": "$(json_esc "$role")",
+  "searching": $searching,
+  "search_remaining": ${pair_rem:-0},
+  "mesh_ssid": "$(json_esc "$CFG_SSID")",
+  "channel": "$(json_esc "$chan")",
+  "htmode": "$(json_esc "$htmode")",
+  "local_ip": "$(json_esc "$lip")",
+  "local_mac": "$(json_esc "$lmac")",
+  "local_name": "$(json_esc "$lname")",
+  "board_model": "$(json_esc "$bmodel")",
+  "master_ip": "192.168.1.1",
+  "master_model": "$(json_esc "$bmodel")",
+  "master_name": "$(json_esc "$lname")",
+  "has_internet": $has_dir,
+  "peer_count": 0,
+  "peers": []
+}
+EOF
+	mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE" 2>/dev/null
+	[ -L /www/mesh_topology.json ] || ln -sf "$CACHE_FILE" /www/mesh_topology.json 2>/dev/null || true
 }
 
 ensure_mesh_uci() {
@@ -1000,20 +1059,26 @@ EOF
 }
 
 reconcile_once() {
+	local my_epoch
+	my_epoch=$(cat "$ACTION_EPOCH_FILE" 2>/dev/null || echo 0)
 	get_mesh_cfg
 	if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ]; then
 		rm -f "$PAIR_UNTIL_FILE" "$IDLE_FLAG_FILE" "$HAD_PEER_FILE"
 		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+			is_epoch_current "$my_epoch" || return 0
 			restore_default_standalone "disabled"
 		fi
+		is_epoch_current "$my_epoch" || return 0
 		refresh_status_cache
 		return 0
 	fi
 
 	if [ -f "$IDLE_FLAG_FILE" ]; then
 		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
+			is_epoch_current "$my_epoch" || return 0
 			restore_default_standalone "auto"
 		fi
+		is_epoch_current "$my_epoch" || return 0
 		refresh_status_cache
 		return 0
 	fi
@@ -1025,10 +1090,12 @@ reconcile_once() {
 
 	# 1. Thiết bị CÓ MẠNG gốc (5G hoặc WAN dây) -> Tự động làm ROUTER CHÍNH (192.168.1.1)
 	if check_direct_internet; then
+		is_epoch_current "$my_epoch" || return 0
 		if [ "$cur_role" = "controller" ]; then
 			lip=$(uci -q get network.lan.ipaddr || echo "192.168.1.1")
 			mbssid=$(get_local_mesh_ap_bssid)
 			pinfo=$(get_mesh_peers_json "controller" "$lip" "$mbssid")
+			is_epoch_current "$my_epoch" || return 0
 			pcnt="${pinfo%%|*}"
 			if [ "${pcnt:-0}" -gt 0 ]; then
 				touch "$HAD_PEER_FILE"
@@ -1051,6 +1118,7 @@ reconcile_once() {
 			touch "$IDLE_FLAG_FILE"
 			restore_default_standalone "auto"
 		fi
+		is_epoch_current "$my_epoch" || return 0
 		refresh_status_cache
 		return 0
 	fi
@@ -1058,12 +1126,14 @@ reconcile_once() {
 	# 2. Thiết bị KHÔNG CÓ MẠNG gốc -> Tự động làm ROUTER PHỤ (192.168.1.10, 11, 12...)
 	if [ "$cur_role" = "node" ]; then
 		if ping -c 2 -W 1 192.168.1.1 >/dev/null 2>&1; then
+			is_epoch_current "$my_epoch" || return 0
 			rm -f "$LOST_TS_FILE" "$PAIR_UNTIL_FILE"
 			touch "$HAD_PEER_FILE"
 			verify_unique_node_ip
 			# Bật tiếp sóng Mesh trên Router Phụ đã thông mạng để cho phép Phụ khác nối tiếp vào tầng dưới
 			ensure_node_relay_ap
 		else
+			is_epoch_current "$my_epoch" || return 0
 			[ -f "$LOST_TS_FILE" ] || echo "$now_s" > "$LOST_TS_FILE"
 			lost_first=$(cat "$LOST_TS_FILE" 2>/dev/null || echo "$now_s")
 			if [ $((now_s - lost_first)) -ge 30 ]; then
@@ -1073,27 +1143,32 @@ reconcile_once() {
 				log_mesh "Hết Mesh quá 30s -> Đã khôi phục IP mặc định 192.168.1.1 và dò lại trong 5 phút!"
 			fi
 		fi
+		is_epoch_current "$my_epoch" || return 0
 		refresh_status_cache
 		return 0
 	fi
 
 	if [ "$rem" -gt 0 ]; then
 		if scan_for_master_mesh; then
+			is_epoch_current "$my_epoch" || return 0
 			log_mesh "Phát hiện sóng mạnh nhất ($FOUND_MESH_SSID kênh $FOUND_MESH_CHAN BSSID $FOUND_MESH_BSSID) -> Tự động ghép làm Router Phụ!"
 			rm -f "$PAIR_UNTIL_FILE"
 			touch "$HAD_PEER_FILE"
 			apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$FOUND_MESH_BSSID"
 		else
+			is_epoch_current "$my_epoch" || return 0
 			if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
 				restore_default_standalone "auto"
 			fi
 		fi
 	else
+		is_epoch_current "$my_epoch" || return 0
 		touch "$IDLE_FLAG_FILE"
 		rm -f "$PAIR_UNTIL_FILE"
 		restore_default_standalone "auto"
 		log_mesh "Sau 5 phút không tìm thấy thiết bị Mesh -> Tự động tắt dò Mesh (IP mặc định 192.168.1.1)."
 	fi
+	is_epoch_current "$my_epoch" || return 0
 	refresh_status_cache
 }
 
@@ -1131,16 +1206,19 @@ case "$1" in
 		run_daemon
 		;;
 	auto|pair|on|start|reconcile)
+		bump_action_epoch
 		ensure_mesh_uci
 		uci set "${MESH_UCI}.mesh.enabled=1"
 		uci set "${MESH_UCI}.mesh.mode=auto"
 		uci commit "$MESH_UCI"
 		start_pairing_window "$PAIR_WINDOW_SEC"
+		write_instant_status_cache
 		log_mesh "Bật Auto-Mesh -> Phát sóng công suất tối đa & tìm ghép nối trong 5 phút!"
 		reconcile_once
 		cat "$CACHE_FILE" 2>/dev/null || echo '{"success":true,"searching":true}'
 		;;
 	unmesh|off|stop|reset)
+		bump_action_epoch
 		rm -f "$IDLE_FLAG_FILE" "$PAIR_UNTIL_FILE" "$HAD_PEER_FILE"
 		restore_default_standalone "disabled"
 		refresh_status_cache
