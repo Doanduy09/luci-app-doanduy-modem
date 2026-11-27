@@ -1260,11 +1260,14 @@ run_umbim_fallback() {
     local tid=2 tries=0 ok=0 pdp_req="ipv4v6:" mbimconfig m_auth="none"
     UMBIM_ACTIVE=1
     while [ "$tries" -lt 3 ] && [ "$STOP_REQ" = "0" ]; do
-        timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" caps >/dev/null 2>&1 && { ok=1; break; }
-        tid=$((tid + 1)); tries=$((tries + 1)); sleep 1
+        # First command MUST NOT pass -t so umbim sends MBIM_OPEN_MSG (tid=1) then caps (tid=2)
+        if timeout 8 umbim -n -d "$CTRL_DEV" caps >/dev/null 2>&1; then
+            ok=1; tid=3; break
+        fi
+        timeout 4 umbim -d "$CTRL_DEV" disconnect >/dev/null 2>&1 || true
+        tries=$((tries + 1)); sleep 1
     done
     [ "$ok" = "1" ] || { UMBIM_ACTIVE=0; return 1; }
-    tid=$((tid + 1))
 
     if [ -n "$pincode" ]; then
         timeout 8 umbim -n -t "$tid" -d "$CTRL_DEV" unlock "$pincode" >/dev/null 2>&1 || true
