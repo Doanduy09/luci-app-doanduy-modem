@@ -325,13 +325,16 @@ heal_invalid_radio_channels() {
 }
 
 radio_channel_is_non_dfs() {
-	local radio="$1" chan="$2" phy line
+	local radio="$1" chan="$2" phy block
 	[ -n "$radio" ] && [ -n "$chan" ] || return 1
 	phy=$(get_phy_for_radio "$radio")
 	if [ -n "$phy" ] && command -v iw >/dev/null 2>&1; then
-		line=$(iw phy "$phy" channels 2>/dev/null | grep -E "\[$chan\]($|[^0-9])" | head -n 1)
-		[ -n "$line" ] || return 1
-		printf '%s' "$line" | grep -qiE 'radar detection|disabled' && return 1
+		block=$(iw phy "$phy" channels 2>/dev/null | awk -v c="[$chan]" '
+			/^[[:space:]]*\*[[:space:]]/{ in_blk = (index($0, c) > 0) }
+			in_blk{ print }
+		')
+		[ -n "$block" ] || return 1
+		printf '%s' "$block" | grep -qiE 'radar detection|dfs state|disabled' && return 1
 	fi
 	return 0
 }
@@ -960,11 +963,17 @@ ensure_node_system_hygiene() {
 			esac
 			new_host="${pfx}-${mac_tail}"
 			uci set system.@system[0].hostname="$new_host"
-			hostname "$new_host" 2>/dev/null || true
+			host="$new_host"
 			sys_ch=1
 			;;
 	esac
-	[ "$sys_ch" = "1" ] && uci commit system
+	if [ -n "$host" ] && [ "$(cat /proc/sys/kernel/hostname 2>/dev/null)" != "$host" ]; then
+		echo "$host" > /proc/sys/kernel/hostname 2>/dev/null || true
+	fi
+	if [ "$sys_ch" = "1" ]; then
+		uci commit system
+		/etc/init.d/system reload >/dev/null 2>&1 || true
+	fi
 
 	if [ -n "$(uci -q get network.mesh_uplink)" ] && [ "$(uci -q get dhcp.mesh_uplink.ignore)" != "1" ]; then
 		uci set dhcp.mesh_uplink=dhcp
@@ -1262,14 +1271,21 @@ ensure_node_relay_ap() {
 
 		# Tự phục hồi nếu Relay AP bị treo do DFS (vd kênh 100 Radar detection làm ath11k dead AP)
 		if [ "$(uci -q get wireless.mesh_backhaul_ap.device)" = "$radio" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" != "1" ]; then
-			local rts_dfs now_dfs rap_dfs_if dfs_dead=0
+			local rts_dfs now_dfs rap_dfs_if dfs_dead=0 car_val op_val iwi_out
 			now_dfs=$(date +%s)
 			rts_dfs=$(cat /tmp/doanduy_mesh_relay_ts 2>/dev/null || echo 0)
 			if [ "${rts_dfs:-0}" -gt 0 ] && [ $((now_dfs - rts_dfs)) -ge 15 ]; then
 				rap_dfs_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${radio}.interfaces[@.section='mesh_backhaul_ap'].ifname" 2>/dev/null | head -n 1)
-				if [ -n "$rap_dfs_if" ] && [ -d "/sys/class/net/$rap_dfs_if" ]; then
-					[ "$(cat "/sys/class/net/${rap_dfs_if}/carrier" 2>/dev/null)" = "0" ] && dfs_dead=1
-					iwinfo "$rap_dfs_if" info 2>/dev/null | grep -q 'Channel: 0' && dfs_dead=1
+				if [ -n "$rap_dfs_if" ]; then
+					if [ ! -d "/sys/class/net/$rap_dfs_if" ]; then
+						dfs_dead=1
+					else
+						car_val=$(cat "/sys/class/net/${rap_dfs_if}/carrier" 2>/dev/null || echo "err")
+						op_val=$(cat "/sys/class/net/${rap_dfs_if}/operstate" 2>/dev/null || echo "")
+						[ "$car_val" != "1" ] || [ "$op_val" = "down" ] && dfs_dead=1
+						iwi_out=$(iwinfo "$rap_dfs_if" info 2>/dev/null)
+						printf '%s' "$iwi_out" | grep -qE 'Channel: 0|Tx-Power: 0 dBm|HT Mode: NOHT' && dfs_dead=1
+					fi
 				fi
 				if [ "$dfs_dead" = "1" ] && [ "$relay_ch" != "149" ] && radio_supports_channel "$radio" 149; then
 					touch "/tmp/doanduy_mesh_dfs_blocked_${radio}"
@@ -2066,9 +2082,11 @@ reconcile_once() {
 		rm -f "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE"
 		apply_controller_role
 		[ ! -f /tmp/doanduy_mesh_offload_done ] && optimize_hw_offload
-		if [ ! -f /tmp/doanduy_mesh_2g_opt_done ] && [ "$(optimize_2g_channel controller)" = "1" ]; then
-			uci commit wireless
-			safe_wifi_reload 0
+		if [ ! -f /tmp/doanduy_mesh_2g_opt_done ]; then
+			local opt_w=0
+			[ "$(configure_roaming_on_user_aps)" = "1" ] && opt_w=1
+			[ "$(optimize_2g_channel controller)" = "1" ] && opt_w=1
+			[ "$opt_w" = "1" ] && { uci commit wireless; safe_wifi_reload 0; }
 		fi
 		if [ -f "$WIFI_HELPER" ] && command -v lua >/dev/null 2>&1; then
 			lua "$WIFI_HELPER" publish >/dev/null 2>&1 || true
@@ -2088,9 +2106,11 @@ reconcile_once() {
 			rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" "$PAIR_UNTIL_FILE" "$SCAN_MISS_FILE"
 			verify_unique_node_ip
 			[ ! -f /tmp/doanduy_mesh_offload_done ] && optimize_hw_offload
-			if [ ! -f /tmp/doanduy_mesh_2g_opt_done ] && [ "$(optimize_2g_channel node)" = "1" ]; then
-				uci commit wireless
-				safe_wifi_reload 0
+			if [ ! -f /tmp/doanduy_mesh_2g_opt_done ]; then
+				local opt_w=0
+				[ "$(configure_roaming_on_user_aps)" = "1" ] && opt_w=1
+				[ "$(optimize_2g_channel node)" = "1" ] && opt_w=1
+				[ "$opt_w" = "1" ] && { uci commit wireless; safe_wifi_reload 0; }
 			fi
 			[ ! -f /tmp/doanduy_mesh_hygiene_done ] && ensure_node_system_hygiene
 			ensure_node_relay_ap
