@@ -691,12 +691,18 @@ scan_for_master_mesh() {
 			[ "$band" = "5g" ] || [ "$band" = "6g" ] || continue
 			phy_dev=$(get_phy_for_radio "$dev")
 			[ -n "$phy_dev" ] || continue
+			iw dev dd_scan del 2>/dev/null || true
 			iw dev 2>/dev/null | awk -v p="$phy_dev" '/^phy#/{in_p=($0=="phy#"substr(p,4))} in_p && /type managed/{found=1} END{exit !found}' && continue
 			wifi down "$dev" >/dev/null 2>&1 || true
-			sleep 1
-			iw dev dd_scan del 2>/dev/null || true
+			local _w=0
+			while [ "$_w" -lt 4 ]; do
+				iw dev 2>/dev/null | awk -v p="$phy_dev" '/^phy#/{in_p=($0=="phy#"substr(p,4))} in_p && /Interface /{c++} END{exit (c>0)}' && break
+				sleep 1
+				_w=$((_w + 1))
+			done
 			if iw phy "$phy_dev" interface add dd_scan type managed >/dev/null 2>&1; then
 				ip link set dd_scan up >/dev/null 2>&1 || true
+				sleep 1
 				raw=$(iw dev dd_scan scan 2>/dev/null)
 				iw dev dd_scan del 2>/dev/null || true
 				if [ -n "$raw" ]; then
