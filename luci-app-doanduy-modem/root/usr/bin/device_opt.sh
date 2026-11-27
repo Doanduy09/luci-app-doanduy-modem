@@ -23,9 +23,12 @@ detect_hw() {
 	if lsmod 2>/dev/null | grep -qE '^qca_nss_drv|^ecm ' || [ -d /sys/kernel/debug/qca-nss-drv ] || [ -d /sys/kernel/debug/ecm ]; then
 		SOC_TYPE="qualcomm_ipq_nss"
 		SOC_LABEL="Qualcomm IPQ (NSS Hardware Offload)"
+	elif [ -d /sys/module/mt_wifi ] || lsmod 2>/dev/null | grep -qE '^mt_wifi|^mtk_hnat|^mediatek_hnat'; then
+		SOC_TYPE="mediatek_mtwifi_hnat"
+		SOC_LABEL="MediaTek Filogic (mt_wifi + Native HNAT/WED)"
 	elif [ -d /sys/kernel/debug/ppe ] || lsmod 2>/dev/null | grep -qE 'mtk_ppe|mt7915e|mt7986|mt76'; then
 		SOC_TYPE="mediatek_filogic"
-		SOC_LABEL="MediaTek Filogic / MTK"
+		SOC_LABEL="MediaTek Filogic (mt76 + PPE HNAT/WED)"
 	elif echo "$HW_ARCH" | grep -qE 'x86_64|i[3-6]86'; then
 		SOC_TYPE="x86_64"
 		SOC_LABEL="x86_64 Router / Mini PC"
@@ -138,8 +141,8 @@ vm.vfs_cache_pressure = 60
 EOF
 	sysctl -p "$OPT_CONF" >/dev/null 2>&1 || true
 	disable_wwan_powersave
-	# Tự động tắt nft_flow_offload trên Qualcomm IPQ NSS để tránh xung đột qca-nss-ecm gây giật ping
-	if [ "$SOC_TYPE" = "qualcomm_ipq_nss" ]; then
+	# Tự động tắt nft_flow_offload trên Qualcomm IPQ NSS & MediaTek mt_wifi+HNAT để tránh đụng phần cứng
+	if [ "$SOC_TYPE" = "qualcomm_ipq_nss" ] || [ "$SOC_TYPE" = "mediatek_mtwifi_hnat" ]; then
 		if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ] || [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ]; then
 			uci -q set firewall.@defaults[0].flow_offloading='0'
 			uci -q set firewall.@defaults[0].flow_offloading_hw='0'
@@ -157,8 +160,8 @@ cmd_offload() {
 	detect_hw
 	local act="$1"
 	if [ "$act" = "on" ] || [ "$act" = "1" ]; then
-		if [ "$SOC_TYPE" = "qualcomm_ipq_nss" ]; then
-			echo '{"success":false,"message":"Router đang chạy Qualcomm NSS 12.5! Đã chặn bật Flow Offload phần mềm để tránh xung đột NSS."}'
+		if [ "$SOC_TYPE" = "qualcomm_ipq_nss" ] || [ "$SOC_TYPE" = "mediatek_mtwifi_hnat" ]; then
+			echo "{\"success\":false,\"message\":\"Router đang chạy tăng tốc phần cứng độc quyền (${SOC_LABEL})! Đã chặn bật Flow Offload phần mềm để tránh xung đột.\"}"
 			return 0
 		fi
 		uci -q set firewall.@defaults[0].flow_offloading='1'

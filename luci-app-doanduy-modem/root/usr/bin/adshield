@@ -106,9 +106,17 @@ ensure_dnsmasq_config() {
     fi
 }
 
-## 1. Kích hoạt Nftables Anti-Bypass Firewall (Chống thiết bị dùng DNS riêng 8.8.8.8 / 1.1.1.1, DoT 853 và giải phóng đường tải)
+is_passwall_active() {
+    [ "$(uci -q get passwall.@global[0].enabled 2>/dev/null)" = "1" ] && return 0
+    [ "$(uci -q get passwall2.@global[0].enabled 2>/dev/null)" = "1" ] && return 0
+    nft list tables 2>/dev/null | grep -qE 'passwall|passwall2' && return 0
+    return 1
+}
+
+## 1. Kích hoạt Nftables Anti-Bypass Firewall (Nhường quyền DNS Hijack khi PassWall đang bật)
 apply_firewall_rules() {
     remove_firewall_rules
+    is_passwall_active && return 0
     local lan_dev
     lan_dev=$(get_lan_dev)
     if command -v nft >/dev/null 2>&1; then

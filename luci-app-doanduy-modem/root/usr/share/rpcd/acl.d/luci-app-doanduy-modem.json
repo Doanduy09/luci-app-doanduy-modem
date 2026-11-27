@@ -11,11 +11,12 @@
 				"doanduy.remote": [ "*" ],
 				"doanduy.vault": [ "*" ],
 				"doanduy.opt": [ "*" ],
+				"doanduy.mesh": [ "*" ],
 				"doanduy.smarthome": [ "*" ],
 				"network.interface": [ "dump", "status" ],
 				"uci": [ "get", "changes" ]
 			},
-			"uci": [ "network", "system", "firewall", "dhcp" ]
+			"uci": [ "network", "system", "firewall", "dhcp", "wireless", "doanduy_mesh" ]
 		},
 		"write": {
 			"ubus": {
@@ -27,10 +28,11 @@
 				"doanduy.remote": [ "*" ],
 				"doanduy.vault": [ "*" ],
 				"doanduy.opt": [ "*" ],
+				"doanduy.mesh": [ "*" ],
 				"doanduy.smarthome": [ "*" ],
 				"uci": [ "set", "commit", "apply" ]
 			},
-			"uci": [ "network", "system", "firewall", "dhcp" ]
+			"uci": [ "network", "system", "firewall", "dhcp", "wireless", "doanduy_mesh" ]
 		}
 	}
 }

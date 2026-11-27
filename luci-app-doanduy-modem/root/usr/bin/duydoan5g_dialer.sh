@@ -41,6 +41,37 @@ case "$user_pdp_index" in ''|*[!0-9]*) user_pdp_index="" ;; esac
 [ "$force_apn" = "1" ] || force_apn=0
 
 mkdir -p /var/lock /var/run /tmp/quectel_cm
+run_to() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+        return $?
+    fi
+    "$@" &
+    local cpid=$! w=0 rc=0
+    while kill -0 "$cpid" 2>/dev/null; do
+        if [ "$w" -ge "$secs" ]; then
+            kill -TERM "$cpid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$cpid" 2>/dev/null || true
+            wait "$cpid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        w=$((w + 1))
+    done
+    wait "$cpid" 2>/dev/null
+    rc=$?
+    return "$rc"
+}
+SUP_PID_FILE="/var/run/duydoan5g_super_${interface}.pid"
+old_sup=$(cat "$SUP_PID_FILE" 2>/dev/null)
+if [ -n "$old_sup" ] && [ "$old_sup" != "$$" ] && kill -0 "$old_sup" 2>/dev/null; then
+    kill -TERM "$old_sup" 2>/dev/null || true
+    sleep 1
+fi
+echo "$$" > "$SUP_PID_FILE"
 acquire_fd_lock() {
     local fd="$1" secs="${2:-10}" w=0
     command -v flock >/dev/null 2>&1 || return 0
@@ -52,7 +83,11 @@ acquire_fd_lock() {
     return 1
 }
 exec 8>"/var/lock/duydoan5g_${interface}.lock"
-acquire_fd_lock 8 10 || exit 1
+acquire_fd_lock 8 5 || {
+    rm -f "/var/lock/duydoan5g_${interface}.lock" 2>/dev/null || true
+    exec 8>"/var/lock/duydoan5g_${interface}.lock"
+    acquire_fd_lock 8 3 || exit 1
+}
 
 if [ "$interface" = "duydoan_5g" ]; then
     LOG_FILE="/tmp/quectel_cm/quectel-cm.log"
@@ -118,7 +153,8 @@ cleanup_and_exit() {
     if [ "$AT_DIAL_ACTIVE" = "1" ]; then
         at_hangup
     fi
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$SUP_PID_FILE"
+    exec 8>&- 2>/dev/null || true
     exit 0
 }
 trap 'cleanup_and_exit' TERM INT HUP
@@ -383,16 +419,17 @@ safe_at_once() {
     case "$port" in
         /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
             (
-                acquire_fd_lock 9 4 || true
+                exec 8>&-
+                acquire_fd_lock 9 3 || true
                 export _MODEM_AT_LOCKED=1
                 if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                    timeout 4 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && exit 0
+                    run_to 3 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null && exit 0
                 fi
                 if command -v tom_modem >/dev/null 2>&1; then
-                    timeout 4 tom_modem -d "$port" -c "$cmd" 2>/dev/null && exit 0
+                    run_to 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null && exit 0
                 fi
                 if command -v sms_tool >/dev/null 2>&1; then
-                    timeout 4 sms_tool -d "$port" at "$cmd" 2>/dev/null && exit 0
+                    run_to 3 sms_tool -d "$port" at "$cmd" 2>/dev/null && exit 0
                 fi
                 exit 1
             ) 9>/var/lock/modem_at.lock 2>/dev/null
@@ -400,26 +437,30 @@ safe_at_once() {
             ;;
         *)
             (
-                acquire_fd_lock 9 4 || true
+                exec 8>&-
+                acquire_fd_lock 9 3 || true
                 export _MODEM_AT_LOCKED=1
                 if command -v stty >/dev/null 2>&1; then
                     stty -F "$port" 115200 raw -echo -echoe -echok -echoctl -echoke -icrnl -onlcr 2>/dev/null || true
                 fi
                 local out=""
                 if command -v sms_tool >/dev/null 2>&1; then
-                    out=$(timeout 3 sms_tool -d "$port" at "$cmd" 2>/dev/null)
+                    out=$(run_to 2 sms_tool -d "$port" at "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
+                    # Fast-fail on silent non-AT USB ports (DM/NMEA) instead of stacking 3 tools per dead port
+                    exit 1
                 fi
                 if command -v tom_modem >/dev/null 2>&1; then
-                    out=$(timeout 3 tom_modem -d "$port" -c "$cmd" 2>/dev/null)
+                    out=$(run_to 2 tom_modem -d "$port" -c "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
+                    exit 1
                 fi
                 if command -v atinout >/dev/null 2>&1; then
-                    out=$(printf '%s\r\n' "$cmd" | timeout 2 atinout - "$port" - 2>/dev/null)
+                    out=$(printf '%s\r\n' "$cmd" | run_to 2 atinout - "$port" - 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                 fi
                 if [ -x /usr/bin/read_pcie_sms.lua ]; then
-                    out=$(timeout 3 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
+                    out=$(run_to 2 /usr/bin/read_pcie_sms.lua -p "$port" --at "$cmd" 2>/dev/null)
                     [ -n "$out" ] && { printf '%s\n' "$out"; exit 0; }
                 fi
                 exit 1
@@ -849,6 +890,17 @@ EOF
     cp -f "/tmp/duydoan5g_modem_meta_${interface}" /tmp/duydoan5g_modem_meta 2>/dev/null || true
 }
 
+async_populate_modem_meta() {
+    (
+        exec 8>&-
+        sleep 2
+        find_working_at_port || { detect_modem_profile; write_modem_meta; exit 0; }
+        detect_modem_profile
+        sync_sim_status
+        write_modem_meta
+    ) >/dev/null 2>&1 &
+}
+
 pre_dial_prepare() {
     stop_competing_dialers
     if [ "$MODE" = "phone_dhcp" ]; then
@@ -856,6 +908,18 @@ pre_dial_prepare() {
         [ "$NET_DRV" = "ipheth" ] && MODEM_PLATFORM="apple_ios" || MODEM_PLATFORM="${NET_DRV:-tether}"
         write_modem_meta
         return 0
+    fi
+    # Fast-Path for QMI/MBIM binary control channels (quectel-cm / umbim / uqmi):
+    # Dial immediately in <2s without blocking 30s+ on sequential AT probing; populate AT/IMEI/ICCID in background!
+    if [ -z "$pincode" ] && [ ! -f /etc/config/cell_lock_golden.json ]; then
+        case "$MODE" in
+            cm_usb|cm_qmi|cm_mbim|mtk_pcie)
+                detect_modem_profile
+                write_modem_meta
+                async_populate_modem_meta
+                return 0
+                ;;
+        esac
     fi
     find_working_at_port || { detect_modem_profile; write_modem_meta; return 0; }
     detect_modem_profile
@@ -1552,13 +1616,13 @@ run_at_dhcp_monitor() {
 
     while [ "$STOP_REQ" = "0" ] && [ -d "/sys/class/net/$IFNAME" ]; do
         if [ -z "$UDHCPC_PID" ] || ! kill -0 "$UDHCPC_PID" 2>/dev/null; then
-            INTERFACE="$interface" /sbin/udhcpc -f -p "$PID_FILE" -i "$IFNAME" -s /lib/netifd/dhcp.script >/dev/null 2>&1 &
+            INTERFACE="$interface" /sbin/udhcpc -f -p "$PID_FILE" -i "$IFNAME" -s /lib/netifd/dhcp.script >/dev/null 2>&1 8>&- &
             UDHCPC_PID=$!
             UDHCPC_START=$(awk '{print $22}' "/proc/$UDHCPC_PID/stat" 2>/dev/null)
         fi
         if [ "$want_v6" = "1" ] && [ -x /lib/netifd/dhcpv6.script ] && command -v odhcp6c >/dev/null 2>&1; then
             if [ -z "$ODHCP6C_PID" ] || ! kill -0 "$ODHCP6C_PID" 2>/dev/null; then
-                INTERFACE="$interface" odhcp6c -s /lib/netifd/dhcpv6.script -Ntry "$IFNAME" >/dev/null 2>&1 &
+                INTERFACE="$interface" odhcp6c -s /lib/netifd/dhcpv6.script -Ntry "$IFNAME" >/dev/null 2>&1 8>&- &
                 ODHCP6C_PID=$!
                 ODHCP6C_START=$(awk '{print $22}' "/proc/$ODHCP6C_PID/stat" 2>/dev/null)
             fi
@@ -1642,13 +1706,40 @@ run_phone_dhcp_monitor() {
     run_at_dhcp_monitor
 }
 
+async_enrich_modem_meta() {
+    (
+        sleep 2
+        find_working_at_port || true
+        detect_modem_profile
+        sync_sim_status
+        if [ "$MODEM_VENDOR" = "quectel" ] && [ -f /etc/config/cell_lock_golden.json ] && command -v jsonfilter >/dev/null 2>&1; then
+            lte_f=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.lte_freq' 2>/dev/null)
+            lte_p=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.lte_pci' 2>/dev/null)
+            nr_f=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_freq' 2>/dev/null)
+            nr_p=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_pci' 2>/dev/null)
+            nr_scs=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_scs' 2>/dev/null)
+            nr_b=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.nr_band' 2>/dev/null)
+            [ -n "$lte_f" ] && [ -n "$lte_p" ] && safe_at_once "$AT_PORT" "AT+QNWLOCK=\"common/4g\",1,${lte_f},${lte_p}" >/dev/null
+            [ -n "$nr_p" ] && [ -n "$nr_f" ] && safe_at_once "$AT_PORT" "AT+QNWLOCK=\"common/5g\",${nr_p},${nr_f},${nr_scs:-1},${nr_b:-41}" >/dev/null
+        fi
+        write_modem_meta
+    ) </dev/null >/dev/null 2>&1 8>&- &
+}
+
 wake_hardware
 detect_endpoint || exit 1
 if is_usb_phone_tether; then
     MODE="phone_dhcp"
 fi
-pre_dial_prepare
-logger -t duydoan5g "Starting 5G supervised dialer on $IFNAME (Mode: $MODE, Vendor: $MODEM_VENDOR/$MODEM_PLATFORM, PDP: $MODEM_PDP_IDX, AT: ${AT_PORT:-none}, Driver: ${NET_DRV:-unknown}, Ctrl: ${CTRL_DEV:-none}, APN: $apn)"
+if [ -z "$pincode" ] && { [ "$MODE" = "cm_qmi" ] || [ "$MODE" = "cm_mbim" ] || [ "$MODE" = "cm_usb" ] || [ "$MODE" = "mtk_pcie" ]; }; then
+    stop_competing_dialers
+    detect_modem_profile
+    write_modem_meta
+    async_enrich_modem_meta
+else
+    pre_dial_prepare
+fi
+logger -t duydoan5g "Starting 5G supervised dialer on $IFNAME (Mode: $MODE, Vendor: $MODEM_VENDOR/$MODEM_PLATFORM, PDP: $MODEM_PDP_IDX, AT: ${AT_PORT:-async}, Driver: ${NET_DRV:-unknown}, Ctrl: ${CTRL_DEV:-none}, APN: $apn)"
 
 if [ "$MODE" = "mtk_pcie" ]; then
     run_mtk_pcie_dial && exit 0
@@ -1732,7 +1823,7 @@ while [ "$STOP_REQ" = "0" ]; do
         : > "$LOG_FILE"
         chmod 600 "$LOG_FILE" 2>/dev/null || true
 
-        "$local_qcm" "$@" </dev/null >/dev/null 2>&1 &
+        "$local_qcm" "$@" </dev/null >/dev/null 2>&1 8>&- &
         CM_PID=$!
         CM_START=$(awk '{print $22}' "/proc/$CM_PID/stat" 2>/dev/null)
         echo "$CM_PID" > "$PID_FILE"
@@ -1792,6 +1883,7 @@ while [ "$STOP_REQ" = "0" ]; do
             fail_streak=0
         else
             fail_streak=$((fail_streak + 1))
+            [ "$fail_streak" -eq 1 ] && pre_dial_prepare
         fi
     fi
 

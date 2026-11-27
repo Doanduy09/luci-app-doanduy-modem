@@ -41,15 +41,26 @@ proto_duydoan5g_setup() {
 proto_duydoan5g_teardown() {
 	local interface="$1"
 	logger -t duydoan5g "Gracefully stopping 5G dialer for $interface..."
+	local cm_pid=""
+	cm_pid=$(cat "/var/run/duydoan5g_${interface}.pid" 2>/dev/null)
 	proto_kill_command "$interface" 15
+	[ -n "$cm_pid" ] && kill -TERM "$cm_pid" 2>/dev/null || true
 	local w=0 pid=""
-	while [ "$w" -lt 6 ]; do
+	while [ "$w" -lt 4 ]; do
 		pid=$(cat "/var/run/duydoan5g_${interface}.pid" 2>/dev/null)
-		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || break
+		if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+			[ -z "$cm_pid" ] || ! kill -0 "$cm_pid" 2>/dev/null && break
+		fi
 		sleep 1
 		w=$((w + 1))
 	done
-	rm -f "/var/run/duydoan5g_${interface}.pid" "/tmp/quectel_dialing_${interface}" /var/run/duydoan5g.pid /tmp/quectel_dialing
+	[ -n "$cm_pid" ] && kill -0 "$cm_pid" 2>/dev/null && kill -KILL "$cm_pid" 2>/dev/null || true
+	local sup_pid=""
+	sup_pid=$(cat "/var/run/duydoan5g_super_${interface}.pid" 2>/dev/null)
+	[ -n "$sup_pid" ] && kill -0 "$sup_pid" 2>/dev/null && kill -KILL "$sup_pid" 2>/dev/null || true
+	rm -f "/var/run/duydoan5g_${interface}.pid" "/var/run/duydoan5g_super_${interface}.pid" \
+	      "/tmp/quectel_dialing_${interface}" /var/run/duydoan5g.pid /tmp/quectel_dialing \
+	      "/var/lock/duydoan5g_${interface}.lock"
 }
 
 add_protocol duydoan5g

@@ -273,13 +273,14 @@ touch /tmp/sms_sending.lock
 
 send_pcie_at_sms() {
     local dev="$1" dest="$2" text="$3"
-    {
-        printf 'AT+CMGF=1\r'
-        sleep 1
-        printf 'AT+CMGS="%s"\r' "$dest"
-        sleep 1
-        printf '%s\032' "$text"
-    } > "$dev"
+    if [ -x /usr/bin/read_pcie_sms.lua ]; then
+        if command -v modem_lock_run >/dev/null 2>&1; then
+            modem_lock_run /usr/bin/read_pcie_sms.lua -p "$dev" --send "$dest" "$text" >/dev/null 2>&1 && return 0
+        else
+            /usr/bin/read_pcie_sms.lua -p "$dev" --send "$dest" "$text" >/dev/null 2>&1 && return 0
+        fi
+    fi
+    modem_lock_run sh -c 'printf "AT+CMGF=1\r"; sleep 1; printf "AT+CMGS=\"%s\"\r" "$2"; sleep 1; printf "%s\032" "$3"' _ "$dev" "$dest" "$text" > "$dev" 2>/dev/null
 }
 
 run_send_sms() {
@@ -319,7 +320,11 @@ run_send_sms() {
 
 case "$port" in
     /dev/wwan*|/dev/mhi*|/dev/ttyFMI*)
-        printf 'AT+CMGD=1,4\r' > "$port" 2>/dev/null || true
+        if [ -x /usr/bin/read_pcie_sms.lua ]; then
+            modem_lock_run /usr/bin/read_pcie_sms.lua -p "$port" --at "AT+CMGD=1,4" >/dev/null 2>&1 || true
+        else
+            modem_lock_run sh -c 'printf "AT+CMGD=1,4\r" > "$1"' _ "$port" 2>/dev/null || true
+        fi
         if send_pcie_at_sms "$port" "$renew_dest" "$renew_pkg" 2>/dev/null; then
             log "✔️ [Pha 1/4] Đã gửi PCIe AT [${renew_pkg}] tới [${renew_dest}] qua [$port]. Chờ 5 giây..."
         else

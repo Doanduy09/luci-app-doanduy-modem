@@ -1,0 +1,49 @@
+#!/bin/sh
+# DOANDUY Auto-Mesh RPCD Backend
+
+case "$1" in
+	list)
+		echo '{"status":{},"setMode":{"mode":"string","node_ip":"string"}}'
+		;;
+	call)
+		read -r -t 1 input 2>/dev/null || input=""
+		case "$2" in
+			status)
+				if [ -x /usr/bin/auto_mesh ]; then
+					/usr/bin/auto_mesh status
+				else
+					echo '{"success":false,"message":"Chưa cài đặt /usr/bin/auto_mesh"}'
+				fi
+				;;
+			setMode)
+				mode=$(printf '%s' "$input" | jsonfilter -e '$.mode' 2>/dev/null | tr -cd 'a-z_')
+				nip=$(printf '%s' "$input" | jsonfilter -e '$.node_ip' 2>/dev/null | tr -cd '0-9.')
+				case "$mode" in
+					auto)
+						( setsid /usr/bin/auto_mesh auto </dev/null >/dev/null 2>&1 & )
+						echo '{"success":true,"message":"Đã bật Auto-Mesh Tự Động! Router có mạng làm Chính (192.168.1.1), không mạng tự ghép làm Phụ (192.168.1.10)."}'
+						;;
+					controller)
+						( setsid /usr/bin/auto_mesh controller </dev/null >/dev/null 2>&1 & )
+						echo '{"success":true,"message":"Đang thiết lập làm Router Chính (192.168.1.1, DHCP BẬT, phát sóng DOANDUY_MESH)..."}'
+						;;
+					node)
+						[ -n "$nip" ] || nip="192.168.1.10"
+						( setsid /usr/bin/auto_mesh node "$nip" </dev/null >/dev/null 2>&1 & )
+						echo "{\"success\":true,\"new_ip\":\"$nip\",\"message\":\"Đang chuyển làm Router Phụ (IP $nip, tắt DHCP, nối vào Router Chính 192.168.1.1)...\"}"
+						;;
+					unmesh|standalone|off)
+						( setsid /usr/bin/auto_mesh unmesh </dev/null >/dev/null 2>&1 & )
+						echo '{"success":true,"new_ip":"192.168.1.1","message":"Đã tắt Mesh! Đang khôi phục IP mặc định 192.168.1.1 và bật lại DHCP..."}'
+						;;
+					*)
+						echo '{"success":false,"message":"Chế độ Mesh không hợp lệ"}'
+						;;
+				esac
+				;;
+			*)
+				echo '{"success":false,"message":"Unknown method"}'
+				;;
+		esac
+		;;
+esac

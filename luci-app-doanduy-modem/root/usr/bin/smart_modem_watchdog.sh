@@ -10,7 +10,32 @@
 # ==============================================================================
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-export TZ=Asia/Ho_Chi_Minh
+export TZ='ICT-7'
+
+has_physical_modem_present() {
+    local n d drv u vid
+    for d in /dev/wwan* /dev/mhi_* /dev/ttyFMI* /dev/cdc-wdm* /dev/qcqmi* /dev/ttyUSB* /dev/ttyACM*; do
+        [ -c "$d" ] && return 0
+    done
+    for n in /sys/class/net/wwan* /sys/class/net/mhi_hwip* /sys/class/net/rmnet* /sys/class/net/usb* /sys/class/net/rndis*; do
+        [ -e "$n" ] && return 0
+    done
+    for n in /sys/class/net/eth*; do
+        [ -e "$n" ] || continue
+        drv=$(readlink -f "$n/device/driver" 2>/dev/null)
+        case "${drv##*/}" in
+            cdc_ncm|huawei_cdc_ncm|cdc_ether|rndis_host|sierra_net|ipheth|qmi_wwan|qmi_wwan_q|cdc_mbim|GobiNet|mtk_t7xx|mhi_net|rmnet_nss) return 0 ;;
+        esac
+    done
+    for u in /sys/bus/usb/devices/*; do
+        [ -r "$u/idVendor" ] || continue
+        vid=$(tr 'A-F' 'a-f' < "$u/idVendor" 2>/dev/null)
+        case "$vid" in
+            1199|2c7c|2cb7|0e8d|05c6|12dc|3466|1e0e|1a0e|2dee|1bc7|305a|1e2d|3763|1782|413c|1508) return 0 ;;
+        esac
+    done
+    return 1
+}
 
 # Dọn ngay /tmp/wd_interface nếu bị script cũ gán nhầm vào cổng dây wan/lan
 if [ -f /tmp/wd_interface ]; then
@@ -964,6 +989,15 @@ RX_SKIP_STREAK=0
 SLEEP_INTERVAL=20
 
 while true; do
+    if ! has_physical_modem_present; then
+        FAIL_STREAK=0
+        SILENT_FREEZE_CNT=0
+        sleep 45 &
+        SLEEP_PID=$!
+        wait "$SLEEP_PID" 2>/dev/null || true
+        SLEEP_PID=""
+        continue
+    fi
     ACT_IFACE=$(get_smart_iface)
 
     # [ZERO-DELAY INTERFACE GUARD] Tự động bật lại khi interface rớt bất ngờ (chờ xong boot grace 90s và không cắt ngang quá trình quay số)
@@ -995,41 +1029,6 @@ while true; do
         fi
         proactive_rf_health_guard
         killall -CONT quectel-CM-M quectel-CM 2>/dev/null # Heartbeat safety to prevent orphan SIGSTOP
-
-        # TRAFFIC-AWARE PROACTIVE 48H WWAN PURGE & PDP RENEWAL (03:30 - 04:30 AM)
-        cur_hm=$(date +%H%M 2>/dev/null || echo "1200")
-        today_str=$(date +%Y%m%d 2>/dev/null || echo "00000000")
-        [ -z "$WWAN_UPTIME_EPOCH" ] && WWAN_UPTIME_EPOCH=$(date +%s)
-        curr_epoch=$(date +%s)
-        conn_duration=$(( curr_epoch - WWAN_UPTIME_EPOCH ))
-
-        # Nếu modem đã chạy liên tục >= 48 giờ (172800 giây) hoặc 72 giờ và đang trong khung giờ vàng 03:00 - 04:30 sáng:
-        if [ "$conn_duration" -ge 172800 ] && [ "$cur_hm" -ge "0300" ] && [ "$cur_hm" -le "0430" ] && [ "$LAST_PROACTIVE_PURGE_DATE" != "$today_str" ]; then
-            ACT_IFACE=$(get_smart_iface)
-            L3_DEV=$(get_smart_device)
-            [ ! -d "/sys/class/net/$L3_DEV" ] && L3_DEV="$ACT_IFACE"
-            rx1=$(cat "/sys/class/net/$L3_DEV/statistics/rx_packets" 2>/dev/null || echo 0)
-            sleep 2
-            rx2=$(cat "/sys/class/net/$L3_DEV/statistics/rx_packets" 2>/dev/null || echo 0)
-            if [ $((rx2 - rx1)) -lt 250 ] || [ "$cur_hm" -ge "0425" ]; then
-                LAST_PROACTIVE_PURGE_DATE="$today_str"
-                WWAN_UPTIME_EPOCH=$(date +%s)
-                echo "$(date): [ĐỊNH KỲ 48H XẢ RÁC WWAN] Card đã chạy liên tục $(($conn_duration / 3600)) giờ: Tự động Warm Reset card WWAN để giải phóng 100% rác RAM & DMA PCIe..." >> "$LOG_FILE"
-                warm_reset_wwan_baseband "Xả rác DMA/RAM modem định kỳ sau 48h" "$ACT_IFACE"
-            fi
-        elif [ "$cur_hm" -ge "0415" ] && [ "$cur_hm" -le "0430" ] && [ "$LAST_PROACTIVE_RENEW_DATE" != "$today_str" ]; then
-            ACT_IFACE=$(get_smart_iface)
-            L3_DEV=$(get_smart_device)
-            [ ! -d "/sys/class/net/$L3_DEV" ] && L3_DEV="$ACT_IFACE"
-            rx1=$(cat "/sys/class/net/$L3_DEV/statistics/rx_packets" 2>/dev/null || echo 0)
-            sleep 2
-            rx2=$(cat "/sys/class/net/$L3_DEV/statistics/rx_packets" 2>/dev/null || echo 0)
-            if [ $((rx2 - rx1)) -lt 200 ] || [ "$cur_hm" -ge "0428" ]; then
-                LAST_PROACTIVE_RENEW_DATE="$today_str"
-                echo "$(date): [PROACTIVE RENEWAL 04:15 AM] Đường truyền rảnh: Tự động làm mới phiên 5G để reset bộ đếm 24h nhà mạng..." >> "$LOG_FILE"
-                heal_tier2_wwan_session "$ACT_IFACE" >/dev/null 2>&1
-            fi
-        fi
         continue
     fi
 
@@ -1173,13 +1172,19 @@ while true; do
                 usbreset "$usb_id" >/dev/null 2>&1
             fi
 
-            # 2. Tái cấp quyền USB sysfs (ngắt và cấp lại nguồn logic USB)
-            for auth_f in /sys/bus/usb/devices/2-*/authorized /sys/bus/usb/devices/1-*/authorized; do
-                if [ -f "$auth_f" ]; then
-                    echo 0 > "$auth_f" 2>/dev/null
-                    sleep 2
-                    echo 1 > "$auth_f" 2>/dev/null
-                fi
+            # 2. Tái cấp quyền USB sysfs CHỈ CHO MODEM 4G/5G (bảo vệ tuyệt đối ổ cứng USB & USB LAN)
+            for auth_f in /sys/bus/usb/devices/*/authorized; do
+                [ -f "$auth_f" ] || continue
+                u_dir="${auth_f%/authorized}"
+                [ -r "$u_dir/idVendor" ] || continue
+                u_vid=$(tr 'A-F' 'a-f' < "$u_dir/idVendor" 2>/dev/null)
+                case "$u_vid" in
+                    1199|2c7c|2cb7|0e8d|05c6|12d1|12dc|3466|1e0e|1a0e|2dee|1bc7|305a|1e2d|3763|1782|413c|1508)
+                        echo 0 > "$auth_f" 2>/dev/null
+                        sleep 2
+                        echo 1 > "$auth_f" 2>/dev/null
+                        ;;
+                esac
             done
 
             # 3. Dọn dẹp triệt để tiến trình treo

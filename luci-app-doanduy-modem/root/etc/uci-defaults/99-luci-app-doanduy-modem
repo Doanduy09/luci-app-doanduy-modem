@@ -8,12 +8,12 @@ chmod +x /usr/bin/duydoan5g_dialer.sh 2>/dev/null
 chmod +x /usr/bin/read_pcie_sms.lua 2>/dev/null
 chmod +x /usr/bin/smart_modem_watchdog.sh 2>/dev/null
 chmod +x /usr/bin/modem_lock_run 2>/dev/null
-chmod +x /usr/bin/adshield /usr/bin/clean_dns.sh /usr/bin/remote_web_tunnel.sh /usr/bin/doanduy_remote_auto.sh /usr/bin/doanduy_pkg_helper.sh /usr/bin/send_telegram /usr/bin/device_opt.sh 2>/dev/null
+chmod +x /usr/bin/adshield /usr/bin/auto_mesh /usr/bin/clean_dns.sh /usr/bin/remote_web_tunnel.sh /usr/bin/doanduy_remote_auto.sh /usr/bin/doanduy_pkg_helper.sh /usr/bin/send_telegram /usr/bin/device_opt.sh 2>/dev/null
 chmod +x /usr/bin/logall /usr/bin/imei /usr/bin/restart_wwan /usr/bin/logchan 2>/dev/null
 chmod +x /usr/libexec/rpcd/luci.sms-status 2>/dev/null
 chmod +x /usr/libexec/rpcd/modem_ctrl 2>/dev/null
-chmod +x /usr/libexec/rpcd/doanduy.sim /usr/libexec/rpcd/doanduy.rf /usr/libexec/rpcd/doanduy.adshield /usr/libexec/rpcd/doanduy.remote /usr/libexec/rpcd/doanduy.vault /usr/libexec/rpcd/doanduy.opt /usr/libexec/rpcd/doanduy.smarthome 2>/dev/null
-chmod +x /etc/init.d/doanduy_auto /etc/init.d/smart_modem_watchdog 2>/dev/null
+chmod +x /usr/libexec/rpcd/doanduy.sim /usr/libexec/rpcd/doanduy.rf /usr/libexec/rpcd/doanduy.adshield /usr/libexec/rpcd/doanduy.remote /usr/libexec/rpcd/doanduy.vault /usr/libexec/rpcd/doanduy.opt /usr/libexec/rpcd/doanduy.mesh /usr/libexec/rpcd/doanduy.smarthome 2>/dev/null
+chmod +x /etc/init.d/doanduy_auto /etc/init.d/doanduy_mesh /etc/init.d/smart_modem_watchdog 2>/dev/null
 chmod +x /lib/netifd/proto/duydoan5g.sh 2>/dev/null
 
 # Go bo menu Script ALL cu, menu modem cu, CGI cu khong xac thuc & code chet
@@ -160,9 +160,11 @@ esac
 HP_EOF
 chmod +x /etc/hotplug.d/net/99_wwan_net.sh
 
-# 5. Kich hoat service smart_modem_watchdog & doanduy_auto (tu dong toi uu & AdShield)
+# 5. Kich hoat service smart_modem_watchdog, doanduy_mesh & doanduy_auto (tu dong Mesh, toi uu & AdShield)
 /etc/init.d/smart_modem_watchdog enable 2>/dev/null
 /etc/init.d/smart_modem_watchdog start >/dev/null 2>&1
+/etc/init.d/doanduy_mesh enable 2>/dev/null
+/etc/init.d/doanduy_mesh start >/dev/null 2>&1
 /etc/init.d/doanduy_auto enable 2>/dev/null
 [ -x /usr/bin/device_opt.sh ] && /usr/bin/device_opt.sh apply >/dev/null 2>&1
 ad_st=$(cat /etc/config/adshield_status 2>/dev/null | tr -d ' \r\n')

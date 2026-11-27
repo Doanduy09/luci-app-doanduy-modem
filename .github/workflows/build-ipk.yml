@@ -78,7 +78,7 @@ jobs:
             node --check "$jsf"
           done
 
-          echo ">> [5/5] Running Isolated Per-Scenario Group Audit (01..06)..."
+          echo ">> [5/5] Running Isolated Per-Scenario Group Audit (01..07)..."
           sh scenarios/run_scenario.sh check all
 
       - name: Extract Package Metadata
@@ -114,6 +114,7 @@ jobs:
           chmod 755 build_staging/base/lib/netifd/proto/* 2>/dev/null || true
 
           cat << 'EOF' > build_staging/conffiles.txt
+          /etc/config/doanduy_mesh
           /etc/config/doanduy_smarthome.json
           /etc/config/doanduy_smarthome_keys.json
           /etc/duytv_s06_config.json
@@ -220,6 +221,7 @@ jobs:
           [ -n "${IPKG_INSTROOT:-}" ] && exit 0
           [ -n "${APK_INSTALL_ROOT:-}" ] && exit 0
           /etc/init.d/smart_modem_watchdog stop 2>/dev/null || true
+          /etc/init.d/doanduy_mesh stop 2>/dev/null || true
           /etc/init.d/doanduy_auto stop 2>/dev/null || true
           exit 0
           EOF
@@ -259,12 +261,14 @@ jobs:
           mkdir -p verify_ipk/data
           tar -xzf verify_ipk/data.tar.gz -C verify_ipk/data
           test -x verify_ipk/data/usr/bin/duydoan5g_dialer.sh
+          test -x verify_ipk/data/usr/bin/auto_mesh
           test -x verify_ipk/data/usr/bin/read_pcie_sms.lua
           test -x verify_ipk/data/usr/bin/doanduy_pkg_helper.sh
 
           # 2. Verify APKv3 extraction & payload
           "$APK_BIN" extract --allow-untrusted --destination verify_apk "$APK_FILE"
           test -x verify_apk/usr/bin/duydoan5g_dialer.sh
+          test -x verify_apk/usr/bin/auto_mesh
           test -x verify_apk/usr/bin/read_pcie_sms.lua
           test -x verify_apk/usr/bin/doanduy_pkg_helper.sh
           test -f verify_apk/lib/apk/packages/luci-app-doanduy-modem.list
@@ -292,7 +296,7 @@ jobs:
           NOTES="### LuCI App DoanDuy Modem v${PKG_VER} (Dual Package Standard: OPKG .ipk & OpenWrt 25.12/26+ APK .apk)
           - **OpenWrt / ImmortalWrt <= 24.10 (\`opkg\`)**: \`opkg install ${IPK_FILE}\`
           - **OpenWrt / ImmortalWrt 25.12 / 26+ (\`apk\`)**: \`apk add --allow-untrusted ${APK_FILE}\`
-          - Tích hợp QModem-grade USB + PCIe SMS PDU Engine, Smart 5G Dialer, Dual Package Helper (\`doanduy_pkg_helper.sh\`), Smart Home Hub & AI Sentinel."
+          - Tích hợp QModem-grade USB + PCIe SMS PDU Engine, Ultra-Fast 5G Dialer (~1.5s), Universal Cross-Chip Auto-Mesh (Chính 192.168.1.1 <-> Phụ 192.168.1.10), Dual Package Helper (\`doanduy_pkg_helper.sh\`), Smart Home Hub & AI Sentinel."
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" "$IPK_FILE" "$APK_FILE" sha256sums.txt --clobber
             gh release edit "$TAG_NAME" --title "LuCI App DoanDuy Modem v${PKG_VER} (Dual .ipk + .apk)" --notes "$NOTES"

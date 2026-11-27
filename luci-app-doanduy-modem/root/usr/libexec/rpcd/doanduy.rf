@@ -133,7 +133,11 @@ encode_sierra_imei() {
 }
 
 is_nss_soc() {
-	lsmod 2>/dev/null | grep -qE '^qca_nss_drv|^ecm ' || [ -d /sys/kernel/debug/qca-nss-drv ] || [ -d /sys/kernel/debug/ecm ]
+	lsmod 2>/dev/null | grep -qE '^qca_nss_drv|^ecm |^mt_wifi|^mtk_hnat|^mediatek_hnat' || [ -d /sys/kernel/debug/qca-nss-drv ] || [ -d /sys/kernel/debug/ecm ] || [ -d /sys/module/mt_wifi ]
+}
+
+is_mt76_ppe_soc() {
+	! is_nss_soc && { [ -d /sys/kernel/debug/ppe ] || lsmod 2>/dev/null | grep -qE 'mtk_ppe|mt7915e|mt7986|mt76'; }
 }
 
 get_current_ttl() {
@@ -328,7 +332,11 @@ EOF
 						sw_of="${saved_of%%|*}"
 						hw_of="${saved_of#*|}"
 						uci -q set "firewall.@defaults[0].flow_offloading=${sw_of:-1}"
-						uci -q set "firewall.@defaults[0].flow_offloading_hw=${hw_of:-1}"
+						if is_mt76_ppe_soc; then
+							uci -q set "firewall.@defaults[0].flow_offloading_hw=${hw_of:-1}"
+						else
+							uci -q set "firewall.@defaults[0].flow_offloading_hw=0"
+						fi
 						uci commit firewall 2>/dev/null
 						rm -f "$OFFLOAD_SAVE"
 					fi

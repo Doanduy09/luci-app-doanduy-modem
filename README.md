@@ -1,21 +1,22 @@
-# 🚀 LuCI App DoanDuy Modem & 5G Sentinel Suite (`v2.5.0` — Modular Scenarios)
+# 🚀 LuCI App DoanDuy Modem & 5G Sentinel Suite (`v2.6.0` — Ultra-Fast Dialer & Universal Auto-Mesh)
 
-Ứng dụng quản trị chuyên sâu dành cho Modem 5G PCIe (Sierra Wireless EM9190 / Snapdragon SDX55, Quectel RM500Q/RM520N, Fibocom) & Nhà Thông Minh Đa Năng trên nền tảng **ImmortalWrt / OpenWrt** (Qualcomm IPQ8074, IPQ6000, MediaTek Filogic, x86).
+Ứng dụng quản trị chuyên sâu dành cho Modem 5G PCIe & USB (Sierra Wireless EM9190 / Snapdragon SDX55, Quectel RM500Q/RM520N, Fibocom, MediaTek T-Series) + Auto-Mesh Đa Chip & Nhà Thông Minh Đa Năng trên nền tảng **ImmortalWrt / OpenWrt** (Qualcomm IPQ807x, IPQ60xx, MediaTek Filogic, x86).
 
 ---
 
-## 🗂️ Cấu Trúc Tách Kịch Bản Độc Lập (`v2.5.0` — Dễ Quản Lý & Dễ Nâng Cấp)
+## 🗂️ Cấu Trúc Tách Kịch Bản Độc Lập (`v2.6.0` — 7 Nhóm Độc Lập)
 
-Toàn bộ mã nguồn đã được **tách thành 6 nhóm kịch bản độc lập** (xem bản đồ chi tiết tại [`SCENARIO_INDEX.md`](./SCENARIO_INDEX.md) và thư mục [`scenarios/`](./scenarios/)):
+Toàn bộ mã nguồn được **tách thành 7 nhóm kịch bản độc lập** (xem bản đồ chi tiết tại [`SCENARIO_INDEX.md`](./SCENARIO_INDEX.md) và thư mục [`scenarios/`](./scenarios/)):
 
 | Nhóm | Thư Mục Kịch Bản | Chức Năng & Module Phụ Trách |
 | :--- | :--- | :--- |
-| **01** | [`scenarios/01-dialer-watchdog/`](./scenarios/01-dialer-watchdog/README.md) | Trình quay số `duydoan5g` (QMI/MBIM/AT/ECM) & Watchdog tự phục hồi mạng 5G |
+| **01** | [`scenarios/01-dialer-watchdog/`](./scenarios/01-dialer-watchdog/README.md) | Trình quay số siêu tốc `duydoan5g` (~1.5s QMI/MBIM Fast-Path, chống rò khóa FD) & Watchdog tự phục hồi |
 | **02** | [`scenarios/02-sim-sms/`](./scenarios/02-sim-sms/README.md) | Quản lý SIM, giải mã/gửi SMS tiếng Việt UCS2, hẹn giờ SMS (`doanduy/tab_sms.js`) |
 | **03** | [`scenarios/03-rf-band-imei/`](./scenarios/03-rf-band-imei/README.md) | Sóng 5G, Khóa Băng Tần/PCI, Đổi IMEI, TTL & Lệnh AT (`doanduy/tab_modem.js`) |
 | **04** | [`scenarios/04-sentinel-telegram-remote/`](./scenarios/04-sentinel-telegram-remote/README.md) | Đa Bot Telegram, AI Sentinel, Két Key & Camera/Tailscale (`doanduy/tab_sentinel.js`) |
-| **05** | [`scenarios/05-adshield-optimizer/`](./scenarios/05-adshield-optimizer/README.md) | AdShield chặn quảng cáo DNS, Auto-Optimizer phần cứng & Khung điều phối LuCI |
+| **05** | [`scenarios/05-adshield-optimizer/`](./scenarios/05-adshield-optimizer/README.md) | AdShield tương thích PassWall, Auto-Optimizer NSS/HNAT/WED & Khung điều phối LuCI |
 | **06** | [`scenarios/06-smarthome/`](./scenarios/06-smarthome/README.md) | Nhà thông minh tự nhận diện qua IP, không giới hạn loại thiết bị & nút lệnh (5 module Lua + 2 module JS) |
+| **07** | [`scenarios/07-auto-mesh/`](./scenarios/07-auto-mesh/README.md) | Auto-Mesh Đa Chip tự động: có mạng làm Chính (`192.168.1.1`), không mạng làm Phụ (`192.168.1.10`), hết Mesh tự về mặc định |
 
 ### ⚡ Kiểm Tra Hoặc Nạp Riêng Từng Kịch Bản (Windows PowerShell & Linux/CI)
 ```powershell
@@ -45,7 +46,7 @@ Toàn bộ mã nguồn đã được **tách thành 6 nhóm kịch bản độc 
 ### 🛡️ Kịch Bản 3: Tự Động Nhận Biết Nhà Mạng Thu Hồi IP & Warm Reset Khôi Phục Tức Thì
 * **Tự nhận biết khi mất IP WAN:** Khi mạng di động thay đổi trạng thái hoặc thu hồi IP, Watchdog nhận biết ngay trong 15-20 giây.
 * **Warm Baseband Reset (`AT+CFUN=1,1` / `AT!RESET`):** Tự động ra lệnh khởi động lại chip baseband của modem, giải phóng bộ nhớ đệm PCIe MHI và cấp lại IP WAN mới tức thì.
-* **Tự Động Làm Tươi Kết Nối (Connection Refresh):** Tự động tối ưu hóa trạng thái kết nối định kỳ, giải phóng bộ đệm mạng và duy trì độ trễ thấp nhất.
+* **Không Tự Ý Ngắt Mạng Định Kỳ:** Tuyệt đối không chủ động ngắt phiên mạng đang hoạt động; chỉ can thiệp leo thang 4 cấp (Nudge DHCP -> Redial -> Warm Reset -> Cellular USB Re-enumerate) khi thực sự rớt kết nối.
 
 ### 🤖 Kịch Bản 4: Quản Lý Không Giới Hạn Camera IP & Đa Bot Telegram
 * Quản lý động danh sách Camera IP RTSP không giới hạn số lượng.

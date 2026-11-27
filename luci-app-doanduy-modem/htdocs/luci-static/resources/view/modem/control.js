@@ -8,6 +8,7 @@
 'require doanduy.tab_modem as tabModem';
 'require doanduy.tab_sentinel as tabSentinel';
 'require doanduy.smarthome as smarthome';
+'require doanduy.tab_mesh as tabMesh';
 
 var callSMSInfo           = rpc.declare({ object: 'luci.sms-status', method: 'getSMSInfo', expect: { } });
 var callGetPorts          = rpc.declare({ object: 'luci.sms-status', method: 'getAvailablePorts', expect: { } });
@@ -81,6 +82,7 @@ return view.extend({
         var tabButtons = [
             { id: 'tab-btn-sms',       key: 'sms',       icon: '📬', title: 'Quản Lý SIM & Tin Nhắn SMS' },
             { id: 'tab-btn-modem',     key: 'modem',     icon: '📶', title: 'Modem 5G, Băng Tần & Lệnh AT' },
+            { id: 'tab-btn-mesh',      key: 'mesh',      icon: '🌐', title: 'Auto-Mesh Đa Chip' },
             { id: 'tab-btn-sentinel',  key: 'sentinel',  icon: '🤖', title: 'Telegram, AI & Từ Xa' },
             { id: 'tab-btn-smarthome', key: 'smarthome', icon: '🏠', title: 'Thiết Bị Điều Khiển Nhà' }
         ];
@@ -88,6 +90,7 @@ return view.extend({
         var tabPanes = {
             sms:       tabSms.renderPane(sharedCtx),
             modem:     tabModem.renderPane(sharedCtx),
+            mesh:      tabMesh.renderPane(sharedCtx),
             sentinel:  tabSentinel.renderPane(sharedCtx),
             smarthome: smarthome.renderPane()
         };
@@ -128,6 +131,7 @@ return view.extend({
             navBar,
             tabPanes.sms,
             tabPanes.modem,
+            tabPanes.mesh,
             tabPanes.sentinel,
             tabPanes.smarthome
         ]);
