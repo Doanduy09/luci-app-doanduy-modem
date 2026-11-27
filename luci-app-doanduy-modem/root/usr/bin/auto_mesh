@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.7.6)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.7.7)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -535,6 +535,34 @@ get_mac_seed_oct() {
 	echo "${dec:-66}"
 }
 
+parse_iw_scan_mesh() {
+	local relay_ssid="$1" my_macs="$2"
+	awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v s3="$relay_ssid" -v own="$my_macs" -v pref_r="$CFG_PREFER_RELAY" '
+		BEGIN { best_score=-9999; bssid=""; essid=""; chan=""; sig=-95 }
+		function flush_bss() {
+			if ((essid == s1 || essid == s2 || essid == s3) && bssid != "" && index(own, "," bssid ",") == 0) {
+				s = sig + 0
+				wbon = (chan+0 >= 36 && chan+0 < 149) ? 40 : 0
+				if (pref_r == "1" && essid == s3) {
+					tier = 2; sc = 2000 + wbon + s
+				} else {
+					tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
+					sc = (tier == 1 ? 1000 : 0) + wbon + s
+				}
+				if (sc > best_score) {
+					best_score = sc
+					best_out = essid "|" (chan != "" ? chan : "36") "|" bssid "|" s "|" tier "|" sc
+				}
+			}
+		}
+		/^BSS / { flush_bss(); split($2, a, "("); bssid=toupper(a[1]); essid=""; chan=""; sig=-95 }
+		/^[[:space:]]*SSID: / { sub(/^[[:space:]]*SSID: /, ""); essid=$0 }
+		/primary channel:/ { chan=$NF; gsub(/[^0-9]/, "", chan) }
+		/^[[:space:]]*signal:/ { sig=$2; sub(/\..*/, "", sig) }
+		END { flush_bss(); if (best_out != "") print best_out }
+	'
+}
+
 # Quét tất cả trạm Mesh xung quanh: ƯU TIÊN SỐ 1 nối trực tiếp Router Chính (DOANDUY_MESH >= -78dBm),
 # chỉ nối tiếp qua Router Phụ (DOANDUY_MESH_R) nếu Router Chính ngoài tầm phủ sóng!
 scan_for_master_mesh() {
@@ -605,30 +633,7 @@ scan_for_master_mesh() {
 			ip link set "$w_if" up 2>/dev/null || true
 			raw=$(iw dev "$w_if" scan 2>/dev/null)
 			if [ -n "$raw" ]; then
-				best_line=$(printf '%s\n' "$raw" | awk -v s1="$CFG_SSID" -v s2="$LEGACY_MESH_SSID" -v s3="$relay_ssid" -v own="$my_macs" -v pref_r="$CFG_PREFER_RELAY" '
-					BEGIN { best_score=-9999; bssid=""; essid=""; chan=""; sig=-95 }
-					function flush_bss() {
-						if ((essid == s1 || essid == s2 || essid == s3) && bssid != "" && index(own, "," bssid ",") == 0) {
-							s = sig + 0
-							wbon = (chan+0 >= 36 && chan+0 < 149) ? 40 : 0
-							if (pref_r == "1" && essid == s3) {
-								tier = 2; sc = 2000 + wbon + s
-							} else {
-								tier = ((essid == s1 || essid == s2) && s >= -78) ? 1 : 2
-								sc = (tier == 1 ? 1000 : 0) + wbon + s
-							}
-							if (sc > best_score) {
-								best_score = sc
-								best_out = essid "|" (chan != "" ? chan : "36") "|" bssid "|" s "|" tier "|" sc
-							}
-						}
-					}
-					/^BSS / { flush_bss(); split($2, a, "("); bssid=toupper(a[1]); essid=""; chan=""; sig=-95 }
-					/^[[:space:]]*SSID: / { sub(/^[[:space:]]*SSID: /, ""); essid=$0 }
-					/primary channel:/ { chan=$NF; gsub(/[^0-9]/, "", chan) }
-					/^[[:space:]]*signal:/ { sig=$2; sub(/\..*/, "", sig) }
-					END { flush_bss(); if (best_out != "") print best_out }
-				')
+				best_line=$(printf '%s\n' "$raw" | parse_iw_scan_mesh "$relay_ssid" "$my_macs")
 			fi
 		fi
 
@@ -642,13 +647,49 @@ scan_for_master_mesh() {
 		fi
 	done
 
+	# Fallback cho ath11k 5G-Low HE160 khi AP chặn scan (-EBUSY): tạm hạ AP tạo STA ảo dd_scan rồi khôi phục
+	if [ -z "$best_out" ] && command -v iw >/dev/null 2>&1; then
+		local phy_dev band
+		for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+			[ "$(uci -q get "wireless.${dev}.disabled")" = "1" ] && continue
+			band=$(uci -q get "wireless.${dev}.band")
+			[ "$band" = "5g" ] || [ "$band" = "6g" ] || continue
+			phy_dev=$(get_phy_for_radio "$dev")
+			[ -n "$phy_dev" ] || continue
+			iw dev 2>/dev/null | awk -v p="$phy_dev" '/^phy#/{in_p=($0=="phy#"substr(p,4))} in_p && /type managed/{found=1} END{exit !found}' && continue
+			wifi down "$dev" >/dev/null 2>&1 || true
+			sleep 1
+			iw dev dd_scan del 2>/dev/null || true
+			if iw phy "$phy_dev" interface add dd_scan type managed >/dev/null 2>&1; then
+				ip link set dd_scan up >/dev/null 2>&1 || true
+				raw=$(iw dev dd_scan scan 2>/dev/null)
+				iw dev dd_scan del 2>/dev/null || true
+				if [ -n "$raw" ]; then
+					best_line=$(printf '%s\n' "$raw" | parse_iw_scan_mesh "$relay_ssid" "$my_macs")
+					if [ -n "$best_line" ]; then
+						score=$(printf '%s' "$best_line" | cut -d'|' -f6)
+						if [ "${score:--9999}" -gt "$best_score" ] 2>/dev/null; then
+							best_score="$score"
+							best_out="$best_line"
+							best_wif="$dev"
+						fi
+					fi
+				fi
+			fi
+			wifi up "$dev" >/dev/null 2>&1 || true
+		done
+	fi
+
 	if [ -n "$best_out" ]; then
 		FOUND_MESH_SSID=$(printf '%s' "$best_out" | cut -d'|' -f1)
 		FOUND_MESH_CHAN=$(printf '%s' "$best_out" | cut -d'|' -f2)
 		FOUND_MESH_BSSID=$(printf '%s' "$best_out" | cut -d'|' -f3)
 		FOUND_MESH_TIER=$(printf '%s' "$best_out" | cut -d'|' -f5)
 		[ -z "$FOUND_MESH_TIER" ] && FOUND_MESH_TIER="1"
-		FOUND_MESH_RADIO=$(get_radio_for_ifname "$best_wif")
+		case "$best_wif" in
+			radio[0-9]*) FOUND_MESH_RADIO="$best_wif" ;;
+			*) FOUND_MESH_RADIO=$(get_radio_for_ifname "$best_wif") ;;
+		esac
 		return 0
 	fi
 	return 1
@@ -958,6 +999,34 @@ ensure_node_relay_ap() {
 		return 0
 	fi
 
+	# Nếu driver/phần cứng từ chối phát Relay AP cùng kênh 160MHz với STA (NO-CARRIER / Channel 0), tắt thay vì tạo AP chết hoặc hạ xuống 80MHz
+	if [ "$radio" = "$uplink_radio" ] && [ -f "/tmp/doanduy_mesh_relay_blocked_${radio}" ]; then
+		return 0
+	fi
+	if [ "$radio" = "$uplink_radio" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.device)" = "$radio" ] && [ "$(uci -q get wireless.mesh_backhaul_ap.disabled)" != "1" ]; then
+		local rts now_s rap_if dead_ap=0
+		now_s=$(date +%s)
+		if [ ! -f /tmp/doanduy_mesh_relay_ts ]; then
+			echo "$now_s" > /tmp/doanduy_mesh_relay_ts 2>/dev/null || true
+		fi
+		rts=$(cat /tmp/doanduy_mesh_relay_ts 2>/dev/null || echo 0)
+		if [ "${rts:-0}" -gt 0 ] && [ $((now_s - rts)) -ge 12 ]; then
+			rap_if=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${radio}.interfaces[@.section='mesh_backhaul_ap'].ifname" 2>/dev/null | head -n 1)
+			if [ -n "$rap_if" ] && [ -d "/sys/class/net/$rap_if" ]; then
+				[ "$(cat "/sys/class/net/${rap_if}/carrier" 2>/dev/null)" = "0" ] && dead_ap=1
+				iwinfo "$rap_if" info 2>/dev/null | grep -q 'Channel: 0' && dead_ap=1
+			fi
+			if [ "$dead_ap" = "1" ]; then
+				uci -q delete wireless.mesh_backhaul_ap
+				uci commit wireless
+				safe_wifi_reload 1
+				touch "/tmp/doanduy_mesh_relay_blocked_${radio}"
+				log_mesh "Radio $radio ($rap_if) không hỗ trợ STA+AP đồng thời ở HE160 -> Tắt Relay AP để giữ Uplink 4804 Mbps tối đa."
+				return 0
+			fi
+		fi
+	fi
+
 	if [ "$radio" != "$uplink_radio" ]; then
 		relay_ch=$(uci -q get "wireless.${radio}.channel")
 		case "$relay_ch" in ''|auto|0)
@@ -1015,6 +1084,7 @@ ensure_node_relay_ap() {
 	fi
 
 	if [ "$changed" = "1" ]; then
+		date +%s > /tmp/doanduy_mesh_relay_ts 2>/dev/null || true
 		uci commit wireless
 		safe_wifi_reload 0
 		if [ "$radio" != "$uplink_radio" ]; then
@@ -1229,7 +1299,7 @@ apply_node_role() {
 restore_default_standalone() {
 	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0 fw_changed=0
 	ensure_mesh_uci
-	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE"
+	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts
 	if [ "$mode_after" = "disabled" ]; then
 		uci set "${MESH_UCI}.mesh.enabled=0"
 		uci set "${MESH_UCI}.mesh.mode=standalone"
@@ -1751,7 +1821,7 @@ reconcile_once() {
 		up_gw=$(get_upstream_gateway)
 		if ping -c 2 -W 1 "$up_gw" >/dev/null 2>&1; then
 			is_epoch_current "$my_epoch" || return 0
-			rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" "$PAIR_UNTIL_FILE" "$SCAN_MISS_FILE"
+			rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts "$PAIR_UNTIL_FILE" "$SCAN_MISS_FILE"
 			verify_unique_node_ip
 			ensure_node_relay_ap
 			disable_mesh_sta_powersave
@@ -1808,7 +1878,7 @@ handle_pair_cmd() {
 	uci set "${MESH_UCI}.mesh.enabled=1"
 	uci set "${MESH_UCI}.mesh.mode=auto"
 	uci commit "$MESH_UCI"
-	rm -f "$IDLE_FLAG_FILE" "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE"
+	rm -f "$IDLE_FLAG_FILE" "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts
 	start_pairing_window "$PAIR_WINDOW_SEC"
 	write_instant_status_cache
 	log_mesh "Bật Auto-Mesh Always-Ready -> Phát sóng công suất tối đa & tự động ghép nối!"
