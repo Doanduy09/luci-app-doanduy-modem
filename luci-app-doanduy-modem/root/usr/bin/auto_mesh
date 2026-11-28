@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.8)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.9)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -2509,6 +2509,10 @@ reconcile_once() {
 			fi
 			[ ! -f /tmp/doanduy_mesh_hygiene_done ] && ensure_node_system_hygiene
 			ensure_node_relay_ap
+			if [ "$(maximize_all_5g_radios)" = "1" ]; then
+				uci commit wireless
+				safe_wifi_reload 0
+			fi
 			disable_mesh_sta_powersave
 			touch "$HAD_PEER_FILE"
 			if [ -f "$WIFI_HELPER" ] && command -v lua >/dev/null 2>&1; then
