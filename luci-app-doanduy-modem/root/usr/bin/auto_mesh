@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.6)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.7)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -9,6 +9,7 @@
 # ==============================================================================
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export TZ='ICT-7'
+umask 022
 
 MESH_UCI="doanduy_mesh"
 CACHE_FILE="/tmp/auto_mesh_status.json"
@@ -165,6 +166,7 @@ write_instant_status_cache() {
   "peers": []
 }
 EOF
+	chmod 644 "${CACHE_FILE}.tmp" 2>/dev/null || true
 	mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE" 2>/dev/null
 	[ -L /www/mesh_topology.json ] || ln -sf "$CACHE_FILE" /www/mesh_topology.json 2>/dev/null || true
 }
@@ -380,6 +382,47 @@ radio_is_ath11k_nss_offload() {
 	nss_p=$(cat /sys/module/ath11k/parameters/nss_offload 2>/dev/null || echo "")
 	fm_p=$(cat /sys/module/ath11k/parameters/frame_mode 2>/dev/null || echo "")
 	[ "$nss_p" = "1" ] || [ "$nss_p" = "Y" ] || [ "$fm_p" = "2" ]
+}
+
+# Tách toàn bộ AP khỏi radio STA nếu thiết bị chạy ath11k NSS offload để giữ STA 160MHz thông suốt
+isolate_nss_offload_sta_radio() {
+	local radio="$1" changed=0 other_r=0 r_chk uap p_rem="" puap
+	radio_is_ath11k_nss_offload || { echo 0; return 0; }
+	for r_chk in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+		[ "$r_chk" = "$radio" ] && continue
+		[ "$(uci -q get "wireless.${r_chk}.disabled")" = "1" ] && continue
+		other_r=1
+		break
+	done
+	[ "$other_r" = "1" ] || { echo 0; return 0; }
+	if [ -f "$PAUSED_APS_FILE" ]; then
+		for puap in $(cat "$PAUSED_APS_FILE" 2>/dev/null); do
+			[ -n "$puap" ] || continue
+			if [ -n "$(uci -q get "wireless.${puap}")" ] && [ "$(uci -q get "wireless.${puap}.device")" != "$radio" ]; then
+				[ "$(uci -q get "wireless.${puap}.disabled")" = "1" ] && { uci -q set "wireless.${puap}.disabled=0"; changed=1; }
+			else
+				p_rem="${p_rem}${puap}
+"
+			fi
+		done
+		if [ -n "$p_rem" ]; then printf '%s' "$p_rem" > "$PAUSED_APS_FILE"; else rm -f "$PAUSED_APS_FILE"; fi
+	fi
+	for uap in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$uap" in mesh_backhaul_ap|mesh_sta) continue ;; esac
+		[ "$(uci -q get "wireless.${uap}.device")" = "$radio" ] || continue
+		[ "$(uci -q get "wireless.${uap}.mode")" = "ap" ] || continue
+		[ "$(uci -q get "wireless.${uap}.disabled")" = "1" ] && continue
+		uci set "wireless.${uap}.disabled=1"
+		mkdir -p /etc/config 2>/dev/null
+		grep -qx "$uap" "$PAUSED_APS_FILE" 2>/dev/null || echo "$uap" >> "$PAUSED_APS_FILE"
+		changed=1
+		log_mesh "ath11k NSS offload ($radio): tách AP '$uap' để giữ STA thuần 160MHz thông suốt."
+	done
+	if [ "$(uci -q get wireless.mesh_backhaul_ap.device)" = "$radio" ]; then
+		uci -q delete wireless.mesh_backhaul_ap
+		changed=1
+	fi
+	echo "$changed"
 }
 
 # Kiểm tra radio có hỗ trợ băng thông siêu rộng >=160MHz (160/320MHz) và có kênh tương thích (không bị kẹt UNII-3 80MHz)
@@ -1445,8 +1488,12 @@ ensure_node_relay_ap() {
 	target_key="$CFG_KEY"
 
 	if [ "$radio" = "$uplink_radio" ] && radio_is_ath11k_nss_offload; then
+		[ "$(isolate_nss_offload_sta_radio "$uplink_radio")" = "1" ] && changed=1
 		if [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
 			uci -q delete wireless.mesh_backhaul_ap
+			changed=1
+		fi
+		if [ "$changed" = "1" ]; then
 			uci commit wireless
 			safe_wifi_reload 0
 		fi
@@ -1729,44 +1776,7 @@ apply_node_role() {
 		uci -q delete wireless.mesh_backhaul_ap
 		wifi_changed=1
 	fi
-	if radio_is_ath11k_nss_offload; then
-		local other_r=0 r_chk uap p_rem="" puap
-		for r_chk in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
-			[ "$r_chk" = "$radio" ] && continue
-			[ "$(uci -q get "wireless.${r_chk}.disabled")" = "1" ] && continue
-			other_r=1
-			break
-		done
-		if [ "$other_r" = "1" ]; then
-			if [ -f "$PAUSED_APS_FILE" ]; then
-				for puap in $(cat "$PAUSED_APS_FILE" 2>/dev/null); do
-					[ -n "$puap" ] || continue
-					if [ -n "$(uci -q get "wireless.${puap}")" ] && [ "$(uci -q get "wireless.${puap}.device")" != "$radio" ]; then
-						[ "$(uci -q get "wireless.${puap}.disabled")" = "1" ] && { uci -q set "wireless.${puap}.disabled=0"; wifi_changed=1; }
-					else
-						p_rem="${p_rem}${puap}
-"
-					fi
-				done
-				if [ -n "$p_rem" ]; then printf '%s' "$p_rem" > "$PAUSED_APS_FILE"; else rm -f "$PAUSED_APS_FILE"; fi
-			fi
-			for uap in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
-				case "$uap" in mesh_backhaul_ap|mesh_sta) continue ;; esac
-				[ "$(uci -q get "wireless.${uap}.device")" = "$radio" ] || continue
-				[ "$(uci -q get "wireless.${uap}.mode")" = "ap" ] || continue
-				[ "$(uci -q get "wireless.${uap}.disabled")" = "1" ] && continue
-				uci set "wireless.${uap}.disabled=1"
-				mkdir -p /etc/config 2>/dev/null
-				grep -qx "$uap" "$PAUSED_APS_FILE" 2>/dev/null || echo "$uap" >> "$PAUSED_APS_FILE"
-				wifi_changed=1
-				log_mesh "ath11k NSS offload ($radio): tách AP '$uap' để giữ STA thuần 160MHz thông suốt."
-			done
-			if [ "$(uci -q get wireless.mesh_backhaul_ap.device)" = "$radio" ]; then
-				uci -q delete wireless.mesh_backhaul_ap
-				wifi_changed=1
-			fi
-		fi
-	fi
+	[ "$(isolate_nss_offload_sta_radio "$radio")" = "1" ] && wifi_changed=1
 	if [ -n "$(uci -q get wireless.mesh_80211s)" ]; then
 		uci -q delete wireless.mesh_80211s
 		wifi_changed=1
@@ -2335,6 +2345,7 @@ refresh_status_cache() {
 	cat <<EOF > /tmp/mesh_node_info.json.tmp
 {"role":"$(json_esc "$role")","hostname":"$(json_esc "$lname")","model":"$(json_esc "$bmodel")","ip":"$(json_esc "$lip")","lan_subnet":"$(json_esc "$lan_sub")","mac":"$(json_esc "$lmac")","mesh_bssid":"$(json_esc "$mbssid")","uplink_bssid":"$(json_esc "$ubssid")","uplink_signal":"$(json_esc "$usig_lbl")","children":$children_js}
 EOF
+	chmod 644 /tmp/mesh_node_info.json.tmp 2>/dev/null || true
 	mv -f /tmp/mesh_node_info.json.tmp /tmp/mesh_node_info.json 2>/dev/null || true
 	[ -L /www/mesh_node_info.json ] || ln -sf /tmp/mesh_node_info.json /www/mesh_node_info.json 2>/dev/null || true
 
@@ -2397,6 +2408,7 @@ EOF
   "peers": $pjson
 }
 EOF
+	chmod 644 "${CACHE_FILE}.tmp" 2>/dev/null || true
 	mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE" 2>/dev/null
 	[ -L /www/mesh_topology.json ] || ln -sf "$CACHE_FILE" /www/mesh_topology.json 2>/dev/null || true
 }
