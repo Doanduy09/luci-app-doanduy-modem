@@ -722,8 +722,18 @@ preemptive_5g_handover() {
         if is_quectel_modem; then
             local serving_cell=""
             serving_cell=$(wd_at_cmd "$port" 'AT+QENG="servingcell"' 3 2>/dev/null)
-            sinr=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $NF}' | tr -d ' \r\n')
-            rsrp=$(echo "$serving_cell" | grep -iE 'NR5G-NSA|NR5G-SA' | awk -F',' '{print $(NF-2)}' | tr -d ' \r\n')
+            eval "$(printf '%s\n' "$serving_cell" | awk -F',' '
+                {sub(/^[^:]*:[[:space:]]*/, "", $1)}
+                /"NR5G-NSA"/{for(i=1;i<=NF;i++)gsub(/[^0-9A-Za-z_-]/,"",$i); if(NF>=6 && $4!="65535"){nr_r=$5;nr_s=$6}}
+                /"NR5G-SA"/{for(i=1;i<=NF;i++){gsub(/[^0-9A-Za-z_-]/,"",$i); if($i=="NR5G-SA"){nr_r=$(i+10);nr_s=$(i+12)}}}
+                /"LTE"/{for(i=1;i<=NF;i++){gsub(/[^0-9A-Za-z_-]/,"",$i); if($i=="LTE"){lt_r=$(i+11);lt_s=$(i+14)}}}
+                END{
+                    r=(nr_r!="" && nr_r!="-32768" && nr_r!="32767" ? nr_r : lt_r);
+                    s=(nr_s!="" && nr_s!="-32768" && nr_s!="32767" && nr_s!="-255" ? nr_s : lt_s);
+                    if(r=="-32768"||r=="32767"||r=="-") r="";
+                    if(s=="-32768"||s=="32767"||s=="-255"||s=="-") s="";
+                    printf "rsrp=%s sinr=%s", r, s
+                }')"
         else
             local gstatus=""
             gstatus=$(wd_at_cmd "$port" "AT!GSTATUS?" 3 2>/dev/null)

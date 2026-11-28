@@ -727,7 +727,7 @@ detect_modem_profile() {
             MODEM_VENDOR="sierra"
             MODEM_PLATFORM="qualcomm"
             ;;
-        413c:*|05c6:*|*Foxconn*|*T99W*|*DW593*)
+        0489:*|413c:*|05c6:*|*Foxconn*|*T99W*|*DW593*)
             MODEM_VENDOR="foxconn"
             MODEM_PLATFORM="qualcomm"
             ;;
@@ -890,14 +890,219 @@ EOF
     cp -f "/tmp/duydoan5g_modem_meta_${interface}" /tmp/duydoan5g_modem_meta 2>/dev/null || true
 }
 
+auto_unlock_all_bands_ca() {
+    [ -c "$AT_PORT" ] || return 0
+    [ "$MODE" = "phone_dhcp" ] || [ "$MODEM_VENDOR" = "phone" ] && return 0
+    [ -f /etc/config/cell_lock_golden.json ] && return 0
+    [ -s /etc/config/cell_lock_mode ] && return 0
+    if [ -f /etc/config/band_lock_mode ]; then
+        local bmode
+        bmode=$(tr -d ' \t\r\n' < /etc/config/band_lock_mode 2>/dev/null)
+        case "$bmode" in
+            ""|auto) ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    local vendor="$MODEM_VENDOR" changed=0
+    local pol_out="" key pol_val cur_out cur_val pol_norm cur_norm mp_out rat_out nd_out ns_out
+
+    # 1. Quectel (RM50xQ/RM52xN/RM551E/RG5xx/RM500U/EM160R/EP06/EC2x) & QNWPREFCFG-capable OEM cards
+    pol_out=$(safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="policy_band"' | tr -d '\r')
+    if printf '%s' "$pol_out" | grep -q '+QNWPREFCFG:'; then
+        nd_out=$(safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="nr5g_disable_mode"' | tr -d '\r')
+        if printf '%s' "$nd_out" | grep -qE '"nr5g_disable_mode",[[:space:]]*[12]'; then
+            safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="nr5g_disable_mode",0' >/dev/null
+            changed=1
+        fi
+        mp_out=$(safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="mode_pref"' | tr -d '\r')
+        if printf '%s' "$mp_out" | grep -q '"mode_pref"' && ! printf '%s' "$mp_out" | grep -qE 'AUTO|LTE:NR5G|NR5G:LTE'; then
+            safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="mode_pref",AUTO' >/dev/null || safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="mode_pref",LTE:NR5G' >/dev/null
+            changed=1
+        fi
+        rat_out=$(safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="rat_acq_order"' | tr -d '\r')
+        if printf '%s' "$rat_out" | grep -q '"rat_order_pref"' && ! printf '%s' "$rat_out" | grep -q 'NR5G:LTE'; then
+            safe_at_once "$AT_PORT" 'AT+QNWPREFCFG="rat_acq_order",NR5G:LTE:WCDMA' >/dev/null
+            changed=1
+        fi
+        for key in lte_band nsa_nr5g_band nr5g_band; do
+            pol_val=$(printf '%s\n' "$pol_out" | awk -F',' -v k="\"${key}\"" '$0 ~ k {v=$2; for(i=3;i<=NF;i++) v=v":"$i; gsub(/[^0-9:]/,"",v); print v; exit}')
+            [ -n "$pol_val" ] || continue
+            cur_out=$(safe_at_once "$AT_PORT" "AT+QNWPREFCFG=\"${key}\"" | tr -d '\r')
+            cur_val=$(printf '%s\n' "$cur_out" | awk -F',' -v k="\"${key}\"" '$0 ~ k {v=$2; for(i=3;i<=NF;i++) v=v":"$i; gsub(/[^0-9:]/,"",v); print v; exit}')
+            [ -n "$cur_val" ] || continue
+            pol_norm=$(printf '%s' "$pol_val" | tr ':' '\n' | awk '$1!=""' | sort -nu | tr '\n' ':' | sed 's/:$//')
+            cur_norm=$(printf '%s' "$cur_val" | tr ':' '\n' | awk '$1!=""' | sort -nu | tr '\n' ':' | sed 's/:$//')
+            if [ -n "$pol_norm" ] && [ "$cur_norm" != "$pol_norm" ]; then
+                safe_at_once "$AT_PORT" "AT+QNWPREFCFG=\"${key}\",${pol_norm}" >/dev/null && changed=1
+            fi
+        done
+        [ "$changed" = "1" ] && logger -t duydoan5g "Auto-CA: Đã mở full băng tần policy (${AT_PORT}) để tối đa gộp sóng 4G+5G."
+        return 0
+    fi
+
+    if [ "$vendor" = "quectel" ]; then
+        ns_out=$(safe_at_once "$AT_PORT" 'AT+QCFG="nwscanmode"' | tr -d '\r')
+        if printf '%s' "$ns_out" | grep -q '"nwscanmode"' && ! printf '%s' "$ns_out" | grep -qE '"nwscanmode",[[:space:]]*0([^0-9]|$)'; then
+            safe_at_once "$AT_PORT" 'AT+QCFG="nwscanmode",0' >/dev/null && changed=1
+        fi
+        [ "$changed" = "1" ] && logger -t duydoan5g "Auto-CA (Quectel LTE): Đã mở nwscanmode=0 Auto CA trên $AT_PORT."
+        return 0
+    fi
+
+    # 2. Fibocom (FM350-GL/RW350 MTK, FM150/FM160/FM170 QCOM, FM650/L610 Unisoc, NL668/NL678 LTE)
+    local gt_cur="" gt_caps="" gt_rat="" gt_cnt=0
+    if [ "$vendor" = "fibocom" ] || [ "$vendor" = "unknown" ]; then
+        gt_cur=$(safe_at_once "$AT_PORT" "AT+GTACT?" | tr -d '\r' | grep '+GTACT:' | head -n 1)
+        if [ -n "$gt_cur" ]; then
+            gt_rat=$(printf '%s' "$gt_cur" | sed 's/.*+GTACT:[[:space:]]*//' | cut -d',' -f1 | tr -cd '0-9')
+            gt_cnt=$(printf '%s' "$gt_cur" | awk -F',' '{c=0; for(i=4;i<=NF;i++){gsub(/[^0-9]/,"",$i); if($i+0>0) c++} print c}')
+            gt_caps=$(safe_at_once "$AT_PORT" "AT+GTACT=?" | tr -d '\r')
+            if printf '%s' "$gt_caps" | grep -qE '17|20|500[1-9]|50[1-9][0-9]'; then
+                if { [ "$gt_rat" != "20" ] && [ "$gt_rat" != "17" ]; } || [ "${gt_cnt:-0}" -lt 4 ]; then
+                    safe_at_once "$AT_PORT" "AT+GTACT=20,6,3" >/dev/null && changed=1
+                fi
+            elif [ -n "$gt_rat" ] && [ "$gt_rat" != "10" ] && [ "$gt_rat" != "4" ]; then
+                safe_at_once "$AT_PORT" "AT+GTACT=10" >/dev/null && changed=1
+            fi
+            [ "$changed" = "1" ] && logger -t duydoan5g "Auto-CA (Fibocom): Đã mở full băng tần Multi-RAT trên $AT_PORT."
+            return 0
+        fi
+    fi
+
+    # 3. Sierra Wireless (EM9190/EM9291/MC735x)
+    local sr_out="" sb_out=""
+    if [ "$vendor" = "sierra" ] || [ "$vendor" = "unknown" ]; then
+        sr_out=$(safe_at_once "$AT_PORT" "AT!SELRAT?" | tr -d '\r')
+        if [ -n "$sr_out" ] && printf '%s' "$sr_out" | grep -qiE 'SELRAT:|Automatic|Only'; then
+            if ! printf '%s' "$sr_out" | grep -qiE '00,|Automatic|LTE and NR5G|21,'; then
+                safe_at_once "$AT_PORT" 'AT!ENTERCND="A710"' >/dev/null
+                safe_at_once "$AT_PORT" "AT!SELRAT=00" >/dev/null && changed=1
+            fi
+            sb_out=$(safe_at_once "$AT_PORT" "AT!BAND?" | tr -d '\r')
+            if [ -n "$sb_out" ] && ! printf '%s' "$sb_out" | grep -qiE '(^|[[:space:]])00,|All bands'; then
+                safe_at_once "$AT_PORT" 'AT!ENTERCND="A710"' >/dev/null
+                safe_at_once "$AT_PORT" "AT!BAND=00" >/dev/null && changed=1
+            fi
+            [ "$changed" = "1" ] && logger -t duydoan5g "Auto-CA (Sierra): Đã mở AT!SELRAT=00 & AT!BAND=00 trên $AT_PORT."
+            return 0
+        fi
+    fi
+
+    # 4. SIMCom (SIM8200/8202/8380/A8200/A7605C)
+    local cn_out="" cn_val=""
+    if [ "$vendor" = "simcom" ] || [ "$vendor" = "unknown" ]; then
+        cn_out=$(safe_at_once "$AT_PORT" "AT+CNMP?" | tr -d '\r')
+        if printf '%s' "$cn_out" | grep -q '+CNMP:'; then
+            cn_val=$(printf '%s' "$cn_out" | sed -n 's/.*+CNMP:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1)
+            if [ -n "$cn_val" ] && [ "$cn_val" != "2" ] && [ "$cn_val" != "109" ]; then
+                safe_at_once "$AT_PORT" "AT+CNMP=2" >/dev/null && changed=1
+            fi
+            [ "$changed" = "1" ] && logger -t duydoan5g "Auto-CA (SIMCom): Đã mở AT+CNMP=2 Auto 4G+5G trên $AT_PORT."
+            return 0
+        fi
+    fi
+
+    # 5. Foxconn / Thales (T99W175/T99W373/T99W368/T99W640/T77W968, MV32)
+    local sl_out="" at_pre=""
+    if [ "$vendor" = "foxconn" ] || [ "$vendor" = "thales" ]; then
+        sl_out=$(safe_at_once "$AT_PORT" 'AT^SLMODE?' | tr -d '\r')
+        if printf '%s' "$sl_out" | grep -qi 'SLMODE:'; then
+            at_pre='AT^'
+        else
+            sl_out=$(safe_at_once "$AT_PORT" 'AT+SLMODE?' | tr -d '\r')
+            printf '%s' "$sl_out" | grep -qi 'SLMODE:' && at_pre='AT+'
+        fi
+        if [ -n "$at_pre" ] && printf '%s' "$sl_out" | grep -qE '1,[[:space:]]*[124]([^0-9]|$)'; then
+            safe_at_once "$AT_PORT" "${at_pre}SLMODE=1,7" >/dev/null || safe_at_once "$AT_PORT" "${at_pre}SLMODE=1,6" >/dev/null
+            logger -t duydoan5g "Auto-CA (${vendor}): Đã mở ${at_pre}SLMODE=1,7 Multi-RAT trên $AT_PORT."
+        fi
+        return 0
+    fi
+
+    # 6. Telit (FN990A40), Huawei/MeiG (MT57xx/MH5000/SRM8xx), Gosuncn/Neoway/OpenLuat
+    case "$vendor" in
+        telit)
+            local ws_out ws_val
+            ws_out=$(safe_at_once "$AT_PORT" "AT+WS46?" | tr -d '\r')
+            ws_val=$(printf '%s' "$ws_out" | sed -n 's/.*+WS46:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1)
+            if [ -n "$ws_val" ] && [ "$ws_val" != "38" ] && [ "$ws_val" != "37" ]; then
+                safe_at_once "$AT_PORT" "AT+WS46=38" >/dev/null || safe_at_once "$AT_PORT" "AT+WS46=37" >/dev/null
+                logger -t duydoan5g "Auto-CA (Telit): Đã mở AT+WS46=38 (4G+5G) trên $AT_PORT."
+            fi
+            ;;
+        huawei|meig)
+            local sy_out sy_mode
+            sy_out=$(safe_at_once "$AT_PORT" 'AT^SYSCFGEX?' | tr -d '\r')
+            sy_mode=$(printf '%s' "$sy_out" | sed -n 's/.*\^SYSCFGEX:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+            case "$sy_mode" in
+                00|0803|080302|0403|040302|"") ;;
+                *)
+                    if [ "$vendor" = "meig" ]; then
+                        safe_at_once "$AT_PORT" 'AT^SYSCFGEX="00",all,0,2,all,all,all,all,1' >/dev/null && changed=1
+                    else
+                        safe_at_once "$AT_PORT" 'AT^SYSCFGEX="00",3FFFFFFF,1,2,7FFFFFFFFFFFFFFF,,' >/dev/null && changed=1
+                    fi
+                    [ "$changed" = "1" ] && logger -t duydoan5g "Auto-CA (${vendor}): Đã mở AT^SYSCFGEX=00 full band trên $AT_PORT."
+                    ;;
+            esac
+            ;;
+        gosuncn)
+            local zs_out zb_out
+            zs_out=$(safe_at_once "$AT_PORT" "AT+ZSNT?" | tr -d '\r')
+            if printf '%s' "$zs_out" | grep -q '+ZSNT:' && ! printf '%s' "$zs_out" | grep -q '+ZSNT: *0,0,0'; then
+                safe_at_once "$AT_PORT" "AT+ZSNT=0,0,0" >/dev/null && changed=1
+            fi
+            zb_out=$(safe_at_once "$AT_PORT" "AT+ZBAND?" | tr -d '\r')
+            if printf '%s' "$zb_out" | grep -q '+ZBAND:' && ! printf '%s' "$zb_out" | grep -qiE '\+ZBAND: *(0|all)'; then
+                safe_at_once "$AT_PORT" "AT+ZBAND=0" >/dev/null || safe_at_once "$AT_PORT" "AT+ZBAND=all,all,all,all" >/dev/null
+                changed=1
+            fi
+            [ "$changed" = "1" ] && logger -t duydoan5g "Auto-CA (Gosuncn): Đã mở full băng tần trên $AT_PORT."
+            ;;
+        neoway)
+            local nw_out
+            nw_out=$(safe_at_once "$AT_PORT" "AT+NWSETBAND?" | tr -d '\r')
+            if printf '%s' "$nw_out" | grep -q '+NWSETBAND:' && ! printf '%s' "$nw_out" | grep -q '+NWSETBAND: *0'; then
+                safe_at_once "$AT_PORT" "AT+NWSETBAND=0" >/dev/null
+                logger -t duydoan5g "Auto-CA (Neoway): Đã mở AT+NWSETBAND=0 trên $AT_PORT."
+            fi
+            ;;
+        openluat)
+            local ct_out
+            ct_out=$(safe_at_once "$AT_PORT" "AT+CTEC?" | tr -d '\r')
+            if printf '%s' "$ct_out" | grep -q '+CTEC:' && ! printf '%s' "$ct_out" | grep -q '+CTEC: *0'; then
+                safe_at_once "$AT_PORT" "AT+CTEC=0,0" >/dev/null
+                logger -t duydoan5g "Auto-CA (OpenLuat): Đã mở AT+CTEC=0,0 trên $AT_PORT."
+            fi
+            ;;
+    esac
+    return 0
+}
+
+log_ca_aggregation_status() {
+    [ -c "$AT_PORT" ] || return 0
+    local ca_out="" summary=""
+    case "$MODEM_VENDOR" in
+        quectel) ca_out=$(safe_at_once "$AT_PORT" "AT+QCAINFO" | tr -d '\r' | grep '+QCAINFO:') ;;
+        fibocom) ca_out=$(safe_at_once "$AT_PORT" "AT+GTCAINFO?" | tr -d '\r' | grep '+GTCAINFO:') ;;
+        telit)   ca_out=$(safe_at_once "$AT_PORT" "AT#CAINFOEXT?" | tr -d '\r' | grep '#CAINFOEXT:') ;;
+    esac
+    [ -n "$ca_out" ] || return 0
+    summary=$(printf '%s\n' "$ca_out" | tr '\n' ';' | sed 's/;*$//')
+    logger -t duydoan5g "CA status ($MODEM_VENDOR/$IFNAME): $summary"
+}
+
 async_populate_modem_meta() {
     (
         exec 8>&-
         sleep 2
         find_working_at_port || { detect_modem_profile; write_modem_meta; exit 0; }
         detect_modem_profile
+        auto_unlock_all_bands_ca
         sync_sim_status
         write_modem_meta
+        log_ca_aggregation_status
     ) >/dev/null 2>&1 &
 }
 
@@ -942,6 +1147,7 @@ pre_dial_prepare() {
     fi
 
     wait_modem_ready
+    auto_unlock_all_bands_ca
 
     if [ "$MODEM_VENDOR" = "quectel" ] && [ -f /etc/config/cell_lock_golden.json ] && command -v jsonfilter >/dev/null 2>&1; then
         lte_f=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.lte_freq' 2>/dev/null)
@@ -1711,6 +1917,7 @@ async_enrich_modem_meta() {
         sleep 2
         find_working_at_port || true
         detect_modem_profile
+        auto_unlock_all_bands_ca
         sync_sim_status
         if [ "$MODEM_VENDOR" = "quectel" ] && [ -f /etc/config/cell_lock_golden.json ] && command -v jsonfilter >/dev/null 2>&1; then
             lte_f=$(jsonfilter -i /etc/config/cell_lock_golden.json -e '@.lte_freq' 2>/dev/null)

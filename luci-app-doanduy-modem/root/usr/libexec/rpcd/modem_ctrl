@@ -198,25 +198,63 @@ read_rf_telemetry_cached() {
 
 		if [ "$vendor" = "quectel" ] || [ "$USB_VID" = "2c7c" ]; then
 			rf_out=$(safe_at_query "$port" 'AT+QENG="servingcell"')
-			lte_line=$(printf '%s\n' "$rf_out" | grep -E '\+QENG:[[:space:]]*"LTE"' | head -n 1)
+			lte_line=$(printf '%s\n' "$rf_out" | grep -E '"LTE"' | head -n 1)
 			nr_line=$(printf '%s\n' "$rf_out" | grep -E 'NR5G-NSA|NR5G-SA' | head -n 1)
+			if [ -n "$lte_line" ]; then
+				eval "$(printf '%s\n' "$lte_line" | awk -F',' '{
+					sub(/^[^:]*:[[:space:]]*/, "", $1);
+					for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i);
+					k=0; for(i=1;i<=NF;i++) if($i=="LTE"){k=i; break}
+					if(k>0){
+						printf "lte_band=%s lte_rsrp=%s lte_rsrq=%s lte_sinr=%s", $(k+7), $(k+11), $(k+12), $(k+14)
+					}
+				}')"
+				case "$lte_rsrp" in -32768|32767|255|'-'|'') lte_rsrp="" ;; esac
+				case "$lte_rsrq" in -32768|32767|255|'-'|'') lte_rsrq="" ;; esac
+				case "$lte_sinr" in -32768|-255|32767|255|'-'|'') lte_sinr="" ;; esac
+			fi
 			if [ -n "$nr_line" ]; then
 				case "$nr_line" in
 					*NR5G-SA*)
 						rat="5G SA"
-						eval "$(printf '%s\n' "$nr_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "nr_band=%s nr_rsrp=%s nr_rsrq=%s nr_sinr=%s", $11, $13, $14, $15}')"
-						rsrp="$nr_rsrp"; rsrq="$nr_rsrq"; sinr="$nr_sinr"
-						[ -n "$nr_band" ] && band="n${nr_band}"
+						eval "$(printf '%s\n' "$nr_line" | awk -F',' '{
+							sub(/^[^:]*:[[:space:]]*/, "", $1);
+							for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i);
+							k=0; for(i=1;i<=NF;i++) if($i=="NR5G-SA"){k=i; break}
+							if(k>0){
+								printf "nr_band=%s nr_rsrp=%s nr_rsrq=%s nr_sinr=%s", $(k+8), $(k+10), $(k+11), $(k+12)
+							}
+						}')"
+						case "$nr_rsrp" in -32768|32767|255|'-'|'') nr_rsrp="" ;; esac
+						case "$nr_rsrq" in -32768|32767|255|'-'|'') nr_rsrq="" ;; esac
+						case "$nr_sinr" in -32768|-255|32767|255|'-'|'') nr_sinr="" ;; esac
+						rsrp="${nr_rsrp:-$lte_rsrp}"
+						rsrq="${nr_rsrq:-$lte_rsrq}"
+						sinr="${nr_sinr:-$lte_sinr}"
+						[ -n "$nr_band" ] && [ "$nr_band" != "-" ] && band="n${nr_band}"
 						;;
 					*)
 						rat="5G NSA"
-						eval "$(printf '%s\n' "$nr_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "nr_rsrp=%s nr_sinr=%s nr_rsrq=%s nr_band=%s", $5, $6, $7, $9}')"
-						[ -n "$lte_line" ] && eval "$(printf '%s\n' "$lte_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "lte_band=%s lte_rsrp=%s lte_rsrq=%s lte_sinr=%s", $10, $14, $15, $17}')"
-						if [ -n "$lte_band" ] && [ -n "$nr_band" ]; then
+						eval "$(printf '%s\n' "$nr_line" | awk -F',' '{
+							sub(/^[^:]*:[[:space:]]*/, "", $1);
+							for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i);
+							k=0; for(i=1;i<=NF;i++) if($i=="NR5G-NSA"){k=i; break}
+							if(k>0){
+								printf "nr_pci=%s nr_rsrp=%s nr_sinr=%s nr_rsrq=%s nr_band=%s", $(k+3), $(k+4), $(k+5), $(k+6), $(k+8)
+							}
+						}')"
+						if [ "$nr_pci" = "65535" ]; then
+							nr_rsrp=""; nr_rsrq=""; nr_sinr=""; nr_band=""
+						else
+							case "$nr_rsrp" in -32768|32767|255|'-'|'') nr_rsrp="" ;; esac
+							case "$nr_rsrq" in -32768|32767|255|'-'|'') nr_rsrq="" ;; esac
+							case "$nr_sinr" in -32768|-255|32767|255|'-'|'') nr_sinr="" ;; esac
+						fi
+						if [ -n "$lte_band" ] && [ -n "$nr_band" ] && [ "$nr_band" != "-" ]; then
 							band="B${lte_band} + n${nr_band}"
-						elif [ -n "$nr_band" ]; then
+						elif [ -n "$nr_band" ] && [ "$nr_band" != "-" ]; then
 							band="n${nr_band}"
-						elif [ -n "$lte_band" ]; then
+						elif [ -n "$lte_band" ] && [ "$lte_band" != "-" ]; then
 							band="B${lte_band}"
 						fi
 						rsrp="${nr_rsrp:-$lte_rsrp}"
@@ -226,8 +264,7 @@ read_rf_telemetry_cached() {
 				esac
 			elif [ -n "$lte_line" ]; then
 				rat="${rat:-4G LTE}"
-				eval "$(printf '%s\n' "$lte_line" | awk -F',' '{for(i=1;i<=NF;i++) gsub(/[^0-9A-Za-z_-]/,"",$i); printf "lte_band=%s lte_rsrp=%s lte_rsrq=%s lte_sinr=%s", $10, $14, $15, $17}')"
-				[ -n "$lte_band" ] && band="B${lte_band}"
+				[ -n "$lte_band" ] && [ "$lte_band" != "-" ] && band="B${lte_band}"
 				rsrp="$lte_rsrp"; rsrq="$lte_rsrq"; sinr="$lte_sinr"
 			fi
 			temp_out=$(safe_at_query "$port" "AT+QTEMP")
@@ -340,6 +377,11 @@ read_rf_telemetry_cached() {
 				case "$sinr" in ''|'-'|'255') ;; *) extra="$extra | SNR ${sinr} dB" ;; esac
 				;;
 		esac
+
+		[ -z "$op" ] && [ -z "$rsrp" ] && [ -z "$band" ] && {
+			[ -f "$cache_file" ] && . "$cache_file" 2>/dev/null
+			exit 0
+		}
 
 		cat <<EOF > "${cache_file}.tmp"
 C_OP='$(san "$op")'
