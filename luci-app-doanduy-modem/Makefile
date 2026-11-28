@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-doanduy-modem
-PKG_VERSION:=2.8.9
+PKG_VERSION:=2.9.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-3.0-or-later
