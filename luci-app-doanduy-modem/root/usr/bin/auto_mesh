@@ -2036,17 +2036,79 @@ disable_mesh_sta_powersave() {
 	done
 }
 
+parse_dump_peer_metrics() {
+	local dump="$1" target_mac="$2"
+	[ -n "$dump" ] && [ -n "$target_mac" ] || { echo "|"; return 0; }
+	printf '%s\n' "$dump" | awk -v m="$(printf '%s' "$target_mac" | tr 'A-Z' 'a-z')" '
+		/^Station /{
+			in_s = (tolower($2) == m)
+			if (in_s) { matched=1; s_avg=""; s_cur=""; s_bcn=""; r=0 }
+			next
+		}
+		!in_s { next }
+		/^[[:space:]]*signal avg:[[:space:]]/{
+			v = $3 + 0
+			if (v < 0 && v > -115 && s_avg == "") s_avg = int(v)
+		}
+		/^[[:space:]]*signal:[[:space:]]/{
+			v = $2 + 0
+			if (v < 0 && v > -115 && s_cur == "") s_cur = int(v)
+		}
+		/^[[:space:]]*beacon signal avg:[[:space:]]/{
+			v = $4 + 0
+			if (v < 0 && v > -115 && s_bcn == "") s_bcn = int(v)
+		}
+		(/rx bitrate:/ || /tx bitrate:/){
+			if ($3 + 0 > r) r = $3 + 0
+		}
+		END{
+			if (!matched) { print "|"; exit }
+			sig = (s_avg != "" ? s_avg : (s_cur != "" ? s_cur : s_bcn))
+			if (r >= 1000 && sig != "" && s_bcn != "" && s_bcn >= -68 && s_bcn <= -15) {
+				if (sig < -68 || (s_bcn - sig) >= 20) sig = s_bcn
+			}
+			rate = (r > 6 ? sprintf("%.0f", r) : "")
+			printf "%s|%s\n", sig, rate
+		}
+	'
+}
+
+merge_mesh_signal_label() {
+	local ap_sig="$1" ap_rate="$2" peer_sig_txt="$3"
+	awk -v as="$ap_sig" -v ar="$ap_rate" -v ps="$peer_sig_txt" 'BEGIN{
+		psig = ""; prate = 0
+		if (match(ps, /-[0-9]+/)) psig = substr(ps, RSTART, RLENGTH)
+		if (match(ps, /[0-9]+[[:space:]]*Mbps/)) {
+			ps_m = substr(ps, RSTART, RLENGTH)
+			sub(/[[:space:]]*Mbps.*/, "", ps_m)
+			prate = ps_m + 0
+		}
+		as_num = (as ~ /^-[0-9]+$/ ? as + 0 : 0)
+		sig = (as_num <= -15 && as_num >= -105 ? as : psig)
+		ar_num = (ar ~ /^[0-9]+$/ ? ar + 0 : 0)
+		rate = (ar_num > prate ? ar_num : prate)
+		if (sig != "" && rate > 6) printf "%s dBm • %.0f Mbps\n", sig, rate
+		else if (sig != "") printf "%s dBm\n", sig
+		else if (rate > 6) printf "%.0f Mbps\n", rate
+		else if (ps != "") print ps
+	}'
+}
+
 get_local_uplink_info() {
-	local sta_if ubssid="" usig="" urate="" link_out="" dump_out=""
+	local sta_if ubssid="" usig="" urate="" link_out="" dump_out="" dmetrics="" urate_num=""
 	if command -v iw >/dev/null 2>&1; then
 		sta_if=$(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type managed/{print i; exit}')
 		if [ -n "$sta_if" ]; then
 			link_out=$(iw dev "$sta_if" link 2>/dev/null)
 			dump_out=$(iw dev "$sta_if" station dump 2>/dev/null)
 			ubssid=$(printf '%s\n' "$link_out" | awk '/Connected to /{print toupper($3); exit}')
-			usig=$(printf '%s\n' "$link_out" | awk '/signal:/{print $2; exit}')
-			[ -n "$usig" ] || usig=$(printf '%s\n' "$dump_out" | awk '/^[[:space:]]*signal:[[:space:]]/{print $2; exit}')
-			urate=$(printf '%s\n%s\n' "$link_out" "$dump_out" | awk '/rx bitrate:|tx bitrate:/{if($3+0 > m) m=$3+0} END{if(m > 6) printf "%.0f Mbps", m}')
+			if [ -n "$ubssid" ]; then
+				dmetrics=$(parse_dump_peer_metrics "$dump_out" "$ubssid")
+				usig="${dmetrics%|*}"
+			fi
+			[ -n "$usig" ] || usig=$(printf '%s\n' "$link_out" | awk '/signal:/{v=$2+0; if(v<0 && v>-115) print int(v); exit}')
+			urate_num=$(printf '%s\n%s\n' "$link_out" "$dump_out" | awk '/rx bitrate:|tx bitrate:/{if($3+0 > m) m=$3+0} END{if(m > 6) printf "%.0f", m}')
+			[ -n "$urate_num" ] && urate="${urate_num} Mbps"
 		fi
 	fi
 	if [ -z "$ubssid" ] && command -v iwinfo >/dev/null 2>&1; then
@@ -2094,12 +2156,11 @@ collect_relay_children_json() {
 		cip=""
 		[ -f /tmp/dhcp.leases ] && cip=$(awk -v m="$smac" 'tolower($2)==m {print $3; exit}' /tmp/dhcp.leases 2>/dev/null)
 		[ -z "$cip" ] && cip=$(awk -v m="$smac" 'tolower($4)==m && $3!="0x0" {print $1; exit}' /proc/net/arp 2>/dev/null)
-		sig_txt=$(printf '%s\n' "$dump" | awk -v m="$smac" '
-			/^Station /{in_s=(tolower($2)==m); s=""; r=0}
-			in_s && /^[[:space:]]*signal:[[:space:]]/{s=$2 " dBm"}
-			in_s && (/rx bitrate:/ || /tx bitrate:/){if($3+0 > r) r=$3+0}
-			END{if(r>6) printf "%s • %.0f Mbps", (s!=""?s:"-45 dBm"), r; else if(s!="") print s}
-		')
+		local ap_m ap_s ap_r cm_s=""
+		ap_m=$(parse_dump_peer_metrics "$dump" "$smac")
+		ap_s="${ap_m%|*}"
+		ap_r="${ap_m#*|}"
+		sig_txt=$(merge_mesh_signal_label "$ap_s" "$ap_r" "")
 		cmodel="Router Phụ (Tầng 2)"
 		chost="DOANDUY"
 		cmac=$(printf '%s' "$smac" | tr 'a-z' 'A-Z')
@@ -2118,14 +2179,7 @@ collect_relay_children_json() {
 				if [ -n "$cm_sub" ] && [ "$cm_sub" != "192.168.1.0/24" ]; then
 					ip route replace "$cm_sub" via "$cip" 2>/dev/null || true
 				fi
-				if [ -n "$cm_s" ]; then
-					sig_txt=$(awk -v a="$sig_txt" -v b="$cm_s" 'BEGIN{
-						ra=0; rb=0;
-						if (match(a, /[0-9]+ Mbps/)) ra = substr(a, RSTART, RLENGTH-5) + 0;
-						if (match(b, /[0-9]+ Mbps/)) rb = substr(b, RSTART, RLENGTH-5) + 0;
-						print (ra > rb ? a : b);
-					}')
-				fi
+				sig_txt=$(merge_mesh_signal_label "$ap_s" "$ap_r" "$cm_s")
 			fi
 		fi
 		[ -n "$cip" ] || cip="192.168.10.x"
@@ -2240,13 +2294,16 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 		rmbssid=$(printf '%s' "$pmeta" | jsonfilter -e '@.mesh_bssid' 2>/dev/null | tr 'a-z' 'A-Z')
 		rubssid=$(printf '%s' "$pmeta" | jsonfilter -e '@.uplink_bssid' 2>/dev/null | tr 'a-z' 'A-Z')
 		rusig=$(printf '%s' "$pmeta" | jsonfilter -e '@.uplink_signal' 2>/dev/null)
-		local rsub
+		local rsub ap_m ap_s ap_r
 		rsub=$(printf '%s' "$pmeta" | jsonfilter -e '@.lan_subnet' 2>/dev/null)
 		case "$rsub" in
 			192.168.1.0/24|"") ;;
 			192.168.*.*/24) ip route replace "$rsub" via "$nip" dev br-lan 2>/dev/null || true ;;
 		esac
-		[ -z "$rusig" ] && rusig=$(printf '%s\n' "$wds_dump" | awk '/signal:/{print $2 " dBm"; exit}')
+		ap_m=$(parse_dump_peer_metrics "$wds_dump" "$nmac")
+		ap_s="${ap_m%|*}"
+		ap_r="${ap_m#*|}"
+		rusig=$(merge_mesh_signal_label "$ap_s" "$ap_r" "$rusig")
 		[ -z "$rusig" ] && rusig="Online"
 		echo "${nip}|${nmac:-NODE}|${rhost}|${rmodel}|${rmbssid}|${rubssid}|${rusig}" >> "$tmp_nodes"
 
