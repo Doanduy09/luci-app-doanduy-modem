@@ -45,6 +45,7 @@ jobs:
           echo ">> [2/4] Validating POSIX/ash shell syntax across root/..."
           for shf in \
             luci-app-doanduy-modem/root/usr/bin/* \
+            luci-app-doanduy-modem/root/etc/hotplug.d/iface/* \
             luci-app-doanduy-modem/root/etc/init.d/* \
             luci-app-doanduy-modem/root/etc/uci-defaults/* \
             luci-app-doanduy-modem/root/lib/netifd/proto/* \
@@ -109,34 +110,15 @@ jobs:
           find build_staging/base -type f -exec chmod 644 {} +
           chmod 755 build_staging/base/usr/bin/* 2>/dev/null || true
           chmod 755 build_staging/base/usr/libexec/rpcd/* 2>/dev/null || true
+          chmod 755 build_staging/base/etc/hotplug.d/iface/* 2>/dev/null || true
           chmod 755 build_staging/base/etc/init.d/* 2>/dev/null || true
           chmod 755 build_staging/base/etc/uci-defaults/* 2>/dev/null || true
           chmod 755 build_staging/base/lib/netifd/proto/* 2>/dev/null || true
 
-          cat << 'EOF' > build_staging/conffiles.txt
-          /etc/config/doanduy_mesh
-          /etc/config/doanduy_smarthome.json
-          /etc/config/doanduy_smarthome_keys.json
-          /etc/duytv_s06_config.json
-          /etc/config/sentinel_bots.json
-          /etc/config/sentinel_cameras.conf
-          /etc/config/allowed_iccids.dat
-          /etc/config/default_sim_iccid
-          /etc/config/doanduy_vault
-          /etc/config/doanduy_vault_multi.json
-          /etc/config/telegram_bot.conf
-          /etc/config/original_imei.dat
-          /etc/config/adshield_status
-          /etc/config/adshield_family
-          /etc/config/adshield_custom.conf
-          /etc/config/sms_custom_time.dat
-          /etc/config/sms_renew_package.dat
-          /etc/config/sms_renew_dest.dat
-          /etc/config/tailscale_authkey
-          /etc/config/tailscale_hostname
-          /etc/config/gemini_api.key
-          EOF
-          sed -i 's/^[[:space:]]*//' build_staging/conffiles.txt
+          # Single source of truth: extract canonical conffiles list directly from Makefile
+          awk '/^define Package\/\$\(PKG_NAME\)\/conffiles/{flag=1;next}/^endef/{flag=0}flag' \
+            luci-app-doanduy-modem/Makefile | sed '/^[[:space:]]*$/d' > build_staging/conffiles.txt
+          test -s build_staging/conffiles.txt
           cp -f build_staging/conffiles.txt build_staging/base/lib/upgrade/keep.d/luci-app-doanduy-modem
           chmod 644 build_staging/base/lib/upgrade/keep.d/luci-app-doanduy-modem
 
@@ -168,7 +150,7 @@ jobs:
           cat << EOF > build_staging/ipk/control/control
           Package: luci-app-doanduy-modem
           Version: ${PKG_VER}-${PKG_REL}
-          Depends: luci-base, rpcd, ubus, jsonfilter, atinout, ca-bundle, lua, lua-cjson, luci-lib-nixio
+          Depends: luci-base, rpcd, ubus, jsonfilter, curl, ca-bundle, lua, lua-cjson, luci-lib-nixio, coreutils-timeout, flock, atinout
           Section: luci
           Architecture: all
           Maintainer: DOANDUY <doanduy09@gmail.com>
@@ -243,7 +225,7 @@ jobs:
               --script "post-install:build_staging/apk/scripts/post-install" \
               --script "post-upgrade:build_staging/apk/scripts/post-upgrade" \
               --script "pre-deinstall:build_staging/apk/scripts/pre-deinstall" \
-              --info "depends:luci-base rpcd ubus jsonfilter atinout ca-bundle lua lua-cjson luci-lib-nixio" \
+              --info "depends:luci-base rpcd ubus jsonfilter curl ca-bundle lua lua-cjson luci-lib-nixio coreutils-timeout flock atinout" \
               --files "build_staging/apk/data" \
               --output "'"$APK_FILE"'"
             chown "$(stat -c %u:%g .)" "'"$APK_FILE"'"
@@ -265,6 +247,8 @@ jobs:
           test -x verify_ipk/data/usr/bin/auto_mesh
           test -x verify_ipk/data/usr/bin/read_pcie_sms.lua
           test -x verify_ipk/data/usr/bin/doanduy_pkg_helper.sh
+          test -x verify_ipk/data/etc/hotplug.d/iface/98-doanduy-wwan-rps
+          test -f verify_ipk/data/lib/upgrade/keep.d/luci-app-doanduy-modem
 
           # 2. Verify APKv3 extraction & payload
           "$APK_BIN" extract --allow-untrusted --destination verify_apk "$APK_FILE"
@@ -272,8 +256,10 @@ jobs:
           test -x verify_apk/usr/bin/auto_mesh
           test -x verify_apk/usr/bin/read_pcie_sms.lua
           test -x verify_apk/usr/bin/doanduy_pkg_helper.sh
+          test -x verify_apk/etc/hotplug.d/iface/98-doanduy-wwan-rps
           test -f verify_apk/lib/apk/packages/luci-app-doanduy-modem.list
           test -f verify_apk/lib/upgrade/keep.d/luci-app-doanduy-modem
+          grep -qx '/etc/config/doanduy_mesh_orig_wifi.json' verify_apk/lib/upgrade/keep.d/luci-app-doanduy-modem
 
           sha256sum "$IPK_FILE" "$APK_FILE" | tee sha256sums.txt
           rm -rf verify_ipk verify_apk
