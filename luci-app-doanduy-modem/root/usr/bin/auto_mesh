@@ -30,7 +30,7 @@ ACTION_EPOCH_FILE="/tmp/doanduy_mesh_action_epoch"
 ALIAS_MAP_FILE="/tmp/doanduy_mesh_alias_map"
 ALIAS_NFT_HASH_FILE="/tmp/doanduy_mesh_alias_hash"
 WIFI_HELPER="/usr/lib/lua/doanduy/mesh_wifi.lua"
-PAIR_WINDOW_SEC=300
+PAIR_WINDOW_SEC=600
 DEFAULT_MESH_SSID="DOANDUY_MESH"
 DEFAULT_MESH_KEY="DoanduyMesh@2026!Sec"
 LEGACY_MESH_SSID="SysMesh_Athena"
@@ -140,14 +140,19 @@ write_instant_status_cache() {
 	if [ -s "$CACHE_FILE" ]; then
 		[ "$(jsonfilter -i "$CACHE_FILE" -e '@.has_internet' 2>/dev/null)" = "true" ] && has_dir=true
 	fi
-	if [ "$role" = "searching_node" ] || [ "$role" = "controller" ]; then
+	local auto_idle=false is_en=false
+	[ -f "$IDLE_FLAG_FILE" ] && auto_idle=true
+	[ "$CFG_ENABLED" = "1" ] && [ "$auto_idle" = "false" ] && is_en=true
+	if [ "$auto_idle" = "false" ] && { [ "$role" = "searching_node" ] || [ "$role" = "controller" ]; }; then
 		searching=true
 	fi
 	cat <<EOF > "${CACHE_FILE}.tmp"
 {
   "success": true,
   "ts": $(date +%s),
-  "enabled": $([ "$CFG_ENABLED" = "1" ] && echo true || echo false),
+  "enabled": $is_en,
+  "auto_idle": $auto_idle,
+  "pair_window_sec": ${PAIR_WINDOW_SEC:-600},
   "role": "$(json_esc "$role")",
   "searching": $searching,
   "search_remaining": ${pair_rem:-0},
@@ -1108,7 +1113,10 @@ get_pairing_remaining() {
 
 get_active_role() {
 	get_mesh_cfg
-	[ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ] && { echo "standalone"; return 0; }
+	if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ] || [ -f "$IDLE_FLAG_FILE" ]; then
+		echo "standalone"
+		return 0
+	fi
 	if [ -n "$(uci -q get wireless.mesh_sta)" ] && [ "$(uci -q get wireless.mesh_sta.disabled)" != "1" ]; then
 		echo "node"
 		return 0
@@ -1943,12 +1951,14 @@ restore_default_standalone() {
 	done
 	[ "$(heal_invalid_radio_channels)" = "1" ] && wifi_changed=1
 
-	if [ "$mode_after" = "disabled" ]; then
+	if [ "$mode_after" = "disabled" ] || [ "$mode_after" = "idle" ]; then
 		for mi in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
 			if [ "$(uci -q get "wireless.${mi}.mode")" = "ap" ]; then
-				uci -q set "wireless.${mi}.wds=0"
-				uci -q set "wireless.${mi}.ieee80211r=0"
-				wifi_changed=1
+				if [ "$(uci -q get "wireless.${mi}.wds")" = "1" ] || [ "$(uci -q get "wireless.${mi}.ieee80211r")" = "1" ]; then
+					uci -q set "wireless.${mi}.wds=0"
+					uci -q set "wireless.${mi}.ieee80211r=0"
+					wifi_changed=1
+				fi
 			fi
 		done
 	fi
@@ -2431,10 +2441,15 @@ EOF
 	pjson="${pinfo#*|}"
 	[ -z "$pjson" ] && pjson="[]"
 
-	if [ "$role" = "controller" ] && [ "${pcnt:-0}" -eq 0 ]; then
-		searching=true
-	elif [ "$role" = "searching_node" ]; then
-		searching=true
+	local auto_idle=false is_en=false
+	[ -f "$IDLE_FLAG_FILE" ] && auto_idle=true
+	[ "$CFG_ENABLED" = "1" ] && [ "$auto_idle" = "false" ] && is_en=true
+	if [ "$auto_idle" = "false" ]; then
+		if [ "$role" = "controller" ] && [ "${pcnt:-0}" -eq 0 ]; then
+			searching=true
+		elif [ "$role" = "searching_node" ]; then
+			searching=true
+		fi
 	fi
 
 	wifi_js=$(get_wifi_summary_json)
@@ -2464,7 +2479,9 @@ EOF
 {
   "success": true,
   "ts": $(date +%s),
-  "enabled": $([ "$CFG_ENABLED" = "1" ] && echo true || echo false),
+  "enabled": $is_en,
+  "auto_idle": $auto_idle,
+  "pair_window_sec": ${PAIR_WINDOW_SEC:-600},
   "role": "$(json_esc "$role")",
   "searching": $searching,
   "search_remaining": ${pair_rem:-0},
@@ -2490,11 +2507,19 @@ EOF
 	[ -L /www/mesh_topology.json ] || ln -sf "$CACHE_FILE" /www/mesh_topology.json 2>/dev/null || true
 }
 
+enter_auto_idle() {
+	local reason="$1"
+	touch "$IDLE_FLAG_FILE"
+	rm -f "$PAIR_UNTIL_FILE" "$SCAN_MISS_FILE" "$HAD_PEER_FILE" "$LOST_TS_FILE" "$NUDGE_DONE_FILE"
+	restore_default_standalone "idle"
+	log_mesh "$reason"
+	refresh_status_cache
+}
+
 reconcile_once() {
 	local my_epoch
 	my_epoch=$(cat "$ACTION_EPOCH_FILE" 2>/dev/null || echo 0)
 	get_mesh_cfg
-	rm -f "$IDLE_FLAG_FILE"
 
 	if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ]; then
 		rm -f "$PAIR_UNTIL_FILE" "$HAD_PEER_FILE" "$SCAN_MISS_FILE" "$DIRECT_OK_STREAK_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE"
@@ -2505,6 +2530,20 @@ reconcile_once() {
 		is_epoch_current "$my_epoch" || return 0
 		refresh_status_cache
 		return 0
+	fi
+
+	if [ -f "$IDLE_FLAG_FILE" ]; then
+		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get network.mesh_uplink)" ] || [ -n "$(uci -q get wireless.mesh_sta)" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ] || [ -n "$(uci -q get wireless.mesh_80211s)" ]; then
+			is_epoch_current "$my_epoch" || return 0
+			restore_default_standalone "idle"
+		fi
+		is_epoch_current "$my_epoch" || return 0
+		refresh_status_cache
+		return 0
+	fi
+
+	if [ ! -f "$PAIR_UNTIL_FILE" ] && [ ! -f "$HAD_PEER_FILE" ] && [ "$(get_active_role)" != "node" ]; then
+		start_pairing_window "$PAIR_WINDOW_SEC"
 	fi
 
 	local cur_role now_s lost_first elapsed up_gw mwhash misses streak uinfo ubssid
@@ -2537,6 +2576,22 @@ reconcile_once() {
 		fi
 		is_epoch_current "$my_epoch" || return 0
 		refresh_status_cache
+		local ctrl_pcnt ctrl_rem
+		ctrl_pcnt=$(jsonfilter -i "$CACHE_FILE" -e '@.peer_count' 2>/dev/null || echo 0)
+		if [ "${ctrl_pcnt:-0}" -gt 0 ] 2>/dev/null; then
+			touch "$HAD_PEER_FILE"
+			rm -f "$PAIR_UNTIL_FILE"
+		else
+			if [ -f "$HAD_PEER_FILE" ]; then
+				rm -f "$HAD_PEER_FILE"
+				start_pairing_window "$PAIR_WINDOW_SEC"
+			fi
+			ctrl_rem=$(get_pairing_remaining)
+			if [ "${ctrl_rem:-0}" -le 0 ] 2>/dev/null; then
+				is_epoch_current "$my_epoch" || return 0
+				enter_auto_idle "Hết 10 phút không có Router Phụ kết nối -> Tự động tắt Auto-Mesh (sẽ tự bật lại sau khi khởi động lại router)!"
+			fi
+		fi
 		return 0
 	fi
 
@@ -2612,7 +2667,8 @@ reconcile_once() {
 			if [ "$elapsed" -ge 60 ]; then
 				rm -f "$HAD_PEER_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE" "$SCAN_MISS_FILE"
 				restore_default_standalone "auto"
-				log_mesh "Mất kết nối Mesh quá 60s -> Khôi phục IP mặc định 192.168.1.1 và tiếp tục tự động dò ghép!"
+				start_pairing_window "$PAIR_WINDOW_SEC"
+				log_mesh "Mất kết nối Mesh quá 60s -> Khôi phục IP mặc định 192.168.1.1 và mở lại cửa sổ dò 10 phút!"
 			elif [ "$elapsed" -ge 20 ] && [ ! -f "$NUDGE_DONE_FILE" ]; then
 				touch "$NUDGE_DONE_FILE"
 				ifup mesh_uplink >/dev/null 2>&1 || true
@@ -2635,6 +2691,10 @@ reconcile_once() {
 		apply_node_role "$FOUND_MESH_SSID" "$FOUND_MESH_CHAN" "$FOUND_MESH_BSSID" "$FOUND_MESH_RADIO" "$FOUND_MESH_TIER"
 	else
 		is_epoch_current "$my_epoch" || return 0
+		if [ "$(get_pairing_remaining)" -le 0 ] 2>/dev/null; then
+			enter_auto_idle "Hết 10 phút dò không thấy Router Chính -> Tự động tắt Auto-Mesh (sẽ tự bật lại sau khi khởi động lại router)!"
+			return 0
+		fi
 		misses=$(get_scan_misses)
 		echo $((misses + 1)) > "$SCAN_MISS_FILE"
 		if [ "$(uci -q get network.lan.ipaddr)" != "192.168.1.1" ] || [ -n "$(uci -q get network.mesh_uplink)" ] || [ "$(uci -q get dhcp.lan.ignore)" = "1" ] || [ -n "$(uci -q get wireless.mesh_backhaul_ap)" ]; then
@@ -2650,10 +2710,10 @@ handle_pair_cmd() {
 	uci set "${MESH_UCI}.mesh.enabled=1"
 	uci set "${MESH_UCI}.mesh.mode=auto"
 	uci commit "$MESH_UCI"
-	rm -f "$IDLE_FLAG_FILE" "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done
+	rm -f "$IDLE_FLAG_FILE" "$HAD_PEER_FILE" "$SCAN_MISS_FILE" "$NUDGE_DONE_FILE" "$LOST_TS_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done
 	start_pairing_window "$PAIR_WINDOW_SEC"
 	write_instant_status_cache
-	log_mesh "Bật Auto-Mesh Always-Ready -> Phát sóng công suất tối đa & tự động ghép nối!"
+	log_mesh "Bật Auto-Mesh (cửa sổ dò 10 phút) -> Phát sóng công suất tối đa & tự động ghép nối!"
 	reconcile_once
 }
 
@@ -2695,13 +2755,14 @@ run_daemon() {
 	if [ "$CFG_ENABLED" = "1" ]; then
 		uci set "${MESH_UCI}.mesh.mode=auto"
 		uci commit "$MESH_UCI"
-		rm -f "$IDLE_FLAG_FILE" "$SCAN_MISS_FILE"
-		log_mesh "Khởi động Auto-Mesh Always-Ready -> Tự động điều phối Chính/Phụ & công suất sóng tối đa!"
+		rm -f "$IDLE_FLAG_FILE" "$HAD_PEER_FILE" "$SCAN_MISS_FILE"
+		start_pairing_window "$PAIR_WINDOW_SEC"
+		log_mesh "Khởi động Auto-Mesh (cửa sổ dò 10 phút) -> Tự động điều phối Chính/Phụ!"
 	fi
 	while true; do
 		run_locked reconcile_once >/dev/null 2>&1 || true
 		get_mesh_cfg
-		if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ]; then
+		if [ "$CFG_ENABLED" = "0" ] || [ "$CFG_MODE" = "standalone" ] || [ -f "$IDLE_FLAG_FILE" ]; then
 			sleep 30
 		else
 			role=$(get_active_role)

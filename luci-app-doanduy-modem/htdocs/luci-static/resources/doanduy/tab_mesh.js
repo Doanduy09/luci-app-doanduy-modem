@@ -503,10 +503,13 @@ return baseclass.extend({
             var peers       = Array.isArray(st.peers) ? st.peers : [];
             var role        = st.role || 'searching_node';
             var isSearching = !!st.searching;
-            var isEnabled   = !!st.enabled && role !== 'standalone';
+            var isAutoIdle  = !!st.auto_idle;
+            var remSec      = Number(st.search_remaining) || 0;
+            var remTxt      = remSec > 0 ? (' (' + Math.floor(remSec / 60) + 'p' + (remSec % 60 < 10 ? '0' : '') + (remSec % 60) + 's)') : '';
+            var isEnabled   = !!st.enabled && !isAutoIdle && role !== 'standalone';
 
             btnOn.style.opacity  = isEnabled ? '1' : '0.88';
-            btnOff.style.opacity = (!st.enabled || role === 'standalone') ? '0.6' : '1';
+            btnOff.style.opacity = (!isEnabled) ? '0.6' : '1';
 
             if (role === 'controller' && peers.length > 0) {
                 statusPill.textContent = '🟢 Đang kết nối ' + peers.length + ' Router Phụ';
@@ -516,12 +519,16 @@ return baseclass.extend({
                 statusPill.textContent = '🟢 Đã kết nối Router Chính';
                 statusPill.style.background = '#dcfce7';
                 statusPill.style.color = '#15803d';
+            } else if (isAutoIdle) {
+                statusPill.textContent = '⚪ Tự tắt sau 10p (Không có Mesh • Tự bật khi reboot)';
+                statusPill.style.background = '#f1f5f9';
+                statusPill.style.color = '#64748b';
             } else if (role === 'controller') {
-                statusPill.textContent = '📡 Sẵn sàng ghép Mesh (Tự động)';
+                statusPill.textContent = '📡 Sẵn sàng ghép Mesh' + remTxt;
                 statusPill.style.background = '#dbeafe';
                 statusPill.style.color = '#1d4ed8';
             } else if (role === 'searching_node' || isSearching) {
-                statusPill.textContent = '📡 Đang tìm Router Chính...';
+                statusPill.textContent = '📡 Đang tìm Router Chính...' + remTxt;
                 statusPill.style.background = '#dbeafe';
                 statusPill.style.color = '#1d4ed8';
             } else {

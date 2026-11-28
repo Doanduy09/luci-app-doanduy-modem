@@ -30,7 +30,7 @@ case "$1" in
 				case "$mode" in
 					pair|auto)
 						run_bg /usr/bin/auto_mesh pair
-						echo '{"success":true,"message":"Đã bật Auto-Mesh Tự Động (Always-Ready)! Thiết bị có mạng làm Router Chính (192.168.1.1), máy không mạng tự dò ghép Router Phụ (192.168.1.10..99)."}'
+						echo '{"success":true,"message":"Đã bật Auto-Mesh (tự dò ghép tối đa 10 phút, tự tắt nếu không có Mesh và tự bật lại khi khởi động lại router)!"}'
 						;;
 					controller)
 						run_bg /usr/bin/auto_mesh controller
