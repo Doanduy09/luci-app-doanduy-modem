@@ -357,6 +357,9 @@ C_IMEI='$(san "$imei")'
 C_EXTRA='$(san "$extra")'
 EOF
 		mv -f "${cache_file}.tmp" "$cache_file"
+		printf '{"status":"ok","operator":"%s","rat":"%s","band":"%s","rsrp":"%s","rsrq":"%s","sinr":"%s","score":%s}\n' \
+			"$(san "$op")" "$(san "$rat")" "$(san "$band")" "$(san "$rsrp")" "$(san "$rsrq")" "$(san "$sinr")" "${pct:-100}" > /tmp/duydoan5g_signal_cache_json.tmp
+		mv -f /tmp/duydoan5g_signal_cache_json.tmp /tmp/duydoan5g_signal_cache_json 2>/dev/null || true
 		exit 0
 	) 9>"$AT_LOCK" 2>/dev/null
 

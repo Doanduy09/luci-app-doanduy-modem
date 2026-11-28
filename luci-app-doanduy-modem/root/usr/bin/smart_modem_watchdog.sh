@@ -1131,7 +1131,14 @@ while true; do
             echo "$(date): [Tầng 3 Thành Công] Sóng modem 5G đã hồi sinh sau ${DUR}s!" >> "$LOG_FILE"
             rotate_log_if_needed
             FAIL_STREAK=0
-            SIG_INFO=$(cat /tmp/rf_signal_stats.json 2>/dev/null | jsonfilter -e '$.grade' 2>/dev/null || echo "Ổn định")
+            SIG_INFO=""
+            if [ -f /tmp/duydoan5g_signal_cache_json ]; then
+                _rat=$(jsonfilter -i /tmp/duydoan5g_signal_cache_json -e '@.rat' 2>/dev/null)
+                _rsrp=$(jsonfilter -i /tmp/duydoan5g_signal_cache_json -e '@.rsrp' 2>/dev/null)
+                [ -n "$_rat$_rsrp" ] && SIG_INFO="${_rat:+${_rat} }${_rsrp:+(RSRP ${_rsrp} dBm)}"
+            fi
+            [ -z "$SIG_INFO" ] && SIG_INFO=$(jsonfilter -i /tmp/rf_signal_stats.json -e '@.grade' 2>/dev/null)
+            [ -z "$SIG_INFO" ] && SIG_INFO="Ổn định"
             send_tg_alert "🎉 <b>BÁC SĨ 5G: TỰ CHỮA LÀNH THÀNH CÔNG! (Tầng 3)</b>
 ━━━━━━━━━━━━━━━━━━━
 ⚡ <b>Thời gian xử lý:</b> ~${DUR} giây
