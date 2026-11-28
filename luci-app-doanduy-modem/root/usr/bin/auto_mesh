@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.4)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.5)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -386,7 +386,9 @@ radio_supports_wide_bw() {
 	[ -n "$hlist" ] || hlist=$(uci -q get "wireless.${radio}.htmode")
 	printf '%s' "$hlist" | grep -qE 'EHT320|EHT160|HE160|VHT160' || return 1
 	[ "$band" = "6g" ] && return 0
-	radio_supports_channel "$radio" 36 || radio_supports_channel "$radio" 52 || radio_supports_channel "$radio" 100
+	{ radio_supports_channel "$radio" 36 && radio_channel_is_non_dfs "$radio" 36; } || \
+	{ radio_supports_channel "$radio" 52 && radio_channel_is_non_dfs "$radio" 52; } || \
+	{ radio_supports_channel "$radio" 100 && radio_channel_is_non_dfs "$radio" 100; }
 }
 
 # Chọn radio Relay AP tối ưu: CHỈ tách radio phụ nếu radio phụ CŨNG hỗ trợ >=160MHz (tránh bị bóp 721-1201Mbps trên radio 80MHz như IPQ6018 radio0)
@@ -1918,11 +1920,12 @@ restore_default_standalone() {
 }
 
 get_local_mesh_ap_bssid() {
-	local w_if bssid=""
+	local w_if w_info bssid=""
 	if command -v iw >/dev/null 2>&1; then
 		for w_if in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
-			if iw dev "$w_if" info 2>/dev/null | grep -qE "ssid (${CFG_SSID}|${CFG_SSID}_R|${LEGACY_MESH_SSID})$"; then
-				bssid=$(iw dev "$w_if" info 2>/dev/null | awk '/addr /{print toupper($2); exit}')
+			w_info=$(iw dev "$w_if" info 2>/dev/null)
+			if printf '%s\n' "$w_info" | grep -qE "type AP$" && printf '%s\n' "$w_info" | grep -qE "ssid (${CFG_SSID}|${CFG_SSID}_R|${LEGACY_MESH_SSID})$"; then
+				bssid=$(printf '%s\n' "$w_info" | awk '/addr /{print toupper($2); exit}')
 				[ -n "$bssid" ] && break
 			fi
 		done
