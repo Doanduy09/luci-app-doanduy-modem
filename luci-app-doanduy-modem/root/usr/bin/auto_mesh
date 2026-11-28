@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.7)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.8)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -512,9 +512,9 @@ maximize_mesh_radio_perf() {
 		fi
 	done
 
-	# Đẩy công suất phát (txpower) lên mức cao nhất phần cứng hỗ trợ
+	# Đẩy công suất phát (txpower) lên mức cao nhất phần cứng hỗ trợ (hỗ trợ cả dBm lẫn dbm trên OpenWrt 25.12+)
 	if command -v iwinfo >/dev/null 2>&1; then
-		max_tx=$(iwinfo "$wif" txpowerlist 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dBm" && $(i-1)+0>m) m=$(i-1)+0} END{if(m>0) print m}')
+		max_tx=$(iwinfo "$wif" txpowerlist 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(tolower($i)=="dbm" && $(i-1)+0>m) m=$(i-1)+0} END{if(m>0) print m}')
 		if [ -n "$max_tx" ] && [ "$(uci -q get "wireless.${radio}.txpower")" != "$max_tx" ]; then
 			uci -q set "wireless.${radio}.txpower=${max_tx}"
 			changed=1
@@ -545,13 +545,21 @@ maximize_mesh_radio_perf() {
 }
 
 maximize_all_5g_radios() {
-	local dev dis band any=0
+	local dev dis band wif max_tx any=0
 	for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
 		dis=$(uci -q get "wireless.${dev}.disabled")
 		[ "$dis" = "1" ] && continue
 		band=$(uci -q get "wireless.${dev}.band")
 		if [ "$band" = "5g" ] || [ "$band" = "6g" ]; then
 			[ "$(maximize_mesh_radio_perf "$dev")" = "1" ] && any=1
+		elif [ "$band" = "2g" ] && command -v iwinfo >/dev/null 2>&1; then
+			wif=$(get_radio_ifname "$dev")
+			[ -n "$wif" ] || wif="$dev"
+			max_tx=$(iwinfo "$wif" txpowerlist 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(tolower($i)=="dbm" && $(i-1)+0>m) m=$(i-1)+0} END{if(m>0) print m}')
+			if [ -n "$max_tx" ] && [ "$(uci -q get "wireless.${dev}.txpower")" != "$max_tx" ]; then
+				uci -q set "wireless.${dev}.txpower=${max_tx}"
+				any=1
+			fi
 		fi
 	done
 	echo "$any"
