@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.3)
+# DOANDUY UNIVERSAL MULTI-TIER AUTO-MESH ENGINE (v2.8.4)
 # - Tự động 100% Always-Ready: Có mạng = Router Chính (192.168.1.1),
 #   không mạng = Router Phụ (192.168.1.10..99) tự dò & ghép bất cứ lúc nào
 # - Hỗ trợ mọi dòng chip & giữ nguyên Hardware Offload (NSS / WED / HNAT)
@@ -25,6 +25,8 @@ IDLE_FLAG_FILE="/tmp/doanduy_mesh_auto_idle"
 HAD_PEER_FILE="/tmp/doanduy_mesh_had_peer"
 PAUSED_APS_FILE="/etc/config/doanduy_mesh_paused_aps"
 ACTION_EPOCH_FILE="/tmp/doanduy_mesh_action_epoch"
+ALIAS_MAP_FILE="/tmp/doanduy_mesh_alias_map"
+ALIAS_NFT_HASH_FILE="/tmp/doanduy_mesh_alias_hash"
 WIFI_HELPER="/usr/lib/lua/doanduy/mesh_wifi.lua"
 PAIR_WINDOW_SEC=300
 DEFAULT_MESH_SSID="DOANDUY_MESH"
@@ -796,6 +798,236 @@ flush_brlan_master_subnet() {
 	done
 }
 
+# Gỡ bỏ toàn bộ Management IP Alias 192.168.1.1x/32 và bảng NAT hairpin khỏi Router Chính
+clear_mesh_mgmt_aliases() {
+	local ip_cidr _m _aip _rip _pip
+	if [ -f "$ALIAS_MAP_FILE" ]; then
+		while IFS='|' read -r _m _aip _rip _pip; do
+			[ -n "$_aip" ] && ip addr del "${_aip}/32" dev br-lan >/dev/null 2>&1 || true
+		done < "$ALIAS_MAP_FILE"
+	fi
+	for ip_cidr in $(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet 192\.168\.1\.[1-4][0-9]\/32/{print $2}'); do
+		ip addr del "$ip_cidr" dev br-lan >/dev/null 2>&1 || true
+	done
+	if command -v nft >/dev/null 2>&1; then
+		nft list table ip doanduy_mesh_nat >/dev/null 2>&1 && nft delete table ip doanduy_mesh_nat >/dev/null 2>&1 || true
+	elif command -v iptables >/dev/null 2>&1; then
+		while iptables -t nat -D PREROUTING -j DOANDUY_MESH_PRE >/dev/null 2>&1; do :; done
+		while iptables -t nat -D OUTPUT -j DOANDUY_MESH_OUT >/dev/null 2>&1; do :; done
+		while iptables -t nat -D POSTROUTING -j DOANDUY_MESH_POST >/dev/null 2>&1; do :; done
+		iptables -t nat -F DOANDUY_MESH_PRE >/dev/null 2>&1 || true
+		iptables -t nat -X DOANDUY_MESH_PRE >/dev/null 2>&1 || true
+		iptables -t nat -F DOANDUY_MESH_OUT >/dev/null 2>&1 || true
+		iptables -t nat -X DOANDUY_MESH_OUT >/dev/null 2>&1 || true
+		iptables -t nat -F DOANDUY_MESH_POST >/dev/null 2>&1 || true
+		iptables -t nat -X DOANDUY_MESH_POST >/dev/null 2>&1 || true
+	fi
+	rm -f "$ALIAS_MAP_FILE" "$ALIAS_NFT_HASH_FILE" /tmp/doanduy_mesh_nat.nft
+}
+
+# Ánh xạ 1:1 Management IP Alias (192.168.1.10..49) cho toàn bộ Router Phụ tầng 2+ qua NAT hairpin trên br-lan
+sync_mesh_mgmt_aliases() {
+	local nodes_file="$1" children_file="$2" resolved_file="$3"
+	local used_ips=" 192.168.1.1 ${RESCUE_IP} " tier1_macs="," existing_aliases=" " brlan_aliases=" "
+	local seen_keys="," new_map="/tmp/doanduy_mesh_alias_map.$$" nft_tmp="/tmp/doanduy_mesh_nat.nft"
+	local nip nmac rhost rmodel rmbssid rubssid rusig _m _aip _rip _pip _ip
+	local cip cpar cmac chost cmodel csig cmac_u dkey real_valid alias_ip oct cand is_local
+	local new_hash old_hash need_apply=0 ip_cidr ip_only pre_rules="" out_rules="" post_rules="" map_desc=""
+
+	rm -f "$resolved_file" "$new_map"
+	if [ ! -s "$children_file" ]; then
+		clear_mesh_mgmt_aliases
+		return 0
+	fi
+
+	if [ -f "$nodes_file" ]; then
+		while IFS='|' read -r nip nmac rhost rmodel rmbssid rubssid rusig; do
+			[ -n "$nip" ] && used_ips="${used_ips}${nip} "
+			if [ -n "$nmac" ] && [ "$nmac" != "NODE" ]; then
+				tier1_macs="${tier1_macs}$(printf '%s' "$nmac" | tr 'a-z' 'A-Z'),"
+			fi
+		done < "$nodes_file"
+	fi
+
+	if [ -f /tmp/dhcp.leases ]; then
+		for _ip in $(awk '$3 ~ /^192\.168\.1\./ {print $3}' /tmp/dhcp.leases 2>/dev/null); do
+			used_ips="${used_ips}${_ip} "
+		done
+	fi
+
+	for _ip in $(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet 192\.168\.1\.[1-4][0-9]\/32/{sub(/\/.*/, "", $2); print $2}'); do
+		brlan_aliases="${brlan_aliases}${_ip} "
+		existing_aliases="${existing_aliases}${_ip} "
+	done
+	if [ -f "$ALIAS_MAP_FILE" ]; then
+		while IFS='|' read -r _m _aip _rip _pip; do
+			[ -n "$_aip" ] && existing_aliases="${existing_aliases}${_aip} "
+		done < "$ALIAS_MAP_FILE"
+	fi
+	for _ip in $(awk '$1 ~ /^192\.168\.1\.[1-4][0-9]$/ && $3!="0x0" {print $1}' /proc/net/arp 2>/dev/null); do
+		case "$existing_aliases" in
+			*" $_ip "*) ;;
+			*) used_ips="${used_ips}${_ip} " ;;
+		esac
+	done
+
+	while IFS='|' read -r cip cpar cmac chost cmodel csig; do
+		[ -n "$cip" ] || continue
+		cmac_u=$(printf '%s' "$cmac" | tr 'a-z' 'A-Z')
+		if [ -n "$cmac_u" ] && [ "$cmac_u" != "RELAY" ]; then
+			dkey="$cmac_u"
+			case "$tier1_macs" in
+				*,"${cmac_u}",*) continue ;;
+			esac
+		else
+			dkey="$cip"
+		fi
+		case "$seen_keys" in
+			*,"${dkey}",*) continue ;;
+		esac
+		seen_keys="${seen_keys}${dkey},"
+
+		real_valid=0
+		case "$cip" in
+			192.168.1.*|*.x|"") real_valid=0 ;;
+			192.168.*.*|10.*.*.*|172.*.*.*) real_valid=1 ;;
+		esac
+		if [ "$real_valid" = "0" ]; then
+			echo "${cip}|${cip}|${cpar}|${cmac}|${chost}|${cmodel}|${csig}" >> "$resolved_file"
+			continue
+		fi
+
+		alias_ip=""
+		if [ -f "$ALIAS_MAP_FILE" ] && [ -n "$cmac_u" ] && [ "$cmac_u" != "RELAY" ]; then
+			alias_ip=$(awk -F'|' -v m="$cmac_u" '$1==m {print $2; exit}' "$ALIAS_MAP_FILE" 2>/dev/null)
+		fi
+		case "$alias_ip" in
+			192.168.1.[1-4][0-9])
+				case "$used_ips" in
+					*" $alias_ip "*) alias_ip="" ;;
+				esac
+				;;
+			*) alias_ip="" ;;
+		esac
+
+		if [ -z "$alias_ip" ]; then
+			for oct in $(seq 10 49); do
+				cand="192.168.1.${oct}"
+				case "$used_ips" in
+					*" $cand "*) continue ;;
+				esac
+				is_local=0
+				case "$brlan_aliases" in
+					*" $cand "*) is_local=1 ;;
+				esac
+				if [ "$is_local" = "0" ] && ping -c 1 -W 1 "$cand" >/dev/null 2>&1; then
+					continue
+				fi
+				alias_ip="$cand"
+				break
+			done
+		fi
+
+		[ -n "$alias_ip" ] || alias_ip="$cip"
+		used_ips="${used_ips}${alias_ip} "
+		if [ "$alias_ip" != "$cip" ]; then
+			echo "${cmac_u}|${alias_ip}|${cip}|${cpar}" >> "$new_map"
+		fi
+		echo "${alias_ip}|${cip}|${cpar}|${cmac}|${chost}|${cmodel}|${csig}" >> "$resolved_file"
+	done < "$children_file"
+
+	if [ ! -s "$new_map" ]; then
+		rm -f "$new_map"
+		clear_mesh_mgmt_aliases
+		return 0
+	fi
+
+	new_hash=$(md5sum "$new_map" 2>/dev/null | awk '{print $1}')
+	[ -n "$new_hash" ] || new_hash=$(tr '\n' ';' < "$new_map" 2>/dev/null)
+	old_hash=$(cat "$ALIAS_NFT_HASH_FILE" 2>/dev/null || echo "")
+
+	[ "$new_hash" != "$old_hash" ] && need_apply=1
+	if [ "$need_apply" = "0" ]; then
+		if command -v nft >/dev/null 2>&1; then
+			nft list table ip doanduy_mesh_nat >/dev/null 2>&1 || need_apply=1
+		elif command -v iptables >/dev/null 2>&1; then
+			iptables -t nat -L DOANDUY_MESH_PRE >/dev/null 2>&1 || need_apply=1
+		fi
+	fi
+	if [ "$need_apply" = "0" ]; then
+		while IFS='|' read -r _m _aip _rip _pip; do
+			[ -n "$_aip" ] || continue
+			case "$brlan_aliases" in
+				*" $_aip "*) ;;
+				*) need_apply=1; break ;;
+			esac
+		done < "$new_map"
+	fi
+
+	if [ "$need_apply" = "1" ]; then
+		for ip_cidr in $(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet 192\.168\.1\.[1-4][0-9]\/32/{print $2}'); do
+			ip_only="${ip_cidr%%/*}"
+			if ! awk -F'|' -v a="$ip_only" '$2==a {found=1} END{exit !found}' "$new_map" 2>/dev/null; then
+				ip addr del "$ip_cidr" dev br-lan >/dev/null 2>&1 || true
+			fi
+		done
+
+		while IFS='|' read -r _m _aip _rip _pip; do
+			[ -n "$_aip" ] && [ -n "$_rip" ] || continue
+			ip neigh del "$_aip" dev br-lan >/dev/null 2>&1 || true
+			ip addr add "${_aip}/32" dev br-lan >/dev/null 2>&1 || true
+			pre_rules="${pre_rules}		ip daddr ${_aip} dnat to ${_rip}
+"
+			out_rules="${out_rules}		ip daddr ${_aip} dnat to ${_rip}
+"
+			post_rules="${post_rules}		ip daddr ${_rip} oifname \"br-lan\" snat to 192.168.1.1
+"
+			[ -z "$map_desc" ] && map_desc="${_aip}->${_rip}" || map_desc="${map_desc}, ${_aip}->${_rip}"
+		done < "$new_map"
+
+		if command -v nft >/dev/null 2>&1; then
+			cat <<EOF > "$nft_tmp"
+add table ip doanduy_mesh_nat
+delete table ip doanduy_mesh_nat
+table ip doanduy_mesh_nat {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+${pre_rules}	}
+	chain output {
+		type nat hook output priority -100; policy accept;
+${out_rules}	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+${post_rules}	}
+}
+EOF
+			nft -f "$nft_tmp" >/dev/null 2>&1 || true
+		elif command -v iptables >/dev/null 2>&1; then
+			iptables -t nat -N DOANDUY_MESH_PRE >/dev/null 2>&1 || true
+			iptables -t nat -N DOANDUY_MESH_OUT >/dev/null 2>&1 || true
+			iptables -t nat -N DOANDUY_MESH_POST >/dev/null 2>&1 || true
+			iptables -t nat -F DOANDUY_MESH_PRE >/dev/null 2>&1 || true
+			iptables -t nat -F DOANDUY_MESH_OUT >/dev/null 2>&1 || true
+			iptables -t nat -F DOANDUY_MESH_POST >/dev/null 2>&1 || true
+			iptables -t nat -C PREROUTING -j DOANDUY_MESH_PRE >/dev/null 2>&1 || iptables -t nat -I PREROUTING 1 -j DOANDUY_MESH_PRE >/dev/null 2>&1 || true
+			iptables -t nat -C OUTPUT -j DOANDUY_MESH_OUT >/dev/null 2>&1 || iptables -t nat -I OUTPUT 1 -j DOANDUY_MESH_OUT >/dev/null 2>&1 || true
+			iptables -t nat -C POSTROUTING -j DOANDUY_MESH_POST >/dev/null 2>&1 || iptables -t nat -I POSTROUTING 1 -j DOANDUY_MESH_POST >/dev/null 2>&1 || true
+			while IFS='|' read -r _m _aip _rip _pip; do
+				[ -n "$_aip" ] && [ -n "$_rip" ] || continue
+				iptables -t nat -A DOANDUY_MESH_PRE -d "$_aip" -j DNAT --to-destination "$_rip" >/dev/null 2>&1 || true
+				iptables -t nat -A DOANDUY_MESH_OUT -d "$_aip" -j DNAT --to-destination "$_rip" >/dev/null 2>&1 || true
+				iptables -t nat -A DOANDUY_MESH_POST -d "$_rip" -o br-lan -j SNAT --to-source 192.168.1.1 >/dev/null 2>&1 || true
+			done < "$new_map"
+		fi
+
+		mv -f "$new_map" "$ALIAS_MAP_FILE" 2>/dev/null || true
+		echo "$new_hash" > "$ALIAS_NFT_HASH_FILE" 2>/dev/null || true
+		log_mesh "Ánh xạ IP quản trị 192.168.1.1x thống nhất cho Mesh đa tầng: ${map_desc}"
+	else
+		rm -f "$new_map"
+	fi
+}
+
 start_pairing_window() {
 	local dur="${1:-$PAIR_WINDOW_SEC}"
 	rm -f "$IDLE_FLAG_FILE" "$LOST_TS_FILE"
@@ -1439,6 +1671,7 @@ EOS
 
 apply_node_role() {
 	get_mesh_cfg
+	clear_mesh_mgmt_aliases
 	local target_ssid="${1:-$CFG_SSID}" target_chan="${2:-36}" target_bssid="$3" target_radio="$4" target_tier="${5:-$FOUND_MESH_TIER}"
 	[ -n "$target_tier" ] || target_tier="1"
 	local radio target_ip cur_up_ip cur_lan_ip oct sub_lan_ip wifi_changed=0 net_changed=0 fw_changed=0 target_key="$CFG_KEY" seed
@@ -1602,6 +1835,7 @@ apply_node_role() {
 restore_default_standalone() {
 	local mode_after="${1:-auto}" wifi_changed=0 net_changed=0 fw_changed=0
 	ensure_mesh_uci
+	clear_mesh_mgmt_aliases
 	rm -f "$LOST_TS_FILE" "$NUDGE_DONE_FILE" /tmp/doanduy_mesh_relay_blocked_* /tmp/doanduy_mesh_relay_ts /tmp/doanduy_mesh_dfs_blocked_* /tmp/doanduy_mesh_offload_done /tmp/doanduy_mesh_2g_opt_done /tmp/doanduy_mesh_hygiene_done /tmp/doanduy_mesh_dead_cnt_*
 	[ "$(restore_paused_user_aps)" = "1" ] && wifi_changed=1
 	if [ "$mode_after" = "disabled" ]; then
@@ -1866,11 +2100,16 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 	fi
 
 	# Không xả bão ping khi idle (wds_cnt == 0 và chưa có ARP .10..99). Chỉ quét .10..24 khi có STA mới chưa vào ARP!
-	local arp_ips arp_cnt=0 cand_ips="" oct nip
+	local arp_ips arp_cnt=0 cand_ips="" oct nip alias_ips=" "
+	alias_ips=" $(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet 192\.168\.1\.[1-4][0-9]\/32/{sub(/\/.*/, "", $2); print $2}' | tr '\n' ' ') "
 	arp_ips=$(awk '$1 ~ /^192\.168\.1\.[1-9][0-9]$/ && $3!="0x0" {print $1}' /proc/net/arp 2>/dev/null | sort -u)
-	for nip in $arp_ips; do arp_cnt=$((arp_cnt + 1)); done
+	for nip in $arp_ips; do
+		case "$alias_ips" in *" $nip "*) continue ;; esac
+		arp_cnt=$((arp_cnt + 1))
+	done
 
 	if [ "${wds_cnt:-0}" -eq 0 ] && [ "$arp_cnt" -eq 0 ]; then
+		clear_mesh_mgmt_aliases
 		echo "0|[]"
 		return 0
 	fi
@@ -1884,18 +2123,20 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 
 	for nip in $cand_ips; do
 		[ "$nip" = "$lip" ] && continue
+		case "$alias_ips" in *" $nip "*) continue ;; esac
 		ping -c 1 -W 1 "$nip" >/dev/null 2>&1 &
 	done
 	wait 2>/dev/null || true
 
 	# Sắp xếp danh sách IP ứng viên tăng dần theo số cuối (10, 11, 12, 13, 14...)
-	local sorted_ips tmp_nodes="/tmp/doanduy_mesh_nodes.$$" tmp_children="/tmp/doanduy_mesh_children.$$"
-	rm -f "$tmp_nodes" "$tmp_children"
+	local sorted_ips tmp_nodes="/tmp/doanduy_mesh_nodes.$$" tmp_children="/tmp/doanduy_mesh_children.$$" tmp_resolved="/tmp/doanduy_mesh_resolved.$$"
+	rm -f "$tmp_nodes" "$tmp_children" "$tmp_resolved"
 	sorted_ips=$(awk '$1 ~ /^192\.168\.1\.[1-9][0-9]$/ && $3!="0x0" {split($1,a,"."); printf "%03d %s\n", a[4], $1}' /proc/net/arp 2>/dev/null | sort -u | awk '{print $2}')
 
 	local pmeta rmodel rhost rmbssid rubssid rusig nmac
 	for nip in $sorted_ips; do
 		[ "$nip" = "$lip" ] && continue
+		case "$alias_ips" in *" $nip "*) continue ;; esac
 		if [ -f /tmp/dhcp.leases ] && awk -v ip="$nip" '$3==ip {found=1} END{exit !found}' /tmp/dhcp.leases 2>/dev/null; then
 			continue
 		fi
@@ -1964,19 +2205,21 @@ $(iw dev "$w_if" station dump 2>/dev/null)"
 			local item="{\"ip\":\"$(json_esc "$nip")\",\"parent_ip\":\"$(json_esc "$parent_ip")\",\"mac\":\"$(json_esc "$nmac")\",\"name\":\"$(json_esc "$rhost")\",\"model\":\"$(json_esc "$rmodel")\",\"signal\":\"$(json_esc "$rusig")\",\"url\":\"http://${nip}\"}"
 			[ -z "$peer_list" ] && peer_list="$item" || peer_list="${peer_list},${item}"
 		done < "$tmp_nodes"
-		rm -f "$tmp_nodes"
 	fi
 
-	if [ -f "$tmp_children" ]; then
-		while IFS='|' read -r cip cpar cmac chost cmodel csig; do
-			[ -n "$cip" ] || continue
+	sync_mesh_mgmt_aliases "$tmp_nodes" "$tmp_children" "$tmp_resolved" >/dev/null 2>&1
+	rm -f "$tmp_nodes" "$tmp_children"
+
+	if [ -f "$tmp_resolved" ]; then
+		while IFS='|' read -r aip cip cpar cmac chost cmodel csig; do
+			[ -n "$aip" ] || continue
 			peer_count=$((peer_count + 1))
 			[ -z "$cmodel" ] && cmodel="Router Phụ #${peer_count}"
 			[ -z "$chost" ] && chost="DOANDUY"
-			local citem="{\"ip\":\"$(json_esc "$cip")\",\"parent_ip\":\"$(json_esc "$cpar")\",\"mac\":\"$(json_esc "${cmac:-RELAY}")\",\"name\":\"$(json_esc "$chost")\",\"model\":\"$(json_esc "$cmodel")\",\"signal\":\"$(json_esc "${csig:-Online}")\",\"url\":\"http://${cip}\"}"
+			local citem="{\"ip\":\"$(json_esc "$aip")\",\"real_ip\":\"$(json_esc "$cip")\",\"parent_ip\":\"$(json_esc "$cpar")\",\"mac\":\"$(json_esc "${cmac:-RELAY}")\",\"name\":\"$(json_esc "$chost")\",\"model\":\"$(json_esc "$cmodel")\",\"signal\":\"$(json_esc "${csig:-Online}")\",\"url\":\"http://${aip}\"}"
 			[ -z "$peer_list" ] && peer_list="$citem" || peer_list="${peer_list},${citem}"
-		done < "$tmp_children"
-		rm -f "$tmp_children"
+		done < "$tmp_resolved"
+		rm -f "$tmp_resolved"
 	fi
 
 	if [ "$peer_count" -eq 0 ] && [ "${wds_cnt:-0}" -gt 0 ]; then
